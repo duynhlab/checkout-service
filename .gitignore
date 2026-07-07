@@ -1,0 +1,8 @@
+coverage.out
+
+# GoReleaser build output
+dist/
+
+# Local env
+.env
+checkout-service

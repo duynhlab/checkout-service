@@ -1,0 +1,135 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: read
+  id-token: write
+  actions: read
+  security-events: write
+
+jobs:
+  go-check:
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@main
+    with:
+      command-test: 'go test -race -coverprofile=coverage.out ./...'
+      lint: true
+    secrets: inherit
+
+  gitleaks:
+    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@main
+    permissions:
+      contents: read
+      security-events: write
+
+  docker-build:
+    needs: [go-check, gitleaks]
+    uses: duynhlab/gha-workflows/.github/workflows/docker-build-go.yml@main
+    with:
+      image-name: ${{ github.event.repository.name }}
+      push: true
+      scan-before-push: true
+      scan-severity: 'CRITICAL,HIGH'
+      scan-exit-code: '1'
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+
+  trivy-report:
+    needs: [docker-build]
+    if: needs.docker-build.outputs.scan-status == 'pass'
+    uses: duynhlab/gha-workflows/.github/workflows/trivy-scan.yml@main
+    with:
+      image-ref: ghcr.io/${{ github.repository }}/${{ github.event.repository.name }}@${{ needs.docker-build.outputs.digest }}
+      severity: 'CRITICAL,HIGH,MEDIUM'
+      exit-code: '0'
+      ignore-unfixed: true
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+  docker-sign:
+    needs: [docker-build]
+    uses: duynhlab/gha-workflows/.github/workflows/docker-sign.yml@main
+    with:
+      tags: ${{ needs.docker-build.outputs.tags }}
+      digest: ${{ needs.docker-build.outputs.digest }}
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+  # Continuous delivery to the dev environment: every main build bumps the
+  # image tag in the gitops repo. uat/prod promotion goes through Backstage
+  # PRs reviewed by DevOps/SRE.
+  update-gitops-dev:
+    needs: [docker-build, docker-sign]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gitops repo
+        uses: actions/checkout@v4
+        with:
+          repository: duynhlab/gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Bump dev image tag
+        run: |
+          NEW_TAG="sha-${GITHUB_SHA::7}"
+          yq -i ".spec.values.image.tag = \"${NEW_TAG}\"" apps/dev/checkout/release-patch.yaml
+          git diff --stat
+
+      - name: Commit and push
+        run: |
+          NEW_TAG="sha-${GITHUB_SHA::7}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "dev already at ${NEW_TAG}, nothing to do"
+            exit 0
+          fi
+          git add apps/dev/checkout/release-patch.yaml
+          git commit -m "Deploy checkout ${NEW_TAG} to dev"
+          git push origin main
+
+  # Enable once SONAR_TOKEN / SLACK_BOT_TOKEN / GSHEET_* secrets exist:
+  # sonar:
+  #   needs: [go-check, gitleaks]
+  #   uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@main
+  #   with:
+  #     project-key: 'duynhlab_${{ github.event.repository.name }}'
+  #     organization: 'duynhlab'
+  #     fail-on-quality-gate: false
+  #   secrets:
+  #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  #
+  # release-binary:
+  #   needs: [go-check]
+  #   if: startsWith(github.ref, 'refs/tags/v')
+  #   uses: duynhlab/gha-workflows/.github/workflows/goreleaser.yml@main
+  #   secrets: inherit
+  #   permissions:
+  #     contents: write
+  #     id-token: write
+  #
+  # notify:
+  #   if: always()
+  #   needs: [go-check, gitleaks, docker-build, trivy-report, docker-sign]
+  #   uses: duynhlab/gha-workflows/.github/workflows/status.yml@main
+  #   with:
+  #     slack_channel_id: "C0AD82A9A74"
+  #     gsheet_spreadsheet_id: "1F2VUrAOyMGnETApp5yA-ldCW81ConiQXnWYZVxKas_0"
+  #   secrets:
+  #     SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+  #     GSHEET_CLIENT_EMAIL: ${{ secrets.GSHEET_CLIENT_EMAIL }}
+  #     GSHEET_PRIVATE_KEY: ${{ secrets.GSHEET_PRIVATE_KEY }}

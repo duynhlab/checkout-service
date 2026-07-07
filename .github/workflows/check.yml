@@ -1,0 +1,48 @@
+name: Check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+jobs:
+  go-check:
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@main
+    with:
+      command-test: 'go test -race -coverprofile=coverage.out ./...'
+      lint: true
+    secrets: inherit
+
+  gitleaks:
+    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@main
+    permissions:
+      contents: read
+      security-events: write
+
+  # Enable once SONAR_TOKEN exists (org or repo secret):
+  # sonar:
+  #   needs: [go-check, gitleaks]
+  #   uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@main
+  #   with:
+  #     project-key: 'duynhlab_${{ github.event.repository.name }}'
+  #     organization: 'duynhlab'
+  #     fail-on-quality-gate: false
+  #   secrets:
+  #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # Enable once SLACK_BOT_TOKEN / GSHEET_* secrets exist:
+  # notify:
+  #   if: always()
+  #   needs: [go-check, gitleaks]
+  #   uses: duynhlab/gha-workflows/.github/workflows/status.yml@main
+  #   with:
+  #     slack_channel_id: "C0AD82A9A74"
+  #     gsheet_spreadsheet_id: "1F2VUrAOyMGnETApp5yA-ldCW81ConiQXnWYZVxKas_0"
+  #   secrets:
+  #     SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+  #     GSHEET_CLIENT_EMAIL: ${{ secrets.GSHEET_CLIENT_EMAIL }}
+  #     GSHEET_PRIVATE_KEY: ${{ secrets.GSHEET_PRIVATE_KEY }}
