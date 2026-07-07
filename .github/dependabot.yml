@@ -19,9 +19,3 @@ updates:
     schedule:
       interval: "daily"
     labels: ["dependencies", "docker"]
-
-  - package-ecosystem: "docker"
-    directory: "/db/migrations"
-    schedule:
-      interval: "daily"
-    labels: ["dependencies", "docker"]
