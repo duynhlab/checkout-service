@@ -1,6 +1,8 @@
 // Package v1 implements checkout's HTTP transport: Variant A collection-noun
-// routes under /checkout/v1/private/sessions (naming convention v3.0.0,
-// ADR-017 — checkout's registered collection noun is `sessions`). Handlers
+// routes under /checkout/v1/private/checkout/sessions (naming convention
+// v3.0.1 — checkout, like auth, is a process-named service with no natural
+// plural, so it uses the literal `checkout` segment and nests its resources
+// beneath it). Handlers
 // validate, call the logic layer, and translate domain errors to the shared
 // httpx envelope. All routes are private: Kong edge-JWT pre-filters, the
 // in-service authmw verification is authoritative, and sessions are
@@ -40,7 +42,7 @@ func NewHandler(svc *logicv1.CheckoutService) *Handler {
 // RegisterRoutes mounts the session routes on the private group. The caller
 // passes the JWT middleware so tests can inject a fake.
 func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
-	private := r.Group("/checkout/v1/private", jwtMW)
+	private := r.Group("/checkout/v1/private/checkout", jwtMW)
 	{
 		private.POST("/sessions", h.CreateSession)
 		private.GET("/sessions/:id", h.GetSession)
@@ -49,7 +51,7 @@ func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
 	}
 }
 
-// CreateSession handles POST /checkout/v1/private/sessions — snapshot the
+// CreateSession handles POST /checkout/v1/private/checkout/sessions — snapshot the
 // cart, re-validate prices against product, return 201 (created) or 200 (an
 // active session already exists; POST is idempotent).
 func (h *Handler) CreateSession(c *gin.Context) {
@@ -86,7 +88,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	c.JSON(status, toSessionResponse(session))
 }
 
-// GetSession handles GET /checkout/v1/private/sessions/:id.
+// GetSession handles GET /checkout/v1/private/checkout/sessions/:id.
 func (h *Handler) GetSession(c *gin.Context) {
 	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
 		attribute.String("layer", "web"),
@@ -103,7 +105,7 @@ func (h *Handler) GetSession(c *gin.Context) {
 	c.JSON(http.StatusOK, toSessionResponse(session))
 }
 
-// SetAddress handles PUT /checkout/v1/private/sessions/:id/address.
+// SetAddress handles PUT /checkout/v1/private/checkout/sessions/:id/address.
 func (h *Handler) SetAddress(c *gin.Context) {
 	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
 		attribute.String("layer", "web"),
@@ -127,7 +129,7 @@ func (h *Handler) SetAddress(c *gin.Context) {
 	c.JSON(http.StatusOK, toSessionResponse(session))
 }
 
-// CancelSession handles DELETE /checkout/v1/private/sessions/:id.
+// CancelSession handles DELETE /checkout/v1/private/checkout/sessions/:id.
 func (h *Handler) CancelSession(c *gin.Context) {
 	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
 		attribute.String("layer", "web"),

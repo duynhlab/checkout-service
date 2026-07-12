@@ -54,10 +54,10 @@ someone else's session id behaves exactly like one that doesn't exist (404).
 
 | Method | Path | What it does |
 |--------|------|--------------|
-| `POST` | `/checkout/v1/private/sessions` | Start checking out: snapshots your cart, re-checks every price against the catalog. Creating twice is safe — you get your existing session back (**201** new, **200** existing) |
-| `GET` | `/checkout/v1/private/sessions/:id` | See the session: items, prices, totals, status |
-| `PUT` | `/checkout/v1/private/sessions/:id/address` | Save your shipping address |
-| `DELETE` | `/checkout/v1/private/sessions/:id` | Cancel the session (your cart is untouched) |
+| `POST` | `/checkout/v1/private/checkout/sessions` | Start checking out: snapshots your cart, re-checks every price against the catalog. Creating twice is safe — you get your existing session back (**201** new, **200** existing) |
+| `GET` | `/checkout/v1/private/checkout/sessions/:id` | See the session: items, prices, totals, status |
+| `PUT` | `/checkout/v1/private/checkout/sessions/:id/address` | Save your shipping address |
+| `DELETE` | `/checkout/v1/private/checkout/sessions/:id` | Cancel the session (your cart is untouched) |
 
 Errors come in the platform envelope `{"error", "code"}`. The ones you'll
 actually meet: `409 CONFLICT` (empty cart), `410 SESSION_EXPIRED` (took longer

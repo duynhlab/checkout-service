@@ -115,7 +115,7 @@ func TestCreateSession_201WithSnapshot(t *testing.T) {
 		&fakeCart{lines: []logicv1.CartLine{{ProductID: "1", ProductName: "Mouse", Quantity: 1, CartPriceMinor: 2999}}},
 		&fakeProducts{infos: []logicv1.ProductInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 3499}}}, "7")
 
-	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/sessions", "")
+	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/checkout/sessions", "")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
 	}
@@ -136,7 +136,7 @@ func TestCreateSession_201WithSnapshot(t *testing.T) {
 
 func TestCreateSession_200OnExistingActive(t *testing.T) {
 	r := newRouter(&fakeRepo{active: liveSession("7", domain.StatusOpen)}, &fakeCart{}, &fakeProducts{}, "7")
-	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/sessions", "")
+	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/checkout/sessions", "")
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200 (idempotent create)", rec.Code)
 	}
@@ -144,7 +144,7 @@ func TestCreateSession_200OnExistingActive(t *testing.T) {
 
 func TestCreateSession_EmptyCartIs409(t *testing.T) {
 	r := newRouter(&fakeRepo{}, &fakeCart{}, &fakeProducts{}, "7")
-	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/sessions", "")
+	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/checkout/sessions", "")
 	if rec.Code != http.StatusConflict {
 		t.Errorf("status = %d, want 409", rec.Code)
 	}
@@ -152,7 +152,7 @@ func TestCreateSession_EmptyCartIs409(t *testing.T) {
 
 func TestCreateSession_UpstreamDownIsOpaque500(t *testing.T) {
 	r := newRouter(&fakeRepo{}, &fakeCart{err: errors.New("dial tcp 10.1.2.3: refused")}, &fakeProducts{}, "7")
-	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/sessions", "")
+	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/checkout/sessions", "")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
@@ -163,7 +163,7 @@ func TestCreateSession_UpstreamDownIsOpaque500(t *testing.T) {
 
 func TestGetSession_AntiIDOR404ForForeignOwner(t *testing.T) {
 	r := newRouter(&fakeRepo{byID: liveSession("7", domain.StatusOpen)}, &fakeCart{}, &fakeProducts{}, "8")
-	rec := doJSON(r, http.MethodGet, "/checkout/v1/private/sessions/11111111-1111-1111-1111-111111111111", "")
+	rec := doJSON(r, http.MethodGet, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111", "")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404 (foreign session indistinguishable from missing)", rec.Code)
 	}
@@ -174,7 +174,7 @@ func TestGetSession_Expired410WithCode(t *testing.T) {
 	stale.ExpiresAt = time.Now().Add(-time.Minute)
 	r := newRouter(&fakeRepo{byID: stale}, &fakeCart{}, &fakeProducts{}, "7")
 
-	rec := doJSON(r, http.MethodGet, "/checkout/v1/private/sessions/11111111-1111-1111-1111-111111111111", "")
+	rec := doJSON(r, http.MethodGet, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111", "")
 	if rec.Code != http.StatusGone {
 		t.Fatalf("status = %d, want 410", rec.Code)
 	}
@@ -185,7 +185,7 @@ func TestGetSession_Expired410WithCode(t *testing.T) {
 
 func TestSetAddress_200MovesToAddressSet(t *testing.T) {
 	r := newRouter(&fakeRepo{byID: liveSession("7", domain.StatusOpen)}, &fakeCart{}, &fakeProducts{}, "7")
-	rec := doJSON(r, http.MethodPut, "/checkout/v1/private/sessions/11111111-1111-1111-1111-111111111111/address",
+	rec := doJSON(r, http.MethodPut, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/address",
 		`{"full_name":"Alice","line1":"1 Main St","city":"HN","country":"VN"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
@@ -197,7 +197,7 @@ func TestSetAddress_200MovesToAddressSet(t *testing.T) {
 
 func TestSetAddress_MissingFieldsIs400(t *testing.T) {
 	r := newRouter(&fakeRepo{byID: liveSession("7", domain.StatusOpen)}, &fakeCart{}, &fakeProducts{}, "7")
-	rec := doJSON(r, http.MethodPut, "/checkout/v1/private/sessions/11111111-1111-1111-1111-111111111111/address",
+	rec := doJSON(r, http.MethodPut, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/address",
 		`{"line1":"1 Main St"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
@@ -206,7 +206,7 @@ func TestSetAddress_MissingFieldsIs400(t *testing.T) {
 
 func TestSetAddress_OnCompletedIs409InvalidTransition(t *testing.T) {
 	r := newRouter(&fakeRepo{byID: liveSession("7", domain.StatusCompleted)}, &fakeCart{}, &fakeProducts{}, "7")
-	rec := doJSON(r, http.MethodPut, "/checkout/v1/private/sessions/11111111-1111-1111-1111-111111111111/address",
+	rec := doJSON(r, http.MethodPut, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/address",
 		`{"full_name":"Alice","line1":"1 Main St","city":"HN","country":"VN"}`)
 	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "INVALID_TRANSITION") {
 		t.Errorf("got (%d, %s), want 409 INVALID_TRANSITION", rec.Code, rec.Body.String())
@@ -215,7 +215,7 @@ func TestSetAddress_OnCompletedIs409InvalidTransition(t *testing.T) {
 
 func TestCancelSession_200(t *testing.T) {
 	r := newRouter(&fakeRepo{byID: liveSession("7", domain.StatusShippingSet)}, &fakeCart{}, &fakeProducts{}, "7")
-	rec := doJSON(r, http.MethodDelete, "/checkout/v1/private/sessions/11111111-1111-1111-1111-111111111111", "")
+	rec := doJSON(r, http.MethodDelete, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111", "")
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
@@ -224,10 +224,10 @@ func TestCancelSession_200(t *testing.T) {
 func TestRoutes_Unauthenticated401(t *testing.T) {
 	r := newRouter(&fakeRepo{}, &fakeCart{}, &fakeProducts{}, "")
 	for _, tc := range []struct{ method, path string }{
-		{http.MethodPost, "/checkout/v1/private/sessions"},
-		{http.MethodGet, "/checkout/v1/private/sessions/x"},
-		{http.MethodPut, "/checkout/v1/private/sessions/x/address"},
-		{http.MethodDelete, "/checkout/v1/private/sessions/x"},
+		{http.MethodPost, "/checkout/v1/private/checkout/sessions"},
+		{http.MethodGet, "/checkout/v1/private/checkout/sessions/x"},
+		{http.MethodPut, "/checkout/v1/private/checkout/sessions/x/address"},
+		{http.MethodDelete, "/checkout/v1/private/checkout/sessions/x"},
 	} {
 		if rec := doJSON(r, tc.method, tc.path, "{}"); rec.Code != http.StatusUnauthorized {
 			t.Errorf("%s %s = %d, want 401", tc.method, tc.path, rec.Code)
