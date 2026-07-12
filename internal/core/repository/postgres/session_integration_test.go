@@ -27,6 +27,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/duynhlab/pkg/idempotency"
+
 	"github.com/duynhlab/checkout-service/internal/core/domain"
 )
 
@@ -237,5 +239,72 @@ func TestSessionRepository_GarbageIDIsNotFoundNot500(t *testing.T) {
 	_, err := repo.FindByID(context.Background(), "not-a-uuid")
 	if !errors.Is(err, domain.ErrSessionNotFound) {
 		t.Fatalf("FindByID(garbage) err = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestSessionRepository_TouchBumpsExpiryOnActiveOnly(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Reset-on-activity (RFC-0015 P2): every successful mutation bumps the
+	// DB expiry so the lazy backstop agrees with the workflow timer.
+	newExpiry := time.Now().Add(45 * time.Minute)
+	if err := repo.Touch(ctx, s.ID, newExpiry); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	got, err := repo.FindByID(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if got.ExpiresAt.Before(newExpiry.Add(-2 * time.Second)) {
+		t.Errorf("expires_at = %v, want bumped to ~%v", got.ExpiresAt, newExpiry)
+	}
+
+	// A terminal session is never touched back to life.
+	if err := repo.MarkExpired(ctx, s.ID, domain.ExpiredByLazy); err != nil {
+		t.Fatalf("MarkExpired: %v", err)
+	}
+	late := time.Now().Add(2 * time.Hour)
+	if err := repo.Touch(ctx, s.ID, late); err != nil {
+		t.Fatalf("Touch on terminal must be a harmless no-op, got: %v", err)
+	}
+	got, _ = repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusExpired || got.ExpiresAt.After(time.Now().Add(90*time.Minute)) {
+		t.Errorf("terminal session mutated by Touch: %+v", got)
+	}
+}
+
+// TestIdempotencyKeysMigrationWorksWithPkg proves migration 000002 satisfies
+// pkg/idempotency (ADR-010 consumer #2) under THIS service's pool settings —
+// the simple query protocol is exactly what turned response_body jsonb writes
+// into bytea errors in P1, so the full Claim→Checkpoint→Finish→replay cycle
+// must round-trip here, not just in pkg's own tests.
+func TestIdempotencyKeysMigrationWorksWithPkg(t *testing.T) {
+	pool := newTestDB(t)
+	ctx := context.Background()
+	repo := idempotency.New(pool, time.Minute)
+
+	rec, fresh, err := repo.Claim(ctx, 7, "checkout:sess-1:key-1", "POST", "/confirm", "h1")
+	if err != nil || !fresh {
+		t.Fatalf("Claim fresh = (%v, %v), want fresh claim", fresh, err)
+	}
+	subject := int64(42)
+	if err := repo.Checkpoint(ctx, rec.ID, &subject); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := repo.Finish(ctx, rec.ID, 201, []byte(`{"order_id":"42"}`)); err != nil {
+		t.Fatalf("Finish (jsonb under simple protocol): %v", err)
+	}
+
+	replay, fresh, err := repo.Claim(ctx, 7, "checkout:sess-1:key-1", "POST", "/confirm", "h1")
+	if err != nil || fresh {
+		t.Fatalf("Claim replay = (%v, %v), want existing record", fresh, err)
+	}
+	if !replay.Finished() || *replay.ResponseCode != 201 || *replay.SubjectID != 42 {
+		t.Errorf("replay = %+v, want finished 201 subject 42", replay)
 	}
 }

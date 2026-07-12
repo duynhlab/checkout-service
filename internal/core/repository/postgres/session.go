@@ -156,6 +156,24 @@ func (r *SessionRepository) SetAddress(ctx context.Context, id string, from doma
 	return nil
 }
 
+// Touch bumps expires_at — the reset-on-activity half of the expiry contract
+// (RFC-0015 P2): every successful mutation both signals the abandonment
+// workflow (timer reset) and bumps the DB expiry here, so the lazy backstop
+// never expires a session the timer considers alive. Terminal sessions are
+// left untouched — a late Touch is a harmless no-op, like a late timer.
+func (r *SessionRepository) Touch(ctx context.Context, id string, expiresAt time.Time) error {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	_, err := r.db.Exec(ctx, `
+		UPDATE checkout_sessions SET expires_at = $2, updated_at = now()
+		WHERE id = $1 AND status NOT IN ('completed','cancelled','expired')`, id, expiresAt)
+	if err != nil {
+		return fmt.Errorf("touch session: %w", err)
+	}
+	return nil
+}
+
 // MarkExpired conditionally expires a non-terminal session. A late call
 // against a terminal session is a no-op — never an error (RFC-0015: a
 // late-firing timer must be harmless).
