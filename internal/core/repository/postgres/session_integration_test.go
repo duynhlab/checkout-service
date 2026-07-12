@@ -218,3 +218,14 @@ func TestSessionRepository_MarkExpired(t *testing.T) {
 		t.Errorf("reason = %s, want lazy preserved", *got.ExpiredReason)
 	}
 }
+
+func TestSessionRepository_GarbageIDIsNotFoundNot500(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+
+	// A non-UUID id raises Postgres 22P02; the repo must answer "no such
+	// session" so the web layer 404s instead of 500ing on garbage ids.
+	_, err := repo.FindByID(context.Background(), "not-a-uuid")
+	if !errors.Is(err, domain.ErrSessionNotFound) {
+		t.Fatalf("FindByID(garbage) err = %v, want ErrSessionNotFound", err)
+	}
+}

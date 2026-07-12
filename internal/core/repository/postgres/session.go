@@ -23,6 +23,11 @@ const queryTimeout = 3 * time.Second
 // uniqueViolation is the Postgres error code for a unique-index conflict.
 const uniqueViolation = "23505"
 
+// invalidTextRepresentation is the Postgres error code raised when a value
+// cannot be cast to the column type — here, a non-UUID session id. Treated as
+// "no such session" so garbage ids answer 404, not 500.
+const invalidTextRepresentation = "22P02"
+
 // SessionRepository persists checkout sessions.
 type SessionRepository struct {
 	db *pgxpool.Pool
@@ -158,10 +163,14 @@ func (r *SessionRepository) MarkExpired(ctx context.Context, id string, reason d
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
+	// `confirming` is deliberately NOT expirable: a confirm may have an order
+	// handoff in flight (P2) and must finish or drop back to shipping_set —
+	// never be yanked to expired mid-flight. Mirrors the FSM table, which has
+	// no confirming→expired edge.
 	_, err := r.db.Exec(ctx, `
 		UPDATE checkout_sessions
 		SET status = 'expired', expired_reason = $2, updated_at = now()
-		WHERE id = $1 AND status NOT IN ('completed','cancelled','expired')`, id, reason)
+		WHERE id = $1 AND status NOT IN ('completed','cancelled','expired','confirming')`, id, reason)
 	if err != nil {
 		return fmt.Errorf("mark expired: %w", err)
 	}
@@ -189,6 +198,11 @@ func (r *SessionRepository) scanSession(ctx context.Context, query string, arg a
 		return nil, domain.ErrSessionNotFound
 	}
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == invalidTextRepresentation {
+			// A non-UUID id cannot name a session: report not-found, not 500.
+			return nil, domain.ErrSessionNotFound
+		}
 		return nil, fmt.Errorf("scan session: %w", err)
 	}
 	if len(addrJSON) > 0 {

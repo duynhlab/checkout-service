@@ -12,19 +12,24 @@ import (
 // --- doubles ---
 
 type fakeRepo struct {
-	active      *domain.Session
-	activeErr   error
-	byID        *domain.Session
-	byIDErr     error
-	createErr   error
-	created     *domain.Session
-	updated     []string // "from→to"
-	updateErr   error
-	addressed   *domain.Address
-	setAddrErr  error
-	expired     []domain.ExpiredReason
-	markExpErr  error
-	createCalls int
+	active    *domain.Session
+	activeErr error
+	// activeSecond, when set, is returned from the SECOND FindActiveByUserID
+	// call onward (simulating a concurrent winner appearing between the
+	// pre-create lookup and the post-conflict re-fetch).
+	activeSecond *domain.Session
+	activeCalls  int
+	byID         *domain.Session
+	byIDErr      error
+	createErr    error
+	created      *domain.Session
+	updated      []string // "from→to"
+	updateErr    error
+	addressed    *domain.Address
+	setAddrErr   error
+	expired      []domain.ExpiredReason
+	markExpErr   error
+	createCalls  int
 }
 
 func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
@@ -42,6 +47,10 @@ func (f *fakeRepo) FindByID(_ context.Context, _ string) (*domain.Session, error
 }
 
 func (f *fakeRepo) FindActiveByUserID(_ context.Context, _ string) (*domain.Session, error) {
+	f.activeCalls++
+	if f.activeCalls > 1 && f.activeSecond != nil {
+		return f.activeSecond, nil
+	}
 	if f.active == nil && f.activeErr == nil {
 		return nil, domain.ErrSessionNotFound
 	}
@@ -190,28 +199,23 @@ func TestCreateSession_UpstreamErrorsAreOpaque(t *testing.T) {
 }
 
 func TestCreateSession_LosingCreateRaceReturnsWinner(t *testing.T) {
+	// Sequence: FindActive #1 → nothing; Create → unique-violation (a
+	// concurrent request won); FindActive #2 → the winner. The caller must
+	// receive the winner with created=false, never an error.
 	winner := liveSession(domain.StatusOpen)
-	repo := &fakeRepo{createErr: domain.ErrActiveSessionExists}
-	// After the failed create, the winner is discoverable.
-	repo.activeErr = nil
-	repo.active = nil // first lookup: nothing active
+	repo := &fakeRepo{createErr: domain.ErrActiveSessionExists, activeSecond: winner}
 	cart := &fakeCart{lines: []CartLine{{ProductID: "1", ProductName: "Mouse", Quantity: 1, CartPriceMinor: 100}}}
 	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "1", UnitPriceMinor: 100}}}
 
-	svc := newSvc(repo, cart, prods)
-	// Make the post-race lookup succeed by flipping the fake between calls.
-	repo.activeErr = nil
-	go func() {}()
-	repo.active = nil
-	// Simulate: create fails with ErrActiveSessionExists, then FindActive
-	// returns the winner.
-	repo.active = winner
-	s, created, err := svc.CreateSession(context.Background(), "7")
+	s, created, err := newSvc(repo, cart, prods).CreateSession(context.Background(), "7")
 	if err != nil || created {
-		t.Fatalf("want the race winner with created=false, got (%v, %v)", created, err)
+		t.Fatalf("want the race winner with created=false, got (created=%v, err=%v)", created, err)
 	}
 	if s != winner {
 		t.Errorf("session = %+v, want the winner", s)
+	}
+	if repo.createCalls != 1 || repo.activeCalls != 2 {
+		t.Errorf("calls create=%d active=%d, want 1 create and 2 active lookups", repo.createCalls, repo.activeCalls)
 	}
 }
 
