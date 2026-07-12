@@ -39,6 +39,17 @@ func ActiveStatuses() []SessionStatus {
 
 // ExpiredReason records who noticed the expiry: the durable Temporal timer
 // (P2) or the lazy check on a read/mutation.
+// ExpireOutcome is ExpireDue's answer to the abandonment timer (ADR-019):
+// the row was expired now, is not due yet (re-arm to the DB deadline), or is
+// out of the timer's jurisdiction (terminal/confirming/absent → exit).
+type ExpireOutcome string
+
+const (
+	OutcomeExpired ExpireOutcome = "expired"
+	OutcomeNotDue  ExpireOutcome = "not_due"
+	OutcomeGone    ExpireOutcome = "gone"
+)
+
 type ExpiredReason string
 
 const (
@@ -87,6 +98,7 @@ type Session struct {
 	Currency           string         `json:"currency"`
 	PaymentMethodToken string         `json:"-"` // tok_… reference; never serialized outward
 	OrderID            string         `json:"order_id,omitempty"`
+	ConfirmKeyID       *int64         `json:"-"` // idempotency claim bound to confirming (never serialized)
 	ExpiresAt          time.Time      `json:"expires_at"`
 	ExpiredReason      *ExpiredReason `json:"expired_reason,omitempty"`
 	CreatedAt          time.Time      `json:"created_at"`
@@ -109,6 +121,25 @@ type SessionRepository interface {
 	// SetAddress persists the address and the address_set status in one write
 	// (same conditional semantics as UpdateStatus).
 	SetAddress(ctx context.Context, id string, from SessionStatus, addr *Address) error
+	// SetShipping persists the shipping method + fee and the shipping_set
+	// status in one conditional write (same semantics as UpdateStatus). The
+	// session total is recomputed in SQL from the persisted components.
+	SetShipping(ctx context.Context, id string, from SessionStatus, method string, feeMinor int64) error
+	// SetPaymentToken persists the tok_ reference and the ready status in one
+	// conditional write. Token shape is validated in the logic layer BEFORE
+	// this is called — PAN-shaped input must never reach the database.
+	SetPaymentToken(ctx context.Context, id string, from SessionStatus, token string) error
+	// Touch bumps expires_at on a non-terminal session (reset-on-activity);
+	// a late Touch on a terminal session is a harmless no-op.
+	Touch(ctx context.Context, id string, expiresAt time.Time) error
+	// BeginConfirm CASes ready → confirming and binds the idempotency claim.
+	BeginConfirm(ctx context.Context, id string, keyID int64) error
+	// RequoteItems drops confirming → shipping_set with fresh prices and
+	// clears the binding, conditional on the claim still holding the session.
+	RequoteItems(ctx context.Context, id string, keyID int64, items []SessionItem, subtotalMinor, totalMinor int64) error
+	// CompleteSession CASes confirming → completed under the claim binding,
+	// recording the order id. The binding stays on the completed row.
+	CompleteSession(ctx context.Context, id string, keyID int64, orderID string) error
 	// MarkExpired conditionally expires a non-terminal session, recording who
 	// noticed (timer vs lazy). Expiring an already-terminal session is a
 	// no-op, not an error — late timers must be harmless.

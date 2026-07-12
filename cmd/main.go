@@ -1,8 +1,9 @@
 // checkout-service — RFC-0015: the session/UX orchestrator between the SPA
-// and order-service. Client-only (no gRPC server): it dials cart (item-list
-// authority) and product (price authority) to snapshot and re-validate
-// checkout sessions. Subcommands: `migrate` applies the embedded schema
-// migrations; no `seed` — checkout has no demo data in P1.
+// and order-service. Client-only on gRPC (no server): it dials cart
+// (item-list authority), product (price authority), and order (the P2
+// confirm handoff). Subcommands: `migrate` applies the embedded schema
+// migrations; `worker` runs the Temporal worker for the
+// AbandonedCheckoutWorkflow (ADR-019). No `seed` — checkout has no demo data.
 package main
 
 import (
@@ -16,15 +17,20 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 
 	"github.com/duynhlab/pkg/authmw"
 	"github.com/duynhlab/pkg/grpcx"
+	"github.com/duynhlab/pkg/idempotency"
 	"github.com/duynhlab/pkg/logger/zapx"
 	"github.com/duynhlab/pkg/migratex"
 	"github.com/duynhlab/pkg/obsx"
+	"github.com/duynhlab/pkg/temporalx"
 
 	"github.com/duynhlab/checkout-service/config"
 	migrations "github.com/duynhlab/checkout-service/db/migrations"
@@ -33,6 +39,7 @@ import (
 	"github.com/duynhlab/checkout-service/internal/core/repository/postgres"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
 	webv1 "github.com/duynhlab/checkout-service/internal/web/v1"
+	checkoutwf "github.com/duynhlab/checkout-service/internal/workflow"
 	"github.com/duynhlab/checkout-service/middleware"
 )
 
@@ -45,7 +52,8 @@ func main() {
 	}
 	defer func() { _ = logger.Sync() }()
 
-	// Subcommand `migrate` runs the embedded SQL set and exits.
+	// Subcommand `migrate` runs the embedded SQL set and exits. `worker` is
+	// handled below, after observability and the DB pool exist.
 	if len(os.Args) > 1 && runSubcommand(os.Args[1], cfg, logger) {
 		return
 	}
@@ -88,28 +96,57 @@ func main() {
 		logger.Info("Profiling disabled (PROFILING_ENABLED=false)")
 	}
 
+	// `<binary> worker` runs the Temporal worker for the abandonment
+	// workflow and serves no HTTP beyond health probes.
+	if maybeRunWorker(cfg, logger, pool) {
+		if tp != nil {
+			_ = tp.Shutdown(context.Background()) // flush the worker's final metrics/spans
+		}
+		return
+	}
+
 	// East-west gRPC clients (lazy dial — grpcx.Dial uses grpc.NewClient, so
 	// an unreachable target fails per-call, not at startup).
-	cartConn, err := grpcx.Dial(cfg.Checkout.CartGRPCAddr)
-	if err != nil {
-		logger.Error("Failed to dial cart gRPC", zap.String("addr", cfg.Checkout.CartGRPCAddr), zap.Error(err))
+	conns, cleanup, ok := dialEastWest(cfg, logger)
+	if !ok {
 		return
 	}
-	defer closeConn(cartConn, logger, "cart")
-	productConn, err := grpcx.Dial(cfg.Checkout.ProductGRPCAddr)
-	if err != nil {
-		logger.Error("Failed to dial product gRPC", zap.String("addr", cfg.Checkout.ProductGRPCAddr), zap.Error(err))
-		return
+	defer cleanup()
+	cartConn, productConn, orderConn := conns[0], conns[1], conns[2]
+
+	// Deadline-fencing invariant (RFC-0015 P2 confirm): a lock takeover must
+	// PROVE the previous owner is dead, which holds only when the takeover
+	// window dwarfs the longest possible confirm execution.
+	if cfg.Checkout.IdempotencyLockTakeover <= 4*logicv1.ConfirmDeadline {
+		// Fatal: a config gate must exit non-zero so orchestrators see it.
+		logger.Fatal("IDEMPOTENCY_LOCK_TAKEOVER must exceed 4× the confirm deadline",
+			zap.Duration("takeover", cfg.Checkout.IdempotencyLockTakeover),
+			zap.Duration("confirm_deadline", logicv1.ConfirmDeadline))
 	}
-	defer closeConn(productConn, logger, "product")
 
 	repo := postgres.NewSessionRepository(pool)
 	svc := logicv1.NewCheckoutService(repo,
 		clients.NewCartClient(cartConn),
 		clients.NewProductClient(productConn),
 		cfg.Checkout.SessionTTL,
+	).WithConfirm(
+		idempotency.New(pool, cfg.Checkout.IdempotencyLockTakeover),
+		clients.NewOrderClient(orderConn),
 	)
+
+	// Abandonment notifier (ADR-019): best-effort signals to the durable
+	// timer. Temporal being unreachable is NOT fatal — expiry degrades to
+	// the lazy backstop only.
+	if tc, cleanup, ok := configureTemporal(cfg, logger); ok {
+		defer cleanup()
+		svc = svc.WithAbandonment(checkoutwf.NewNotifier(tc, cfg.Temporal.TaskQueue, cfg.Checkout.SessionTTL, logger))
+	}
 	handler := webv1.NewHandler(svc)
+
+	// Retention: finished idempotency rows cache address-bearing session
+	// JSON; reap them after the 24h replay window (unfinished rows are never
+	// reaped — a parked confirm's claim binding must not rot).
+	go runIdempotencyReaper(repo, logger)
 
 	// Local JWT verification via JWKS — fail-closed, the only credential path.
 	verifier, err := authmw.NewVerifier(cfg.JWKSURL, cfg.JWTIssuer, cfg.JWTAudience)
@@ -123,6 +160,56 @@ func main() {
 	runGracefulShutdown(cfg, logger, srv, tp, pool, &isShuttingDown)
 }
 
+// idempotencyRetention is the replay window (Stripe-style 24h) after which a
+// FINISHED key row (and its cached response body) is deleted.
+const idempotencyRetention = 24 * time.Hour
+
+// runIdempotencyReaper deletes expired finished idempotency rows hourly.
+func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		n, err := repo.ReapFinishedIdempotencyKeys(context.Background(), idempotencyRetention)
+		if err != nil {
+			logger.Warn("idempotency reap failed", zap.Error(err))
+			continue
+		}
+		if n > 0 {
+			logger.Info("idempotency keys reaped", zap.Int64("rows", n))
+		}
+	}
+}
+
+// dialEastWest opens the cart/product/order client connections (in that
+// order) and returns a single cleanup for all of them.
+func dialEastWest(cfg *config.Config, logger *zap.Logger) ([3]*grpc.ClientConn, func(), bool) {
+	var conns [3]*grpc.ClientConn
+	targets := []struct {
+		name string
+		addr string
+	}{
+		{"cart", cfg.Checkout.CartGRPCAddr},
+		{"product", cfg.Checkout.ProductGRPCAddr},
+		{"order", cfg.Checkout.OrderGRPCAddr},
+	}
+	for i, tgt := range targets {
+		conn, err := grpcx.Dial(tgt.addr)
+		if err != nil {
+			logger.Error("Failed to dial "+tgt.name+" gRPC", zap.String("addr", tgt.addr), zap.Error(err))
+			for j := range i {
+				_ = conns[j].Close()
+			}
+			return conns, nil, false
+		}
+		conns[i] = conn
+	}
+	cleanup := func() {
+		for i, tgt := range targets {
+			closeConn(conns[i], logger, tgt.name)
+		}
+	}
+	return conns, cleanup, true
+}
 
 // initObservability wires the RFC-0014 OTel pipeline (traces, OTLP metrics,
 // logs) and tees application logs into it. Returns the shutdown handle (nil
@@ -150,6 +237,120 @@ func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context)
 		zap.Float64("sample_rate", otelCfg.SampleRate),
 	)
 	return obs, logger
+}
+
+// Temporal startup-dial budget: the bring-up race (compose/Kind) usually
+// resolves within a few seconds; the serve path degrades on exhaustion, the
+// worker path is fatal (it can do nothing without Temporal).
+const (
+	temporalDialAttempts = 5
+	temporalDialBackoff  = 2 * time.Second
+)
+
+// dialTemporalRetry dials Temporal with a bounded linear-backoff budget — a
+// single eager dial loses the bring-up race when Temporal reports healthy
+// moments after this process starts (order-service lesson).
+func dialTemporalRetry(cfg *config.Config, logger *zap.Logger) (client.Client, error) {
+	var lastErr error
+	for i := 1; i <= temporalDialAttempts; i++ {
+		tc, err := temporalx.Dial(temporalx.Config{HostPort: cfg.Temporal.HostPort, Namespace: cfg.Temporal.Namespace})
+		if err == nil {
+			return tc, nil
+		}
+		lastErr = err
+		if i < temporalDialAttempts {
+			logger.Warn("Temporal dial failed; retrying",
+				zap.Int("attempt", i), zap.Int("attempts", temporalDialAttempts),
+				zap.String("hostport", cfg.Temporal.HostPort), zap.Error(err))
+			time.Sleep(time.Duration(i) * temporalDialBackoff)
+		}
+	}
+	return nil, lastErr
+}
+
+// configureTemporal dials Temporal for the serve path. Failure is non-fatal:
+// ok=false means the abandonment notifier stays nil and expiry is lazy-only.
+func configureTemporal(cfg *config.Config, logger *zap.Logger) (client.Client, func(), bool) {
+	tc, err := dialTemporalRetry(cfg, logger)
+	if err != nil {
+		logger.Warn("Temporal unavailable; session expiry degrades to the lazy backstop only",
+			zap.String("hostport", cfg.Temporal.HostPort), zap.Error(err))
+		return nil, nil, false
+	}
+	logger.Info("Temporal client initialized",
+		zap.String("hostport", cfg.Temporal.HostPort),
+		zap.String("namespace", cfg.Temporal.Namespace))
+	return tc, func() { tc.Close() }, true
+}
+
+// maybeRunWorker runs the Temporal worker for the abandonment workflow when
+// invoked as `<binary> worker`, and reports whether it handled the command.
+// Temporal being unreachable after the retry budget is fatal here — the
+// worker can do nothing without it (order-worker pattern).
+func maybeRunWorker(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) bool {
+	if len(os.Args) <= 1 || os.Args[1] != "worker" {
+		return false
+	}
+
+	tc, err := dialTemporalRetry(cfg, logger)
+	if err != nil {
+		logger.Fatal("Failed to connect to Temporal", zap.String("hostport", cfg.Temporal.HostPort), zap.Error(err))
+	}
+	defer tc.Close()
+
+	acts := &checkoutwf.Activities{
+		Sessions:     postgres.NewSessionRepository(pool),
+		LockTakeover: cfg.Checkout.IdempotencyLockTakeover,
+	}
+	w := temporalx.NewWorker(tc, cfg.Temporal.TaskQueue)
+	w.RegisterWorkflow(checkoutwf.AbandonedCheckoutWorkflow)
+	w.RegisterActivity(acts.ExpireIfDue)
+
+	// Probes need an endpoint even on the worker (order-worker pattern);
+	// /ready flips once the poller is about to run.
+	ready := &atomic.Bool{}
+	healthSrv := startWorkerHealthServer(cfg.Service.Port, logger, ready)
+	defer func() { _ = healthSrv.Close() }()
+
+	logger.Info("Starting Temporal worker",
+		zap.String("hostport", cfg.Temporal.HostPort),
+		zap.String("namespace", cfg.Temporal.Namespace),
+		zap.String("task_queue", cfg.Temporal.TaskQueue))
+	ready.Store(true)
+	if err := w.Run(worker.InterruptCh()); err != nil {
+		logger.Fatal("Temporal worker stopped with error", zap.Error(err))
+	}
+	return true
+}
+
+// startWorkerHealthServer serves /health and /ready for the worker process.
+func startWorkerHealthServer(port string, logger *zap.Logger, ready *atomic.Bool) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"starting"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("worker health server failed", zap.Error(err))
+		}
+	}()
+	return srv
 }
 
 // runSubcommand handles `migrate`; returns true when it handled the command.

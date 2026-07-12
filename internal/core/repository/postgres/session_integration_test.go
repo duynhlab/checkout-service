@@ -27,6 +27,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/duynhlab/pkg/idempotency"
+
 	"github.com/duynhlab/checkout-service/internal/core/domain"
 )
 
@@ -237,5 +239,305 @@ func TestSessionRepository_GarbageIDIsNotFoundNot500(t *testing.T) {
 	_, err := repo.FindByID(context.Background(), "not-a-uuid")
 	if !errors.Is(err, domain.ErrSessionNotFound) {
 		t.Fatalf("FindByID(garbage) err = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestSessionRepository_TouchBumpsExpiryOnActiveOnly(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Reset-on-activity (RFC-0015 P2): every successful mutation bumps the
+	// DB expiry so the lazy backstop agrees with the workflow timer.
+	newExpiry := time.Now().Add(45 * time.Minute)
+	if err := repo.Touch(ctx, s.ID, newExpiry); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	got, err := repo.FindByID(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if got.ExpiresAt.Before(newExpiry.Add(-2 * time.Second)) {
+		t.Errorf("expires_at = %v, want bumped to ~%v", got.ExpiresAt, newExpiry)
+	}
+
+	// A terminal session is never touched back to life.
+	if err := repo.MarkExpired(ctx, s.ID, domain.ExpiredByLazy); err != nil {
+		t.Fatalf("MarkExpired: %v", err)
+	}
+	late := time.Now().Add(2 * time.Hour)
+	if err := repo.Touch(ctx, s.ID, late); err != nil {
+		t.Fatalf("Touch on terminal must be a harmless no-op, got: %v", err)
+	}
+	got, _ = repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusExpired || got.ExpiresAt.After(time.Now().Add(90*time.Minute)) {
+		t.Errorf("terminal session mutated by Touch: %+v", got)
+	}
+}
+
+// TestIdempotencyKeysMigrationWorksWithPkg proves migration 000002 satisfies
+// pkg/idempotency (ADR-010 consumer #2) under THIS service's pool settings —
+// the simple query protocol is exactly what turned response_body jsonb writes
+// into bytea errors in P1, so the full Claim→Checkpoint→Finish→replay cycle
+// must round-trip here, not just in pkg's own tests.
+func TestIdempotencyKeysMigrationWorksWithPkg(t *testing.T) {
+	pool := newTestDB(t)
+	ctx := context.Background()
+	repo := idempotency.New(pool, time.Minute)
+
+	rec, fresh, err := repo.Claim(ctx, 7, "checkout:sess-1:key-1", "POST", "/confirm", "h1")
+	if err != nil || !fresh {
+		t.Fatalf("Claim fresh = (%v, %v), want fresh claim", fresh, err)
+	}
+	subject := int64(42)
+	if err := repo.Checkpoint(ctx, rec.ID, &subject); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := repo.Finish(ctx, rec.ID, 201, []byte(`{"order_id":"42"}`)); err != nil {
+		t.Fatalf("Finish (jsonb under simple protocol): %v", err)
+	}
+
+	replay, fresh, err := repo.Claim(ctx, 7, "checkout:sess-1:key-1", "POST", "/confirm", "h1")
+	if err != nil || fresh {
+		t.Fatalf("Claim replay = (%v, %v), want existing record", fresh, err)
+	}
+	if !replay.Finished() || *replay.ResponseCode != 201 || *replay.SubjectID != 42 {
+		t.Errorf("replay = %+v, want finished 201 subject 42", replay)
+	}
+}
+
+func TestSessionRepository_ShippingAndPaymentWrites(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+
+	// Shipping write recomputes total in SQL from the persisted components.
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0); err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusShippingSet || got.ShippingMethod != "standard" || got.ShippingFeeMinor != 0 {
+		t.Errorf("after shipping = %+v, want shipping_set/standard/0", got)
+	}
+	if got.TotalMinor != got.SubtotalMinor {
+		t.Errorf("total = %d, want subtotal %d (fee 0 stub)", got.TotalMinor, got.SubtotalMinor)
+	}
+
+	// Stale `from` is optimistic-concurrency rejected.
+	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusAddressSet, "tok_visa_ok"); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("stale SetPaymentToken err = %v, want ErrStaleTransition", err)
+	}
+	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"); err != nil {
+		t.Fatalf("SetPaymentToken: %v", err)
+	}
+	got, _ = repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusReady || got.PaymentMethodToken != "tok_visa_ok" {
+		t.Errorf("after payment = %+v, want ready with token", got)
+	}
+}
+
+func TestSessionRepository_ConfirmBindingLifecycle(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	step := func(name string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	step("address", repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}))
+	step("shipping", repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0))
+	step("payment", repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"))
+
+	// BeginConfirm binds claim 11; re-entry with the same claim is idempotent;
+	// a different claim is fenced out.
+	step("begin", repo.BeginConfirm(ctx, s.ID, 11))
+	if err := repo.BeginConfirm(ctx, s.ID, 11); !errors.Is(err, domain.ErrStaleTransition) {
+		// status is confirming (not ready) — same claim re-entry is handled in
+		// logic by reading the binding, not by re-running the CAS.
+		t.Fatalf("second BeginConfirm err = %v, want ErrStaleTransition (status moved)", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusConfirming || got.ConfirmKeyID == nil || *got.ConfirmKeyID != 11 {
+		t.Fatalf("after begin = %+v, want confirming bound to 11", got)
+	}
+
+	// A foreign claim cannot requote or complete.
+	if err := repo.RequoteItems(ctx, s.ID, 99, got.Items, 1, 1); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("foreign requote err = %v, want ErrStaleTransition", err)
+	}
+	if err := repo.CompleteSession(ctx, s.ID, 99, "42"); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("foreign complete err = %v, want ErrStaleTransition", err)
+	}
+
+	// The bound claim completes; the binding stays as recovery proof.
+	step("complete", repo.CompleteSession(ctx, s.ID, 11, "42"))
+	got, _ = repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusCompleted || got.OrderID != "42" || got.ConfirmKeyID == nil || *got.ConfirmKeyID != 11 {
+		t.Errorf("completed = %+v, want completed order 42 binding kept", got)
+	}
+}
+
+func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0); err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"); err != nil {
+		t.Fatalf("SetPaymentToken: %v", err)
+	}
+	if err := repo.BeginConfirm(ctx, s.ID, 7); err != nil {
+		t.Fatalf("BeginConfirm: %v", err)
+	}
+
+	fresh := []domain.SessionItem{
+		{ProductID: "1", UnitPriceMinor: 3499, PriceChanged: true},
+		{ProductID: "2", UnitPriceMinor: 3999, PriceChanged: false},
+	}
+	if err := repo.RequoteItems(ctx, s.ID, 7, fresh, 2*3499+3999, 2*3499+3999); err != nil {
+		t.Fatalf("RequoteItems: %v", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusShippingSet || got.ConfirmKeyID != nil {
+		t.Errorf("after requote = %s bound=%v, want shipping_set unbound", got.Status, got.ConfirmKeyID)
+	}
+	if got.Items[0].UnitPriceMinor != 3499 || !got.Items[0].PriceChanged || got.Items[1].UnitPriceMinor != 3999 {
+		t.Errorf("items = %+v, want fresh prices applied", got.Items)
+	}
+	if got.SubtotalMinor != 2*3499+3999 {
+		t.Errorf("subtotal = %d, want recomputed", got.SubtotalMinor)
+	}
+}
+
+func TestSessionRepository_ReapKeepsUnfinishedKeys(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	// One finished old row, one unfinished old row (a parked confirm's claim).
+	_, err := pool.Exec(ctx, `
+		INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, created_at, response_code, response_body)
+		VALUES (7, 'old-finished', 'POST', '/confirm', 'h', now() - interval '48 hours', 201, '{}'::jsonb)`)
+	if err != nil {
+		t.Fatalf("seed finished: %v", err)
+	}
+	_, err = pool.Exec(ctx, `
+		INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, created_at)
+		VALUES (7, 'old-parked', 'POST', '/confirm', 'h', now() - interval '48 hours')`)
+	if err != nil {
+		t.Fatalf("seed parked: %v", err)
+	}
+
+	n, err := repo.ReapFinishedIdempotencyKeys(ctx, 24*time.Hour)
+	if err != nil || n != 1 {
+		t.Fatalf("reap = (%d, %v), want exactly the finished row", n, err)
+	}
+	var left string
+	if err := pool.QueryRow(ctx, `SELECT idem_key FROM idempotency_keys`).Scan(&left); err != nil || left != "old-parked" {
+		t.Errorf("survivor = %q (%v), want the unfinished claim kept", left, err)
+	}
+}
+
+func TestSessionRepository_ExpireDueOutcomes(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Future deadline: not due, remaining ≈ 30m.
+	outcome, remaining, err := repo.ExpireDue(ctx, s.ID, 90*time.Second)
+	if err != nil || outcome != domain.OutcomeNotDue || remaining < 25*time.Minute {
+		t.Fatalf("future = (%s, %v, %v), want not_due ~30m", outcome, remaining, err)
+	}
+
+	// Past deadline: expired(timer).
+	if _, err := pool.Exec(ctx, `UPDATE checkout_sessions SET expires_at = now() - interval '1 minute' WHERE id = $1`, s.ID); err != nil {
+		t.Fatalf("age row: %v", err)
+	}
+	outcome, _, err = repo.ExpireDue(ctx, s.ID, 90*time.Second)
+	if err != nil || outcome != domain.OutcomeExpired {
+		t.Fatalf("due = (%s, %v), want expired", outcome, err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusExpired || *got.ExpiredReason != domain.ExpiredByTimer {
+		t.Errorf("row = %+v, want expired(timer)", got)
+	}
+}
+
+func TestSessionRepository_ExpireDueParkedConfirmRecovery(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	mkParked := func(userID string, subject *int64) string {
+		t.Helper()
+		s := newSession(userID)
+		if err := repo.Create(ctx, s); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		var keyID int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, locked_at, subject_id)
+			VALUES ($1::bigint, 'parked-'||$2, 'POST', '/confirm', 'h', now() - interval '10 minutes', $3)
+			RETURNING id`, userID, s.ID, subject).Scan(&keyID); err != nil {
+			t.Fatalf("seed claim: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE checkout_sessions SET status='confirming', confirm_key_id=$2,
+			expires_at = now() - interval '1 minute' WHERE id=$1`, s.ID, keyID); err != nil {
+			t.Fatalf("park session: %v", err)
+		}
+		return s.ID
+	}
+
+	// No attempt marker + stale lock ⇒ provably dead pre-order: recoverable.
+	deadID := mkParked("7", nil)
+	outcome, _, err := repo.ExpireDue(ctx, deadID, 90*time.Second)
+	if err != nil || outcome != domain.OutcomeExpired {
+		t.Fatalf("dead parked = (%s, %v), want expired (safe recovery)", outcome, err)
+	}
+	got, _ := repo.FindByID(ctx, deadID)
+	if got.Status != domain.StatusExpired || got.ConfirmKeyID != nil {
+		t.Errorf("recovered row = %+v, want expired and unbound", got)
+	}
+
+	// Attempt marker present ⇒ an order may exist: NEVER auto-expired.
+	marker := int64(0)
+	attemptedID := mkParked("8", &marker)
+	outcome, _, err = repo.ExpireDue(ctx, attemptedID, 90*time.Second)
+	if err != nil || outcome != domain.OutcomeGone {
+		t.Fatalf("attempted parked = (%s, %v), want gone (ops-only)", outcome, err)
+	}
+	got, _ = repo.FindByID(ctx, attemptedID)
+	if got.Status != domain.StatusConfirming {
+		t.Errorf("attempted row mutated: %+v, must stay parked", got)
 	}
 }

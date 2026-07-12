@@ -32,6 +32,15 @@ type ProductInfo struct {
 	AvailableQty   int
 }
 
+// AbandonmentNotifier is the logic-layer port for the abandonment-workflow
+// signals (RFC-0015 P2, ADR-019). All methods are best-effort fire-and-forget;
+// a nil notifier disables them (Temporal absent → lazy-only expiry).
+type AbandonmentNotifier interface {
+	SessionStarted(ctx context.Context, sessionID string)
+	SessionActivity(ctx context.Context, sessionID string)
+	SessionFinalized(ctx context.Context, sessionID string)
+}
+
 // CartFetcher is the logic-layer port for the cart snapshot.
 type CartFetcher interface {
 	GetCart(ctx context.Context, userID string) ([]CartLine, error)
@@ -57,6 +66,17 @@ type CheckoutService struct {
 	ttl      time.Duration
 	// now is injectable for lazy-expiry tests.
 	now func() time.Time
+	// P2 confirm dependencies, wired via WithConfirm (nil pre-P2).
+	idem   IdemStore
+	orders OrderCreator
+	// P2 abandonment notifier, wired via WithAbandonment (nil = disabled).
+	notifier AbandonmentNotifier
+}
+
+// WithAbandonment wires the abandonment-workflow notifier (nil-safe).
+func (s *CheckoutService) WithAbandonment(n AbandonmentNotifier) *CheckoutService {
+	s.notifier = n
+	return s
 }
 
 // NewCheckoutService wires the logic layer. ttl <= 0 falls back to
@@ -85,6 +105,9 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	if existing, err := s.repo.FindActiveByUserID(ctx, userID); err == nil {
 		if !s.lazyExpire(ctx, existing) {
 			span.SetAttributes(attribute.Bool("session.reused", true))
+			// Re-opening checkout is user presence: reset BOTH expiry clocks
+			// (DB deadline + workflow timer), like any other activity.
+			s.touch(ctx, existing)
 			return existing, false, nil
 		}
 	} else if !errors.Is(err, domain.ErrSessionNotFound) {
@@ -167,6 +190,9 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 		attribute.Int("items.count", len(items)),
 		attribute.Int("items.price_changed", priceChanged),
 	)
+	if s.notifier != nil {
+		s.notifier.SessionStarted(ctx, session.ID)
+	}
 	return session, true, nil
 }
 
@@ -213,7 +239,84 @@ func (s *CheckoutService) SetAddress(ctx context.Context, userID, id string, add
 	}
 	session.Status = domain.StatusAddressSet
 	session.Address = addr
+	s.touch(ctx, session)
 	return session, nil
+}
+
+// SetShipping records the chosen shipping method and moves the session to
+// shipping_set. P2 stubs the fee and tax at 0 — shipping's GetQuote and the
+// tax rules join in P3 — so the total stays subtotal − discount.
+func (s *CheckoutService) SetShipping(ctx context.Context, userID, id, method string) (*domain.Session, error) {
+	ctx, span := middleware.StartSpan(ctx, "checkout.session.set_shipping", trace.WithAttributes(
+		attribute.String("layer", "logic"),
+	))
+	defer span.End()
+
+	session, err := s.ownedSession(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	if s.lazyExpire(ctx, session) {
+		return nil, ErrSessionExpired
+	}
+	if !CanTransition(session.Status, domain.StatusShippingSet) {
+		return nil, ErrInvalidTransition
+	}
+	const feeMinor = 0 // P2 stub until the P3 GetQuote integration
+	if err := s.repo.SetShipping(ctx, session.ID, session.Status, method, feeMinor); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	session.Status = domain.StatusShippingSet
+	session.ShippingMethod = method
+	session.ShippingFeeMinor = feeMinor
+	session.TotalMinor = session.SubtotalMinor + feeMinor + session.TaxMinor - session.DiscountMinor
+	s.touch(ctx, session)
+	return session, nil
+}
+
+// SetPayment attaches an opaque tok_ payment reference and moves the session
+// to ready. PAN-shaped input is rejected BEFORE any persistence — the same
+// PCI-shaped rule order and payment enforce.
+func (s *CheckoutService) SetPayment(ctx context.Context, userID, id, token string) (*domain.Session, error) {
+	ctx, span := middleware.StartSpan(ctx, "checkout.session.set_payment", trace.WithAttributes(
+		attribute.String("layer", "logic"),
+	))
+	defer span.End()
+
+	if !domain.ValidPaymentToken(token) {
+		return nil, ErrInvalidPaymentToken
+	}
+	session, err := s.ownedSession(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	if s.lazyExpire(ctx, session) {
+		return nil, ErrSessionExpired
+	}
+	if !CanTransition(session.Status, domain.StatusReady) {
+		return nil, ErrInvalidTransition
+	}
+	if err := s.repo.SetPaymentToken(ctx, session.ID, session.Status, token); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	session.Status = domain.StatusReady
+	session.PaymentMethodToken = token
+	s.touch(ctx, session)
+	return session, nil
+}
+
+// touch is the reset-on-activity half of the expiry contract: after any
+// successful mutation the DB deadline moves to now+TTL (best-effort — the
+// mutation already succeeded; a missed bump only shortens the session, and
+// the abandonment workflow's own timer is reset by the activity signal).
+func (s *CheckoutService) touch(ctx context.Context, session *domain.Session) {
+	session.ExpiresAt = s.now().Add(s.ttl)
+	_ = s.repo.Touch(ctx, session.ID, session.ExpiresAt)
+	if s.notifier != nil {
+		s.notifier.SessionActivity(ctx, session.ID)
+	}
 }
 
 // Cancel moves the session to the terminal cancelled state. Cancelling an
@@ -239,8 +342,19 @@ func (s *CheckoutService) Cancel(ctx context.Context, userID, id string) error {
 		return ErrInvalidTransition
 	}
 	if err := s.repo.UpdateStatus(ctx, session.ID, session.Status, domain.StatusCancelled); err != nil {
+		if errors.Is(err, domain.ErrStaleTransition) {
+			// The abandonment timer can expire the row between our read and
+			// this CAS; a cancel of an already-terminal session is a success
+			// for the user, not a conflict.
+			if fresh, ferr := s.repo.FindByID(ctx, session.ID); ferr == nil && fresh.Status.Terminal() {
+				return nil
+			}
+		}
 		span.RecordError(err)
 		return err
+	}
+	if s.notifier != nil {
+		s.notifier.SessionFinalized(ctx, session.ID)
 	}
 	return nil
 }
@@ -280,5 +394,6 @@ func (s *CheckoutService) lazyExpire(ctx context.Context, session *domain.Sessio
 	}
 	// Best-effort record; MarkExpired is conditional and idempotent.
 	_ = s.repo.MarkExpired(ctx, session.ID, domain.ExpiredByLazy)
+	RecordSessionExpired(ctx, string(domain.ExpiredByLazy))
 	return true
 }
