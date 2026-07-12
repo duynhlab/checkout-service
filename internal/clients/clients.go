@@ -1,5 +1,6 @@
-// Package clients adapts the generated gRPC stubs (cart.v1, product.v1) to
-// the logic layer's ports. Transport-only: no business rules live here.
+// Package clients adapts the generated gRPC stubs (cart.v1, product.v1,
+// order.v1) to the logic layer's ports. Transport-only: no business rules
+// live here.
 package clients
 
 import (
@@ -8,8 +9,10 @@ import (
 	"google.golang.org/grpc"
 
 	cartv1 "github.com/duynhlab/pkg/proto/cart/v1"
+	orderv1 "github.com/duynhlab/pkg/proto/order/v1"
 	productv1 "github.com/duynhlab/pkg/proto/product/v1"
 
+	"github.com/duynhlab/checkout-service/internal/core/domain"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
 )
 
@@ -49,6 +52,42 @@ type ProductClient struct {
 // NewProductClient wraps an established gRPC connection.
 func NewProductClient(conn grpc.ClientConnInterface) *ProductClient {
 	return &ProductClient{c: productv1.NewProductServiceClient(conn)}
+}
+
+// OrderClient satisfies logicv1.OrderCreator over order.v1/CreateOrder — the
+// confirm handoff (RFC-0015 P2, ADR-018). The call is idempotent on the order
+// side by (user_id, idempotency_key), so retrying after a transport error can
+// never double-create.
+type OrderClient struct {
+	c orderv1.OrderServiceClient
+}
+
+// NewOrderClient wraps an established gRPC connection.
+func NewOrderClient(conn grpc.ClientConnInterface) *OrderClient {
+	return &OrderClient{c: orderv1.NewOrderServiceClient(conn)}
+}
+
+// CreateOrder places the order from the session's validated snapshot.
+func (c *OrderClient) CreateOrder(ctx context.Context, userID string, items []domain.SessionItem, paymentToken, idemKey string) (string, string, error) {
+	reqItems := make([]*orderv1.OrderItem, 0, len(items))
+	for _, it := range items {
+		reqItems = append(reqItems, &orderv1.OrderItem{
+			ProductId:      it.ProductID,
+			ProductName:    it.ProductName,
+			Quantity:       int32(it.Quantity),
+			UnitPriceMinor: it.UnitPriceMinor,
+		})
+	}
+	resp, err := c.c.CreateOrder(ctx, &orderv1.CreateOrderRequest{
+		UserId:         userID,
+		Items:          reqItems,
+		PaymentMethod:  paymentToken,
+		IdempotencyKey: idemKey,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return resp.GetOrderId(), resp.GetStatus(), nil
 }
 
 // GetProducts fetches the authoritative price/availability batch.

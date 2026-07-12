@@ -345,3 +345,90 @@ func TestSessionRepository_ShippingAndPaymentWrites(t *testing.T) {
 		t.Errorf("after payment = %+v, want ready with token", got)
 	}
 }
+
+func TestSessionRepository_ConfirmBindingLifecycle(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	step := func(name string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	step("address", repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}))
+	step("shipping", repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0))
+	step("payment", repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"))
+
+	// BeginConfirm binds claim 11; re-entry with the same claim is idempotent;
+	// a different claim is fenced out.
+	step("begin", repo.BeginConfirm(ctx, s.ID, 11))
+	if err := repo.BeginConfirm(ctx, s.ID, 11); !errors.Is(err, domain.ErrStaleTransition) {
+		// status is confirming (not ready) — same claim re-entry is handled in
+		// logic by reading the binding, not by re-running the CAS.
+		t.Fatalf("second BeginConfirm err = %v, want ErrStaleTransition (status moved)", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusConfirming || got.ConfirmKeyID == nil || *got.ConfirmKeyID != 11 {
+		t.Fatalf("after begin = %+v, want confirming bound to 11", got)
+	}
+
+	// A foreign claim cannot requote or complete.
+	if err := repo.RequoteItems(ctx, s.ID, 99, got.Items, 1, 1); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("foreign requote err = %v, want ErrStaleTransition", err)
+	}
+	if err := repo.CompleteSession(ctx, s.ID, 99, "42"); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("foreign complete err = %v, want ErrStaleTransition", err)
+	}
+
+	// The bound claim completes; the binding stays as recovery proof.
+	step("complete", repo.CompleteSession(ctx, s.ID, 11, "42"))
+	got, _ = repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusCompleted || got.OrderID != "42" || got.ConfirmKeyID == nil || *got.ConfirmKeyID != 11 {
+		t.Errorf("completed = %+v, want completed order 42 binding kept", got)
+	}
+}
+
+func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0); err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"); err != nil {
+		t.Fatalf("SetPaymentToken: %v", err)
+	}
+	if err := repo.BeginConfirm(ctx, s.ID, 7); err != nil {
+		t.Fatalf("BeginConfirm: %v", err)
+	}
+
+	fresh := []domain.SessionItem{
+		{ProductID: "1", UnitPriceMinor: 3499, PriceChanged: true},
+		{ProductID: "2", UnitPriceMinor: 3999, PriceChanged: false},
+	}
+	if err := repo.RequoteItems(ctx, s.ID, 7, fresh, 2*3499+3999, 2*3499+3999); err != nil {
+		t.Fatalf("RequoteItems: %v", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusShippingSet || got.ConfirmKeyID != nil {
+		t.Errorf("after requote = %s bound=%v, want shipping_set unbound", got.Status, got.ConfirmKeyID)
+	}
+	if got.Items[0].UnitPriceMinor != 3499 || !got.Items[0].PriceChanged || got.Items[1].UnitPriceMinor != 3999 {
+		t.Errorf("items = %+v, want fresh prices applied", got.Items)
+	}
+	if got.SubtotalMinor != 2*3499+3999 {
+		t.Errorf("subtotal = %d, want recomputed", got.SubtotalMinor)
+	}
+}

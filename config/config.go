@@ -47,17 +47,32 @@ type Config struct {
 	// This gives Kubernetes/Service routing time to stop sending new traffic.
 	// From READINESS_DRAIN_DELAY env (default: 5s, max: 30s).
 	ReadinessDrainDelay int
-	JWKSURL             string // Auth JWKS endpoint for local JWT verification - from AUTH_JWKS_URL env
-	JWTIssuer           string // Expected JWT issuer - from JWT_ISSUER env
-	JWTAudience         string // Expected JWT audience - from JWT_AUDIENCE env
+	JWKSURL             string         // Auth JWKS endpoint for local JWT verification - from AUTH_JWKS_URL env
+	JWTIssuer           string         // Expected JWT issuer - from JWT_ISSUER env
+	JWTAudience         string         // Expected JWT audience - from JWT_AUDIENCE env
+	Temporal            TemporalConfig // Temporal client/worker settings for the abandonment workflow
 }
 
 // CheckoutConfig holds the checkout-domain settings. checkout runs NO gRPC
-// server (client-only service, RFC-0015); it dials cart and product.
+// server (client-only service, RFC-0015); it dials cart, product, and (P2)
+// order for the confirm handoff.
 type CheckoutConfig struct {
 	SessionTTL      time.Duration // reset-on-activity session deadline - from SESSION_TTL_SECONDS env (default: 1800)
 	CartGRPCAddr    string        // cart.v1 target - from CART_GRPC_ADDR env
 	ProductGRPCAddr string        // product.v1 target - from PRODUCT_GRPC_ADDR env
+	OrderGRPCAddr   string        // order.v1 target (confirm handoff) - from ORDER_GRPC_ADDR env
+	// IdempotencyLockTakeover: how long a crashed confirm holds its
+	// idempotency-key lock before a same-key retry may take it over
+	// (pkg/idempotency stale-lock window). From IDEMPOTENCY_LOCK_TAKEOVER env.
+	IdempotencyLockTakeover time.Duration
+}
+
+// TemporalConfig holds the Temporal connection + worker settings for the
+// AbandonedCheckoutWorkflow (RFC-0015 P2).
+type TemporalConfig struct {
+	HostPort  string // TEMPORAL_HOSTPORT (e.g. temporal-frontend.temporal.svc.cluster.local:7233)
+	Namespace string // TEMPORAL_NAMESPACE (e.g. "mop")
+	TaskQueue string // TASK_QUEUE (e.g. "checkout")
 }
 
 // ServiceConfig defines basic service configuration
@@ -135,9 +150,16 @@ func Load() *Config {
 			Env:     getEnv("ENV", "development"),
 		},
 		Checkout: CheckoutConfig{
-			SessionTTL:      time.Duration(getEnvDurationSeconds("SESSION_TTL_SECONDS", 1800)) * time.Second,
-			CartGRPCAddr:    getEnv("CART_GRPC_ADDR", "dns:///cart-grpc.cart.svc.cluster.local:9090"),
-			ProductGRPCAddr: getEnv("PRODUCT_GRPC_ADDR", "dns:///product-grpc.product.svc.cluster.local:9090"),
+			SessionTTL:              time.Duration(getEnvDurationSeconds("SESSION_TTL_SECONDS", 1800)) * time.Second,
+			CartGRPCAddr:            getEnv("CART_GRPC_ADDR", "dns:///cart-grpc.cart.svc.cluster.local:9090"),
+			ProductGRPCAddr:         getEnv("PRODUCT_GRPC_ADDR", "dns:///product-grpc.product.svc.cluster.local:9090"),
+			OrderGRPCAddr:           getEnv("ORDER_GRPC_ADDR", "dns:///order-grpc.order.svc.cluster.local:9090"),
+			IdempotencyLockTakeover: time.Duration(getEnvDurationSecondsWithMax("IDEMPOTENCY_LOCK_TAKEOVER", 90, 600)) * time.Second,
+		},
+		Temporal: TemporalConfig{
+			HostPort:  getEnv("TEMPORAL_HOSTPORT", "temporal-frontend.temporal.svc.cluster.local:7233"),
+			Namespace: getEnv("TEMPORAL_NAMESPACE", "mop"),
+			TaskQueue: getEnv("TASK_QUEUE", "checkout"),
 		},
 		Tracing: TracingConfig{
 			Enabled:     getEnvBool("TRACING_ENABLED", true),

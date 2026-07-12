@@ -98,8 +98,8 @@ func (r *SessionRepository) FindByID(ctx context.Context, id string) (*domain.Se
 	return r.scanSession(ctx, `
 		SELECT id, user_id, status, address, shipping_method, shipping_fee_minor,
 		       tax_minor, promo_code, discount_minor, subtotal_minor, total_minor,
-		       currency, payment_method_token, order_id, expires_at, expired_reason,
-		       created_at, updated_at
+		       currency, payment_method_token, order_id, confirm_key_id, expires_at,
+		       expired_reason, created_at, updated_at
 		FROM checkout_sessions WHERE id = $1`, id)
 }
 
@@ -111,8 +111,8 @@ func (r *SessionRepository) FindActiveByUserID(ctx context.Context, userID strin
 	return r.scanSession(ctx, `
 		SELECT id, user_id, status, address, shipping_method, shipping_fee_minor,
 		       tax_minor, promo_code, discount_minor, subtotal_minor, total_minor,
-		       currency, payment_method_token, order_id, expires_at, expired_reason,
-		       created_at, updated_at
+		       currency, payment_method_token, order_id, confirm_key_id, expires_at,
+		       expired_reason, created_at, updated_at
 		FROM checkout_sessions
 		WHERE user_id = $1
 		  AND status IN ('open','address_set','shipping_set','ready','confirming')`, userID)
@@ -149,6 +149,91 @@ func (r *SessionRepository) SetAddress(ctx context.Context, id string, from doma
 		WHERE id = $1 AND status = $2`, id, from, addrJSON)
 	if err != nil {
 		return fmt.Errorf("set address: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrStaleTransition
+	}
+	return nil
+}
+
+// BeginConfirm moves ready → confirming and binds the session to the
+// idempotency claim in one CAS — the session-level mutual exclusion for the
+// confirm flow (RFC-0015 P2). Idempotent for the same claim; a different
+// claim (or any other status) is ErrStaleTransition.
+func (r *SessionRepository) BeginConfirm(ctx context.Context, id string, keyID int64) error {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	tag, err := r.db.Exec(ctx, `
+		UPDATE checkout_sessions
+		SET status = 'confirming', confirm_key_id = $2, updated_at = now()
+		WHERE id = $1 AND status = 'ready'
+		  AND (confirm_key_id IS NULL OR confirm_key_id = $2)`, id, keyID)
+	if err != nil {
+		return fmt.Errorf("begin confirm: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrStaleTransition
+	}
+	return nil
+}
+
+// RequoteItems drops a confirming session back to shipping_set with fresh
+// product-authoritative prices, releasing the claim binding — the
+// PRICE_CHANGED / STOCK_UNAVAILABLE path. Every write is conditional on the
+// session still being confirming under THIS claim, so it can never race a
+// concurrent completion.
+func (r *SessionRepository) RequoteItems(ctx context.Context, id string, keyID int64, items []domain.SessionItem, subtotalMinor, totalMinor int64) error {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("requote begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE checkout_sessions
+		SET status = 'shipping_set', confirm_key_id = NULL,
+		    subtotal_minor = $3, total_minor = $4, updated_at = now()
+		WHERE id = $1 AND status = 'confirming' AND confirm_key_id = $2`,
+		id, keyID, subtotalMinor, totalMinor)
+	if err != nil {
+		return fmt.Errorf("requote session: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrStaleTransition
+	}
+	for _, it := range items {
+		if _, err := tx.Exec(ctx, `
+			UPDATE checkout_session_items
+			SET unit_price_minor = $3, price_changed = $4
+			WHERE session_id = $1 AND product_id = $2`,
+			id, it.ProductID, it.UnitPriceMinor, it.PriceChanged); err != nil {
+			return fmt.Errorf("requote item %s: %w", it.ProductID, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("requote commit: %w", err)
+	}
+	return nil
+}
+
+// CompleteSession moves confirming → completed and records the order id, CAS
+// on the claim binding. The binding is deliberately KEPT on the completed row:
+// it is the recovery proof that lets the same claim rebuild and cache the
+// response after a crash between completion and Finish.
+func (r *SessionRepository) CompleteSession(ctx context.Context, id string, keyID int64, orderID string) error {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	tag, err := r.db.Exec(ctx, `
+		UPDATE checkout_sessions
+		SET status = 'completed', order_id = $3, updated_at = now()
+		WHERE id = $1 AND status = 'confirming' AND confirm_key_id = $2`, id, keyID, orderID)
+	if err != nil {
+		return fmt.Errorf("complete session: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrStaleTransition
@@ -246,12 +331,13 @@ func (r *SessionRepository) scanSession(ctx context.Context, query string, arg a
 		promo      *string
 		payToken   *string
 		orderID    *string
+		confirmKey *int64
 		expReason  *string
 	)
 	err := r.db.QueryRow(ctx, query, arg).Scan(
 		&s.ID, &s.UserID, &s.Status, &addrJSON, &shipMethod, &s.ShippingFeeMinor,
 		&s.TaxMinor, &promo, &s.DiscountMinor, &s.SubtotalMinor, &s.TotalMinor,
-		&s.Currency, &payToken, &orderID, &s.ExpiresAt, &expReason,
+		&s.Currency, &payToken, &orderID, &confirmKey, &s.ExpiresAt, &expReason,
 		&s.CreatedAt, &s.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -284,6 +370,7 @@ func (r *SessionRepository) scanSession(ctx context.Context, query string, arg a
 	if orderID != nil {
 		s.OrderID = *orderID
 	}
+	s.ConfirmKeyID = confirmKey
 	if expReason != nil {
 		reason := domain.ExpiredReason(*expReason)
 		s.ExpiredReason = &reason

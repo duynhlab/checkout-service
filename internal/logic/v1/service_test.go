@@ -18,25 +18,38 @@ type fakeRepo struct {
 	// activeSecond, when set, is returned from the SECOND FindActiveByUserID
 	// call onward (simulating a concurrent winner appearing between the
 	// pre-create lookup and the post-conflict re-fetch).
-	activeSecond *domain.Session
-	activeCalls  int
-	byID         *domain.Session
-	byIDErr      error
-	createErr    error
-	created      *domain.Session
-	updated      []string // "from→to"
-	updateErr    error
-	addressed    *domain.Address
-	setAddrErr   error
-	expired      []domain.ExpiredReason
-	markExpErr   error
-	createCalls  int
-	shipMethod   string
-	shipFee      int64
-	setShipErr   error
-	payToken     string
-	setPayErr    error
-	touched      []time.Time
+	activeSecond    *domain.Session
+	activeCalls     int
+	byID            *domain.Session
+	byIDErr         error
+	createErr       error
+	created         *domain.Session
+	updated         []string // "from→to"
+	updateErr       error
+	addressed       *domain.Address
+	setAddrErr      error
+	expired         []domain.ExpiredReason
+	markExpErr      error
+	createCalls     int
+	shipMethod      string
+	shipFee         int64
+	setShipErr      error
+	payToken        string
+	setPayErr       error
+	touched         []time.Time
+	beginConfirmErr error
+	confirmedKey    int64
+	requoteErr      error
+	requoted        *requoteCall
+	completeErr     error
+	completedOrder  string
+}
+
+type requoteCall struct {
+	keyID    int64
+	items    []domain.SessionItem
+	subtotal int64
+	total    int64
 }
 
 func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
@@ -104,6 +117,30 @@ func (f *fakeRepo) SetPaymentToken(_ context.Context, _ string, _ domain.Session
 
 func (f *fakeRepo) Touch(_ context.Context, _ string, expiresAt time.Time) error {
 	f.touched = append(f.touched, expiresAt)
+	return nil
+}
+
+func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error {
+	if f.beginConfirmErr != nil {
+		return f.beginConfirmErr
+	}
+	f.confirmedKey = keyID
+	return nil
+}
+
+func (f *fakeRepo) RequoteItems(_ context.Context, _ string, keyID int64, items []domain.SessionItem, subtotal, total int64) error {
+	if f.requoteErr != nil {
+		return f.requoteErr
+	}
+	f.requoted = &requoteCall{keyID: keyID, items: items, subtotal: subtotal, total: total}
+	return nil
+}
+
+func (f *fakeRepo) CompleteSession(_ context.Context, _ string, keyID int64, orderID string) error {
+	if f.completeErr != nil {
+		return f.completeErr
+	}
+	f.completedOrder = orderID
 	return nil
 }
 

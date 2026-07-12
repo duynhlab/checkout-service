@@ -74,6 +74,14 @@ func (f *fakeRepo) SetPaymentToken(_ context.Context, _ string, _ domain.Session
 
 func (f *fakeRepo) Touch(_ context.Context, _ string, _ time.Time) error { return nil }
 
+func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, _ int64) error { return nil }
+
+func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _ int64) error {
+	return nil
+}
+
+func (f *fakeRepo) CompleteSession(_ context.Context, _ string, _ int64, _ string) error { return nil }
+
 type fakeCart struct {
 	lines []logicv1.CartLine
 	err   error
@@ -246,7 +254,6 @@ func TestRoutes_Unauthenticated401(t *testing.T) {
 		}
 	}
 }
-
 
 // --- PUT shipping / PUT payment (P2) ---
 

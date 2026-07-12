@@ -87,6 +87,7 @@ type Session struct {
 	Currency           string         `json:"currency"`
 	PaymentMethodToken string         `json:"-"` // tok_… reference; never serialized outward
 	OrderID            string         `json:"order_id,omitempty"`
+	ConfirmKeyID       *int64         `json:"-"` // idempotency claim bound to confirming (never serialized)
 	ExpiresAt          time.Time      `json:"expires_at"`
 	ExpiredReason      *ExpiredReason `json:"expired_reason,omitempty"`
 	CreatedAt          time.Time      `json:"created_at"`
@@ -120,6 +121,14 @@ type SessionRepository interface {
 	// Touch bumps expires_at on a non-terminal session (reset-on-activity);
 	// a late Touch on a terminal session is a harmless no-op.
 	Touch(ctx context.Context, id string, expiresAt time.Time) error
+	// BeginConfirm CASes ready → confirming and binds the idempotency claim.
+	BeginConfirm(ctx context.Context, id string, keyID int64) error
+	// RequoteItems drops confirming → shipping_set with fresh prices and
+	// clears the binding, conditional on the claim still holding the session.
+	RequoteItems(ctx context.Context, id string, keyID int64, items []SessionItem, subtotalMinor, totalMinor int64) error
+	// CompleteSession CASes confirming → completed under the claim binding,
+	// recording the order id. The binding stays on the completed row.
+	CompleteSession(ctx context.Context, id string, keyID int64, orderID string) error
 	// MarkExpired conditionally expires a non-terminal session, recording who
 	// noticed (timer vs lazy). Expiring an already-terminal session is a
 	// no-op, not an error — late timers must be harmless.
