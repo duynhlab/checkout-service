@@ -19,6 +19,8 @@ jobs:
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
+      integration: true
+      integration-command: 'go test -tags=integration -coverprofile=coverage-integration.out ./internal/core/repository/...'
     secrets: inherit
 
   gitleaks:
@@ -114,14 +116,14 @@ jobs:
   #   secrets:
   #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
   #
-  # release-binary:
-  #   needs: [go-check]
-  #   if: startsWith(github.ref, 'refs/tags/v')
-  #   uses: duynhlab/gha-workflows/.github/workflows/goreleaser.yml@main
-  #   secrets: inherit
-  #   permissions:
-  #     contents: write
-  #     id-token: write
+  release-binary:
+    needs: [go-check]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: duynhlab/gha-workflows/.github/workflows/goreleaser.yml@main
+    secrets: inherit
+    permissions:
+      contents: write
+      id-token: write
   #
   # notify:
   #   if: always()

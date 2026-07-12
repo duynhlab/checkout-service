@@ -15,6 +15,8 @@ jobs:
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
+      integration: true
+      integration-command: 'go test -tags=integration -coverprofile=coverage-integration.out ./internal/core/repository/...'
     secrets: inherit
 
   gitleaks:
@@ -23,7 +25,9 @@ jobs:
       contents: read
       security-events: write
 
-  # Enable once SONAR_TOKEN exists (org or repo secret):
+  # Enable once the repo secret SONAR_TOKEN is added (mirrors shipping-service;
+  # values are repo-level — ask the platform owner). integration-coverage: true
+  # merges the testcontainers run into the quality gate.
   # sonar:
   #   needs: [go-check, gitleaks]
   #   uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@main
