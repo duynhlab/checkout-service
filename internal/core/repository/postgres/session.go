@@ -287,7 +287,7 @@ func (r *SessionRepository) SetPaymentToken(ctx context.Context, id string, from
 // the session ONLY if its DB deadline has actually elapsed — the timer firing
 // is a wake-up, never a verdict. Returns the outcome plus, for OutcomeNotDue,
 // how long until the real deadline so the workflow can re-arm.
-func (r *SessionRepository) ExpireDue(ctx context.Context, id string) (domain.ExpireOutcome, time.Duration, error) {
+func (r *SessionRepository) ExpireDue(ctx context.Context, id string, lockTakeover time.Duration) (domain.ExpireOutcome, time.Duration, error) {
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -304,8 +304,33 @@ func (r *SessionRepository) ExpireDue(ctx context.Context, id string) (domain.Ex
 		return domain.OutcomeExpired, 0, nil
 	}
 
-	// Not expired: find out why — deadline moved (re-arm) or the session is
-	// out of the timer's jurisdiction (terminal or confirming → exit).
+	// Parked-confirming recovery (review finding — the lost-key lockout): a
+	// confirming session may be expired ONLY when its bound claim proves the
+	// confirm is dead AND never authorized an order — the claim is unfinished,
+	// has no attempt marker (subject_id IS NULL, set BEFORE any CreateOrder),
+	// and its lock is stale past the takeover window (deadline fencing ⇒ the
+	// owner cannot still write). A claim with a marker stays parked for the
+	// operator runbook: an order may exist and auto-expiry could invite an
+	// unnoticed second purchase.
+	tag, err = r.db.Exec(ctx, `
+		UPDATE checkout_sessions cs
+		SET status = 'expired', expired_reason = 'timer', confirm_key_id = NULL, updated_at = now()
+		FROM idempotency_keys ik
+		WHERE cs.id = $1 AND cs.status = 'confirming' AND cs.expires_at <= now()
+		  AND ik.id = cs.confirm_key_id
+		  AND ik.subject_id IS NULL
+		  AND ik.response_code IS NULL
+		  AND ik.locked_at < now() - $2::interval`, id, lockTakeover.String())
+	if err != nil {
+		return "", 0, fmt.Errorf("expire parked confirm: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return domain.OutcomeExpired, 0, nil
+	}
+
+	// Neither write hit: find out why — deadline moved (re-arm), a parked
+	// confirm not yet provably dead (re-check after the takeover window), or
+	// out of jurisdiction (terminal / order-attempted confirming → exit).
 	var status string
 	var expiresAt time.Time
 	err = r.db.QueryRow(ctx, `
@@ -318,8 +343,19 @@ func (r *SessionRepository) ExpireDue(ctx context.Context, id string) (domain.Ex
 		return "", 0, fmt.Errorf("expire due read-back: %w", err)
 	}
 	switch domain.SessionStatus(status) { //nolint:exhaustive // non-terminal statuses fall through to re-arm
-	case domain.StatusCompleted, domain.StatusCancelled, domain.StatusExpired, domain.StatusConfirming:
+	case domain.StatusCompleted, domain.StatusCancelled, domain.StatusExpired:
 		return domain.OutcomeGone, 0, nil
+	case domain.StatusConfirming:
+		var attempted bool
+		if err := r.db.QueryRow(ctx, `
+			SELECT ik.subject_id IS NOT NULL OR ik.response_code IS NOT NULL
+			FROM checkout_sessions cs JOIN idempotency_keys ik ON ik.id = cs.confirm_key_id
+			WHERE cs.id = $1`, id).Scan(&attempted); err != nil || attempted {
+			// Order attempted (or binding unreadable): ops-only recovery.
+			return domain.OutcomeGone, 0, nil
+		}
+		// Provably-dead check not passed yet: look again after the window.
+		return domain.OutcomeNotDue, lockTakeover, nil
 	}
 	remaining := time.Until(expiresAt)
 	if remaining <= 0 {
@@ -327,6 +363,27 @@ func (r *SessionRepository) ExpireDue(ctx context.Context, id string) (domain.Ex
 		remaining = time.Second
 	}
 	return domain.OutcomeNotDue, remaining, nil
+}
+
+// ReapFinishedIdempotencyKeys deletes FINISHED idempotency rows older than
+// ttl (the Stripe-style replay window; security review: response_body caches
+// address-bearing session JSON and must not be retained forever). Unfinished
+// rows are never touched — a parked confirming session's claim binding must
+// not rot (doubt-cycle b/c). A finished row reaped after ttl only downgrades
+// a very late same-key replay from a cached 201 to a 409; the session row
+// itself still shows the order.
+func (r *SessionRepository) ReapFinishedIdempotencyKeys(ctx context.Context, ttl time.Duration) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	tag, err := r.db.Exec(ctx, `
+		DELETE FROM idempotency_keys
+		WHERE response_code IS NOT NULL AND created_at < now() - $1::interval`,
+		ttl.String())
+	if err != nil {
+		return 0, fmt.Errorf("reap idempotency keys: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // Touch bumps expires_at — the reset-on-activity half of the expiry contract

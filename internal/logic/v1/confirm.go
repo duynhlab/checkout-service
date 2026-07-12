@@ -131,9 +131,24 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 		return replay, nil
 	}
 
-	// Entry gate + session↔key mutual exclusion.
+	// Entry gate + session↔key mutual exclusion. A deterministic rejection
+	// releases the claim: holding the lock for the 90s takeover window would
+	// turn an ordinary double-tab 409 into a black hole of ErrLocked
+	// (review finding); no order attempt exists for THIS key yet, so the
+	// release is side-effect free.
 	if done, err := s.enterConfirm(ctx, session, key.ID); done || err != nil {
+		if err != nil {
+			_ = s.idem.Release(ctx, key.ID)
+		}
 		return session, err
+	}
+	// Re-read after winning the gate: a concurrent PUT (ready→ready token
+	// re-attach) between our read and the CAS must not send a stale token or
+	// items to order (security-review TOCTOU finding).
+	session, err = s.repo.FindByID(ctx, session.ID)
+	if err != nil || session.Status != domain.StatusConfirming ||
+		session.ConfirmKeyID == nil || *session.ConfirmKeyID != key.ID {
+		return nil, ErrConfirmInFlight
 	}
 
 	// Re-validate ONLY while no order attempt was ever authorized: the marker
@@ -205,7 +220,9 @@ func (s *CheckoutService) enterConfirm(ctx context.Context, session *domain.Sess
 		return false, nil
 	case domain.StatusCompleted:
 		if session.ConfirmKeyID != nil && *session.ConfirmKeyID == keyID {
-			// Crash between completion and Finish: rebuild and cache.
+			// Crash between completion and Finish: rebuild and cache. This IS
+			// the completion (the original attempt died before counting).
+			confirmedCounter.Add(ctx, 1)
 			return true, s.finishConfirm(ctx, keyID, session)
 		}
 		return false, ErrInvalidTransition
@@ -223,6 +240,9 @@ func (s *CheckoutService) placeOrder(ctx context.Context, session *domain.Sessio
 		"checkout:"+session.ID+":"+idemKey)
 	if err != nil {
 		if isOrderValidationBug(err) {
+			// InvalidArgument created nothing order-side: release so the
+			// (buggy) caller's next key isn't wedged behind this lock.
+			_ = s.idem.Release(ctx, keyID)
 			return "", ErrOrderRejected
 		}
 		// Transient (order down, timeout): stay confirming+bound, unlock the

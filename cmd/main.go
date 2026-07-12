@@ -99,6 +99,9 @@ func main() {
 	// `<binary> worker` runs the Temporal worker for the abandonment
 	// workflow and serves no HTTP beyond health probes.
 	if maybeRunWorker(cfg, logger, pool) {
+		if tp != nil {
+			_ = tp.Shutdown(context.Background()) // flush the worker's final metrics/spans
+		}
 		return
 	}
 
@@ -115,10 +118,10 @@ func main() {
 	// PROVE the previous owner is dead, which holds only when the takeover
 	// window dwarfs the longest possible confirm execution.
 	if cfg.Checkout.IdempotencyLockTakeover <= 4*logicv1.ConfirmDeadline {
-		logger.Error("IDEMPOTENCY_LOCK_TAKEOVER must exceed 4× the confirm deadline",
+		// Fatal: a config gate must exit non-zero so orchestrators see it.
+		logger.Fatal("IDEMPOTENCY_LOCK_TAKEOVER must exceed 4× the confirm deadline",
 			zap.Duration("takeover", cfg.Checkout.IdempotencyLockTakeover),
 			zap.Duration("confirm_deadline", logicv1.ConfirmDeadline))
-		return
 	}
 
 	repo := postgres.NewSessionRepository(pool)
@@ -140,6 +143,11 @@ func main() {
 	}
 	handler := webv1.NewHandler(svc)
 
+	// Retention: finished idempotency rows cache address-bearing session
+	// JSON; reap them after the 24h replay window (unfinished rows are never
+	// reaped — a parked confirm's claim binding must not rot).
+	go runIdempotencyReaper(repo, logger)
+
 	// Local JWT verification via JWKS — fail-closed, the only credential path.
 	verifier, err := authmw.NewVerifier(cfg.JWKSURL, cfg.JWTIssuer, cfg.JWTAudience)
 	if err != nil {
@@ -150,6 +158,26 @@ func main() {
 	var isShuttingDown atomic.Bool
 	srv := setupServer(cfg, logger, handler, verifier, pool, &isShuttingDown)
 	runGracefulShutdown(cfg, logger, srv, tp, pool, &isShuttingDown)
+}
+
+// idempotencyRetention is the replay window (Stripe-style 24h) after which a
+// FINISHED key row (and its cached response body) is deleted.
+const idempotencyRetention = 24 * time.Hour
+
+// runIdempotencyReaper deletes expired finished idempotency rows hourly.
+func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		n, err := repo.ReapFinishedIdempotencyKeys(context.Background(), idempotencyRetention)
+		if err != nil {
+			logger.Warn("idempotency reap failed", zap.Error(err))
+			continue
+		}
+		if n > 0 {
+			logger.Info("idempotency keys reaped", zap.Int64("rows", n))
+		}
+	}
 }
 
 // dialEastWest opens the cart/product/order client connections (in that
@@ -270,7 +298,10 @@ func maybeRunWorker(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) 
 	}
 	defer tc.Close()
 
-	acts := &checkoutwf.Activities{Sessions: postgres.NewSessionRepository(pool)}
+	acts := &checkoutwf.Activities{
+		Sessions:     postgres.NewSessionRepository(pool),
+		LockTakeover: cfg.Checkout.IdempotencyLockTakeover,
+	}
 	w := temporalx.NewWorker(tc, cfg.Temporal.TaskQueue)
 	w.RegisterWorkflow(checkoutwf.AbandonedCheckoutWorkflow)
 	w.RegisterActivity(acts.ExpireIfDue)

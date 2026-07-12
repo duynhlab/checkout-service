@@ -48,25 +48,32 @@ func (n *Notifier) SessionActivity(ctx context.Context, sessionID string) {
 // NotFound just means there is nothing to stop.
 func (n *Notifier) SessionFinalized(ctx context.Context, sessionID string) {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
-	defer cancel()
-	err := n.temporal.SignalWorkflow(sctx, WorkflowID(sessionID), "", SignalFinalize, nil)
-	var notFound *serviceerror.NotFound
-	if err != nil && !errors.As(err, &notFound) {
-		n.logger.Warn("abandonment finalize signal failed (lazy expiry still covers this session)",
-			zap.String("session_id", sessionID), zap.Error(err))
-	}
+	go func() {
+		defer cancel()
+		err := n.temporal.SignalWorkflow(sctx, WorkflowID(sessionID), "", SignalFinalize, nil)
+		var notFound *serviceerror.NotFound
+		if err != nil && !errors.As(err, &notFound) {
+			n.logger.Warn("abandonment finalize signal failed (lazy expiry still covers this session)",
+				zap.String("session_id", sessionID), zap.Error(err))
+		}
+	}()
 }
 
+// signalWithStart runs fire-and-forget: a degraded Temporal must not add its
+// timeout to user-facing mutation latency (review finding) — the signal is
+// best-effort by contract either way.
 func (n *Notifier) signalWithStart(ctx context.Context, sessionID string) {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
-	defer cancel()
-	_, err := n.temporal.SignalWithStartWorkflow(sctx, WorkflowID(sessionID), SignalActivity, nil,
-		client.StartWorkflowOptions{
-			ID:        WorkflowID(sessionID),
-			TaskQueue: n.taskQueue,
-		}, AbandonedCheckoutWorkflow, Input{SessionID: sessionID, TTL: n.ttl})
-	if err != nil {
-		n.logger.Warn("abandonment signal-with-start failed (lazy expiry still covers this session)",
-			zap.String("session_id", sessionID), zap.Error(err))
-	}
+	go func() {
+		defer cancel()
+		_, err := n.temporal.SignalWithStartWorkflow(sctx, WorkflowID(sessionID), SignalActivity, nil,
+			client.StartWorkflowOptions{
+				ID:        WorkflowID(sessionID),
+				TaskQueue: n.taskQueue,
+			}, AbandonedCheckoutWorkflow, Input{SessionID: sessionID, TTL: n.ttl})
+		if err != nil {
+			n.logger.Warn("abandonment signal-with-start failed (lazy expiry still covers this session)",
+				zap.String("session_id", sessionID), zap.Error(err))
+		}
+	}()
 }

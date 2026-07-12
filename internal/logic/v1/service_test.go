@@ -43,6 +43,7 @@ type fakeRepo struct {
 	requoted        *requoteCall
 	completeErr     error
 	completedOrder  string
+	afterComplete   *domain.Session // swapped into byID when CompleteSession errors (stale-race tests)
 }
 
 type requoteCall struct {
@@ -125,6 +126,13 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 		return f.beginConfirmErr
 	}
 	f.confirmedKey = keyID
+	// Mirror the real CAS: the row is now confirming and bound (the confirm
+	// flow re-reads after winning the gate).
+	if f.byID != nil {
+		f.byID.Status = domain.StatusConfirming
+		k := keyID
+		f.byID.ConfirmKeyID = &k
+	}
 	return nil
 }
 
@@ -138,6 +146,9 @@ func (f *fakeRepo) RequoteItems(_ context.Context, _ string, keyID int64, items 
 
 func (f *fakeRepo) CompleteSession(_ context.Context, _ string, keyID int64, orderID string) error {
 	if f.completeErr != nil {
+		if f.afterComplete != nil {
+			f.byID = f.afterComplete
+		}
 		return f.completeErr
 	}
 	f.completedOrder = orderID

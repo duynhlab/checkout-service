@@ -59,12 +59,15 @@ type State struct {
 
 // SessionExpirer is the activity-side port (repo.ExpireDue).
 type SessionExpirer interface {
-	ExpireDue(ctx context.Context, id string) (domain.ExpireOutcome, time.Duration, error)
+	ExpireDue(ctx context.Context, id string, lockTakeover time.Duration) (domain.ExpireOutcome, time.Duration, error)
 }
 
-// Activities holds the worker-side dependencies.
+// Activities holds the worker-side dependencies. LockTakeover mirrors the
+// serve path's IDEMPOTENCY_LOCK_TAKEOVER — the parked-confirm recovery in
+// ExpireDue uses it as the provably-dead threshold.
 type Activities struct {
-	Sessions SessionExpirer
+	Sessions     SessionExpirer
+	LockTakeover time.Duration
 }
 
 // ExpireResult crosses the activity boundary (must be serializable).
@@ -77,7 +80,7 @@ type ExpireResult struct {
 // and conditional (skips confirming/terminal rows); safe under unlimited
 // retries.
 func (a *Activities) ExpireIfDue(ctx context.Context, sessionID string) (ExpireResult, error) {
-	outcome, remaining, err := a.Sessions.ExpireDue(ctx, sessionID)
+	outcome, remaining, err := a.Sessions.ExpireDue(ctx, sessionID, a.LockTakeover)
 	if err != nil {
 		return ExpireResult{}, err
 	}

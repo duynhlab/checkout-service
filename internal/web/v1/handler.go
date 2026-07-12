@@ -42,8 +42,18 @@ func NewHandler(svc *logicv1.CheckoutService) *Handler {
 
 // RegisterRoutes mounts the session routes on the private group. The caller
 // passes the JWT middleware so tests can inject a fake.
+// maxBodyBytes caps request bodies well above any legitimate payload (the
+// largest is an address) so a streamed multi-MB body cannot pressure memory.
+const maxBodyBytes = 64 << 10
+
+// limitBody rejects oversized request bodies with 413 before binding.
+func limitBody(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+	c.Next()
+}
+
 func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
-	private := r.Group("/checkout/v1/private/checkout", jwtMW)
+	private := r.Group("/checkout/v1/private/checkout", jwtMW, limitBody)
 	{
 		private.POST("/sessions", h.CreateSession)
 		private.GET("/sessions/:id", h.GetSession)
@@ -196,8 +206,8 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeIdempotencyKeyRequired, "Idempotency-Key header is required")
 		return
 	}
-	if len(key) > maxIdempotencyKeyLen {
-		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Idempotency-Key too long (max 120 chars)")
+	if len(key) > maxIdempotencyKeyLen || !validKeyCharset(key) {
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Idempotency-Key must be 1-120 visible ASCII characters")
 		return
 	}
 
@@ -283,6 +293,18 @@ type shippingRequest struct {
 // enforced in the logic layer so the rule cannot drift per transport.
 type paymentRequest struct {
 	PaymentMethodToken string `json:"payment_method_token" binding:"required,max=64"`
+}
+
+// validKeyCharset restricts Idempotency-Key to visible ASCII: HTTP permits
+// obs-text bytes that are not valid UTF-8, which Postgres TEXT rejects — a
+// malformed header must be the caller's 400, never our 500.
+func validKeyCharset(s string) bool {
+	for i := range len(s) {
+		if s[i] < 0x21 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // addressRequest is the PUT …/address payload; snake_case per the platform

@@ -75,7 +75,14 @@ func (f *fakeRepo) SetPaymentToken(_ context.Context, _ string, _ domain.Session
 
 func (f *fakeRepo) Touch(_ context.Context, _ string, _ time.Time) error { return nil }
 
-func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, _ int64) error { return nil }
+func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error {
+	if f.byID != nil {
+		f.byID.Status = domain.StatusConfirming
+		k := keyID
+		f.byID.ConfirmKeyID = &k
+	}
+	return nil
+}
 
 func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _ int64) error {
 	return nil

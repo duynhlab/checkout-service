@@ -432,3 +432,112 @@ func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
 		t.Errorf("subtotal = %d, want recomputed", got.SubtotalMinor)
 	}
 }
+
+func TestSessionRepository_ReapKeepsUnfinishedKeys(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	// One finished old row, one unfinished old row (a parked confirm's claim).
+	_, err := pool.Exec(ctx, `
+		INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, created_at, response_code, response_body)
+		VALUES (7, 'old-finished', 'POST', '/confirm', 'h', now() - interval '48 hours', 201, '{}'::jsonb)`)
+	if err != nil {
+		t.Fatalf("seed finished: %v", err)
+	}
+	_, err = pool.Exec(ctx, `
+		INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, created_at)
+		VALUES (7, 'old-parked', 'POST', '/confirm', 'h', now() - interval '48 hours')`)
+	if err != nil {
+		t.Fatalf("seed parked: %v", err)
+	}
+
+	n, err := repo.ReapFinishedIdempotencyKeys(ctx, 24*time.Hour)
+	if err != nil || n != 1 {
+		t.Fatalf("reap = (%d, %v), want exactly the finished row", n, err)
+	}
+	var left string
+	if err := pool.QueryRow(ctx, `SELECT idem_key FROM idempotency_keys`).Scan(&left); err != nil || left != "old-parked" {
+		t.Errorf("survivor = %q (%v), want the unfinished claim kept", left, err)
+	}
+}
+
+func TestSessionRepository_ExpireDueOutcomes(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Future deadline: not due, remaining ≈ 30m.
+	outcome, remaining, err := repo.ExpireDue(ctx, s.ID, 90*time.Second)
+	if err != nil || outcome != domain.OutcomeNotDue || remaining < 25*time.Minute {
+		t.Fatalf("future = (%s, %v, %v), want not_due ~30m", outcome, remaining, err)
+	}
+
+	// Past deadline: expired(timer).
+	if _, err := pool.Exec(ctx, `UPDATE checkout_sessions SET expires_at = now() - interval '1 minute' WHERE id = $1`, s.ID); err != nil {
+		t.Fatalf("age row: %v", err)
+	}
+	outcome, _, err = repo.ExpireDue(ctx, s.ID, 90*time.Second)
+	if err != nil || outcome != domain.OutcomeExpired {
+		t.Fatalf("due = (%s, %v), want expired", outcome, err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusExpired || *got.ExpiredReason != domain.ExpiredByTimer {
+		t.Errorf("row = %+v, want expired(timer)", got)
+	}
+}
+
+func TestSessionRepository_ExpireDueParkedConfirmRecovery(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	mkParked := func(userID string, subject *int64) string {
+		t.Helper()
+		s := newSession(userID)
+		if err := repo.Create(ctx, s); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		var keyID int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, locked_at, subject_id)
+			VALUES ($1::bigint, 'parked-'||$2, 'POST', '/confirm', 'h', now() - interval '10 minutes', $3)
+			RETURNING id`, userID, s.ID, subject).Scan(&keyID); err != nil {
+			t.Fatalf("seed claim: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE checkout_sessions SET status='confirming', confirm_key_id=$2,
+			expires_at = now() - interval '1 minute' WHERE id=$1`, s.ID, keyID); err != nil {
+			t.Fatalf("park session: %v", err)
+		}
+		return s.ID
+	}
+
+	// No attempt marker + stale lock ⇒ provably dead pre-order: recoverable.
+	deadID := mkParked("7", nil)
+	outcome, _, err := repo.ExpireDue(ctx, deadID, 90*time.Second)
+	if err != nil || outcome != domain.OutcomeExpired {
+		t.Fatalf("dead parked = (%s, %v), want expired (safe recovery)", outcome, err)
+	}
+	got, _ := repo.FindByID(ctx, deadID)
+	if got.Status != domain.StatusExpired || got.ConfirmKeyID != nil {
+		t.Errorf("recovered row = %+v, want expired and unbound", got)
+	}
+
+	// Attempt marker present ⇒ an order may exist: NEVER auto-expired.
+	marker := int64(0)
+	attemptedID := mkParked("8", &marker)
+	outcome, _, err = repo.ExpireDue(ctx, attemptedID, 90*time.Second)
+	if err != nil || outcome != domain.OutcomeGone {
+		t.Fatalf("attempted parked = (%s, %v), want gone (ops-only)", outcome, err)
+	}
+	got, _ = repo.FindByID(ctx, attemptedID)
+	if got.Status != domain.StatusConfirming {
+		t.Errorf("attempted row mutated: %+v, must stay parked", got)
+	}
+}

@@ -346,3 +346,24 @@ func TestConfirm_NotReadySessionRejected(t *testing.T) {
 		t.Fatalf("err = %v, want ErrInvalidTransition", err)
 	}
 }
+
+func TestConfirm_StaleCompleteRecoversOnlyWhenSameKeyWon(t *testing.T) {
+	// Crash-race branch: CompleteSession answers stale; the re-read decides.
+	completed := readySession()
+	completed.Status = domain.StatusCompleted
+	completed.OrderID = "42"
+	bound := int64(11)
+	completed.ConfirmKeyID = &bound
+
+	repo := &fakeRepo{byID: readySession(), completeErr: domain.ErrStaleTransition, afterComplete: completed}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	orders := &fakeOrders{orderID: "42", status: "pending"}
+
+	s, err := confirmSvc(repo, inStock(), idem, orders).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if err != nil || s.OrderID != "42" {
+		t.Fatalf("stale recovery = (%v, %v), want the same-key completion adopted", s, err)
+	}
+	if idem.finished != 1 {
+		t.Errorf("finished = %d, want the recovered outcome cached", idem.finished)
+	}
+}
