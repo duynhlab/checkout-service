@@ -32,7 +32,7 @@ import (
 )
 
 // defaultServiceName is the fallback service name when SERVICE_NAME is not set
-const defaultServiceName = "checkout"
+const defaultServiceName = "unknown"
 
 // Config holds all configuration for a microservice
 type Config struct {
