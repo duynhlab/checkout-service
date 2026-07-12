@@ -247,8 +247,12 @@ func (r *SessionRepository) scanSession(ctx context.Context, query string, arg a
 	return &s, rows.Err()
 }
 
-// marshalAddress encodes a nullable address for the jsonb column.
-func marshalAddress(addr *domain.Address) ([]byte, error) {
+// marshalAddress encodes a nullable address for the jsonb column. It returns
+// a *string (not []byte): under pgx's simple query protocol — which this
+// service uses for pooler safety — a []byte parameter is encoded as bytea
+// hex, which Postgres rejects for jsonb ("invalid input syntax for type
+// json"). A string round-trips correctly under both protocols.
+func marshalAddress(addr *domain.Address) (*string, error) {
 	if addr == nil {
 		return nil, nil
 	}
@@ -256,5 +260,6 @@ func marshalAddress(addr *domain.Address) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encode address: %w", err)
 	}
-	return b, nil
+	j := string(b)
+	return &j, nil
 }

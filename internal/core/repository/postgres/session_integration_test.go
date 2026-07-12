@@ -55,7 +55,17 @@ func newTestDB(t *testing.T) *pgxpool.Pool {
 	}
 	applyMigrations(t, ctx, dsn)
 
-	pool, err := pgxpool.New(ctx, dsn)
+	// Mirror production's pool settings (internal/core/database.go): the
+	// simple query protocol changes how parameters are encoded (this is what
+	// caught the jsonb-as-bytea bug), so the tests must run the same way.
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse pool config: %v", err)
+	}
+	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	poolCfg.ConnConfig.StatementCacheCapacity = 0
+	poolCfg.ConnConfig.DescriptionCacheCapacity = 0
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		t.Fatalf("new pool: %v", err)
 	}
