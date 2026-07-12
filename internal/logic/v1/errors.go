@@ -12,6 +12,9 @@ var (
 	ErrInvalidTransition = errors.New("invalid session state transition")
 	// ErrEmptyCart — session creation with an empty cart; 409 CONFLICT.
 	ErrEmptyCart = errors.New("cart is empty")
+	// ErrInvalidPaymentToken — the payment reference is not a valid opaque
+	// tok_… (PAN-shaped input included); 400 VALIDATION_ERROR, never persisted.
+	ErrInvalidPaymentToken = errors.New("payment method must be an opaque tok_ reference")
 	// ErrUpstream — a dependency (cart/product) failed; 500 opaque.
 	ErrUpstream = errors.New("upstream dependency failed")
 )

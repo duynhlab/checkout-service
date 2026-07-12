@@ -47,6 +47,8 @@ func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
 		private.POST("/sessions", h.CreateSession)
 		private.GET("/sessions/:id", h.GetSession)
 		private.PUT("/sessions/:id/address", h.SetAddress)
+		private.PUT("/sessions/:id/shipping", h.SetShipping)
+		private.PUT("/sessions/:id/payment", h.SetPayment)
 		private.DELETE("/sessions/:id", h.CancelSession)
 	}
 }
@@ -129,6 +131,57 @@ func (h *Handler) SetAddress(c *gin.Context) {
 	c.JSON(http.StatusOK, toSessionResponse(session))
 }
 
+// SetShipping handles PUT /checkout/v1/private/checkout/sessions/:id/shipping.
+// P2 records the method with a zero fee/tax stub (GetQuote lands in P3).
+func (h *Handler) SetShipping(c *gin.Context) {
+	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
+		attribute.String("layer", "web"),
+		attribute.String("method", c.Request.Method),
+		attribute.String("path", c.Request.URL.Path),
+	))
+	defer span.End()
+
+	var req shippingRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		span.RecordError(err)
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, msgInvalidRequestBody)
+		return
+	}
+
+	session, err := h.svc.SetShipping(ctx, c.GetString(authmw.CtxUserID), c.Param("id"), req.ShippingMethod)
+	if err != nil {
+		h.respondSessionError(c, span, err)
+		return
+	}
+	c.JSON(http.StatusOK, toSessionResponse(session))
+}
+
+// SetPayment handles PUT /checkout/v1/private/checkout/sessions/:id/payment.
+// Only opaque tok_ references are accepted; PAN-like input is 400 before any
+// persistence (the order/payment PCI-shaped rule).
+func (h *Handler) SetPayment(c *gin.Context) {
+	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
+		attribute.String("layer", "web"),
+		attribute.String("method", c.Request.Method),
+		attribute.String("path", c.Request.URL.Path),
+	))
+	defer span.End()
+
+	var req paymentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		span.RecordError(err)
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, msgInvalidRequestBody)
+		return
+	}
+
+	session, err := h.svc.SetPayment(ctx, c.GetString(authmw.CtxUserID), c.Param("id"), req.PaymentMethodToken)
+	if err != nil {
+		h.respondSessionError(c, span, err)
+		return
+	}
+	c.JSON(http.StatusOK, toSessionResponse(session))
+}
+
 // CancelSession handles DELETE /checkout/v1/private/checkout/sessions/:id.
 func (h *Handler) CancelSession(c *gin.Context) {
 	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
@@ -151,6 +204,10 @@ func (h *Handler) CancelSession(c *gin.Context) {
 func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error) {
 	span.RecordError(err)
 	switch {
+	case errors.Is(err, logicv1.ErrInvalidPaymentToken):
+		// Generic message by design: the rejected value must never be echoed
+		// (it may be PAN-shaped).
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "payment_method_token must be an opaque tok_ reference")
 	case errors.Is(err, logicv1.ErrSessionNotFound):
 		httpx.RespondError(c, http.StatusNotFound, httpx.CodeNotFound, "Checkout session not found")
 	case errors.Is(err, logicv1.ErrSessionExpired):
@@ -163,6 +220,17 @@ func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error
 		middleware.GetLoggerFromGinContext(c).Error("Session operation failed", zap.Error(err))
 		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
 	}
+}
+
+// shippingRequest is the PUT …/shipping payload.
+type shippingRequest struct {
+	ShippingMethod string `json:"shipping_method" binding:"required,max=40"`
+}
+
+// paymentRequest is the PUT …/payment payload. Shape (tok_ only, no PAN) is
+// enforced in the logic layer so the rule cannot drift per transport.
+type paymentRequest struct {
+	PaymentMethodToken string `json:"payment_method_token" binding:"required,max=64"`
 }
 
 // addressRequest is the PUT …/address payload; snake_case per the platform

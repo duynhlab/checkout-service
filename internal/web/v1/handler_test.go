@@ -23,9 +23,10 @@ func init() { gin.SetMode(gin.TestMode) }
 // --- logic doubles (repo/cart/product level, driving the real logic layer) ---
 
 type fakeRepo struct {
-	active    *domain.Session
-	byID      *domain.Session
-	createErr error
+	active         *domain.Session
+	byID           *domain.Session
+	createErr      error
+	persistedToken string
 }
 
 func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
@@ -61,6 +62,17 @@ func (f *fakeRepo) SetAddress(_ context.Context, _ string, _ domain.SessionStatu
 func (f *fakeRepo) MarkExpired(_ context.Context, _ string, _ domain.ExpiredReason) error {
 	return nil
 }
+
+func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ string, _ int64) error {
+	return nil
+}
+
+func (f *fakeRepo) SetPaymentToken(_ context.Context, _ string, _ domain.SessionStatus, token string) error {
+	f.persistedToken = token
+	return nil
+}
+
+func (f *fakeRepo) Touch(_ context.Context, _ string, _ time.Time) error { return nil }
 
 type fakeCart struct {
 	lines []logicv1.CartLine
@@ -232,5 +244,86 @@ func TestRoutes_Unauthenticated401(t *testing.T) {
 		if rec := doJSON(r, tc.method, tc.path, "{}"); rec.Code != http.StatusUnauthorized {
 			t.Errorf("%s %s = %d, want 401", tc.method, tc.path, rec.Code)
 		}
+	}
+}
+
+
+// --- PUT shipping / PUT payment (P2) ---
+
+func TestSetShipping_200MovesToShippingSet(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession("7", domain.StatusAddressSet)}
+	r := newRouter(repo, &fakeCart{}, &fakeProducts{}, "7")
+
+	rec := doJSON(r, http.MethodPut,
+		"/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/shipping",
+		`{"shipping_method":"standard"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var body sessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid body: %v", err)
+	}
+	if body.Status != "shipping_set" || body.ShippingMethod != "standard" || body.ShippingFee != 0 {
+		t.Errorf("body = %+v, want shipping_set/standard/fee 0 (P2 stub)", body)
+	}
+}
+
+func TestSetShipping_MissingMethodIs400(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession("7", domain.StatusAddressSet)}
+	r := newRouter(repo, &fakeCart{}, &fakeProducts{}, "7")
+	rec := doJSON(r, http.MethodPut,
+		"/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/shipping", `{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestSetShipping_BeforeAddressIs409(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession("7", domain.StatusOpen)}
+	r := newRouter(repo, &fakeCart{}, &fakeProducts{}, "7")
+	rec := doJSON(r, http.MethodPut,
+		"/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/shipping",
+		`{"shipping_method":"standard"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "INVALID_TRANSITION") {
+		t.Fatalf("resp = %d %s, want 409 INVALID_TRANSITION", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSetPayment_200MovesToReady(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession("7", domain.StatusShippingSet)}
+	r := newRouter(repo, &fakeCart{}, &fakeProducts{}, "7")
+
+	rec := doJSON(r, http.MethodPut,
+		"/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/payment",
+		`{"payment_method_token":"tok_visa_ok"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "tok_visa_ok") {
+		t.Error("payment token echoed in the response body — must never serialize outward")
+	}
+	var body sessionResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body.Status != "ready" {
+		t.Errorf("status = %s, want ready", body.Status)
+	}
+}
+
+func TestSetPayment_PANLikeIs400AndNeverPersisted(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession("7", domain.StatusShippingSet)}
+	r := newRouter(repo, &fakeCart{}, &fakeProducts{}, "7")
+
+	rec := doJSON(r, http.MethodPut,
+		"/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/payment",
+		`{"payment_method_token":"tok_4111111111111111"}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "VALIDATION_ERROR") {
+		t.Fatalf("resp = %d %s, want 400 VALIDATION_ERROR", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "4111111111111111") {
+		t.Error("PAN-shaped input echoed in the error body")
+	}
+	if repo.persistedToken != "" {
+		t.Error("PAN-shaped token reached the repository")
 	}
 }

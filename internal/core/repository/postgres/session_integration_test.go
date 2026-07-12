@@ -308,3 +308,40 @@ func TestIdempotencyKeysMigrationWorksWithPkg(t *testing.T) {
 		t.Errorf("replay = %+v, want finished 201 subject 42", replay)
 	}
 }
+
+func TestSessionRepository_ShippingAndPaymentWrites(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+
+	// Shipping write recomputes total in SQL from the persisted components.
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0); err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusShippingSet || got.ShippingMethod != "standard" || got.ShippingFeeMinor != 0 {
+		t.Errorf("after shipping = %+v, want shipping_set/standard/0", got)
+	}
+	if got.TotalMinor != got.SubtotalMinor {
+		t.Errorf("total = %d, want subtotal %d (fee 0 stub)", got.TotalMinor, got.SubtotalMinor)
+	}
+
+	// Stale `from` is optimistic-concurrency rejected.
+	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusAddressSet, "tok_visa_ok"); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("stale SetPaymentToken err = %v, want ErrStaleTransition", err)
+	}
+	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"); err != nil {
+		t.Fatalf("SetPaymentToken: %v", err)
+	}
+	got, _ = repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusReady || got.PaymentMethodToken != "tok_visa_ok" {
+		t.Errorf("after payment = %+v, want ready with token", got)
+	}
+}

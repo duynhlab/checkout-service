@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +31,12 @@ type fakeRepo struct {
 	expired      []domain.ExpiredReason
 	markExpErr   error
 	createCalls  int
+	shipMethod   string
+	shipFee      int64
+	setShipErr   error
+	payToken     string
+	setPayErr    error
+	touched      []time.Time
 }
 
 func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
@@ -76,6 +83,28 @@ func (f *fakeRepo) SetAddress(_ context.Context, _ string, _ domain.SessionStatu
 func (f *fakeRepo) MarkExpired(_ context.Context, _ string, reason domain.ExpiredReason) error {
 	f.expired = append(f.expired, reason)
 	return f.markExpErr
+}
+
+func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, method string, feeMinor int64) error {
+	if f.setShipErr != nil {
+		return f.setShipErr
+	}
+	f.shipMethod = method
+	f.shipFee = feeMinor
+	return nil
+}
+
+func (f *fakeRepo) SetPaymentToken(_ context.Context, _ string, _ domain.SessionStatus, token string) error {
+	if f.setPayErr != nil {
+		return f.setPayErr
+	}
+	f.payToken = token
+	return nil
+}
+
+func (f *fakeRepo) Touch(_ context.Context, _ string, expiresAt time.Time) error {
+	f.touched = append(f.touched, expiresAt)
+	return nil
 }
 
 type fakeCart struct {
@@ -305,5 +334,111 @@ func TestCancel_CompletedIsInvalidTransition(t *testing.T) {
 	repo := &fakeRepo{byID: liveSession(domain.StatusCompleted)}
 	if err := newSvc(repo, nil, nil).Cancel(context.Background(), "7", "sess-1"); !errors.Is(err, ErrInvalidTransition) {
 		t.Errorf("err = %v, want ErrInvalidTransition", err)
+	}
+}
+
+// --- SetShipping (P2: fee/tax stub 0 until the P3 GetQuote integration) ---
+
+func TestSetShipping_MovesToShippingSetWithZeroFeeStub(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusAddressSet)}
+
+	s, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetShipping(context.Background(), "7", "sess-1", "standard")
+	if err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	if s.Status != domain.StatusShippingSet || repo.shipMethod != "standard" {
+		t.Errorf("status/method = %s/%s, want shipping_set/standard", s.Status, repo.shipMethod)
+	}
+	if repo.shipFee != 0 || s.ShippingFeeMinor != 0 {
+		t.Errorf("fee = %d/%d, want 0 (P2 stub until GetQuote in P3)", repo.shipFee, s.ShippingFeeMinor)
+	}
+	if len(repo.touched) != 1 {
+		t.Errorf("touched %d times, want 1 (reset-on-activity bumps the DB expiry)", len(repo.touched))
+	}
+}
+
+func TestSetShipping_ChangeMethodReentersShippingSet(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusShippingSet)}
+	if _, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetShipping(context.Background(), "7", "sess-1", "express"); err != nil {
+		t.Fatalf("re-enter shipping_set: %v", err)
+	}
+	if repo.shipMethod != "express" {
+		t.Errorf("method = %s, want express", repo.shipMethod)
+	}
+}
+
+func TestSetShipping_RejectedBeforeAddress(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusOpen)}
+	_, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetShipping(context.Background(), "7", "sess-1", "standard")
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("err = %v, want ErrInvalidTransition (open has no shipping edge)", err)
+	}
+	if len(repo.touched) != 0 {
+		t.Error("rejected mutation must not bump expiry")
+	}
+}
+
+func TestSetShipping_ExpiredSessionRejected(t *testing.T) {
+	stale := liveSession(domain.StatusAddressSet)
+	stale.ExpiresAt = time.Now().Add(-time.Minute)
+	repo := &fakeRepo{byID: stale}
+	_, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetShipping(context.Background(), "7", "sess-1", "standard")
+	if !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("err = %v, want ErrSessionExpired (lazy backstop)", err)
+	}
+}
+
+// --- SetPayment (tok_ references only — the order/payment PCI-shaped rule) ---
+
+func TestSetPayment_TokenMovesToReady(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusShippingSet)}
+
+	s, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetPayment(context.Background(), "7", "sess-1", "tok_visa_ok")
+	if err != nil {
+		t.Fatalf("SetPayment: %v", err)
+	}
+	if s.Status != domain.StatusReady || repo.payToken != "tok_visa_ok" {
+		t.Errorf("status/token = %s/%s, want ready/tok_visa_ok", s.Status, repo.payToken)
+	}
+	if len(repo.touched) != 1 {
+		t.Errorf("touched %d times, want 1", len(repo.touched))
+	}
+}
+
+func TestSetPayment_ReattachOnReady(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusReady)}
+	if _, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetPayment(context.Background(), "7", "sess-1", "tok_mc_ok"); err != nil {
+		t.Fatalf("re-attach on ready: %v", err)
+	}
+}
+
+func TestSetPayment_PANLikeRejectedBeforePersist(t *testing.T) {
+	for _, tok := range []string{"4111111111111111", "tok_4111111111111111", "", "tok_" + strings.Repeat("x", 64)} {
+		repo := &fakeRepo{byID: liveSession(domain.StatusShippingSet)}
+		_, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetPayment(context.Background(), "7", "sess-1", tok)
+		if !errors.Is(err, ErrInvalidPaymentToken) {
+			t.Errorf("token %q: err = %v, want ErrInvalidPaymentToken", tok, err)
+		}
+		if repo.payToken != "" {
+			t.Errorf("token %q reached the repo — PAN-shaped input must never persist", tok)
+		}
+	}
+}
+
+func TestSetPayment_RejectedBeforeShipping(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusAddressSet)}
+	_, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetPayment(context.Background(), "7", "sess-1", "tok_visa_ok")
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("err = %v, want ErrInvalidTransition (payment before shipping)", err)
+	}
+}
+
+func TestSetAddress_BumpsExpiry(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusOpen)}
+	if _, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetAddress(context.Background(), "7", "sess-1", &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+	if len(repo.touched) != 1 {
+		t.Errorf("touched %d times, want 1 (every successful mutation resets the clock)", len(repo.touched))
 	}
 }

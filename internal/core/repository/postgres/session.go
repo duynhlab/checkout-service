@@ -156,6 +156,48 @@ func (r *SessionRepository) SetAddress(ctx context.Context, id string, from doma
 	return nil
 }
 
+// SetShipping persists the shipping choice and shipping_set in one
+// conditional write. total_minor is recomputed in SQL from the persisted
+// components so the stored total can never drift from its parts.
+func (r *SessionRepository) SetShipping(ctx context.Context, id string, from domain.SessionStatus, method string, feeMinor int64) error {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	tag, err := r.db.Exec(ctx, `
+		UPDATE checkout_sessions
+		SET status = 'shipping_set', shipping_method = $3, shipping_fee_minor = $4,
+		    total_minor = subtotal_minor + $4 + tax_minor - discount_minor,
+		    updated_at = now()
+		WHERE id = $1 AND status = $2`, id, from, method, feeMinor)
+	if err != nil {
+		return fmt.Errorf("set shipping: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrStaleTransition
+	}
+	return nil
+}
+
+// SetPaymentToken persists the tok_ reference and ready in one conditional
+// write. The logic layer has already validated the token shape — PAN-shaped
+// input never reaches this statement.
+func (r *SessionRepository) SetPaymentToken(ctx context.Context, id string, from domain.SessionStatus, token string) error {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	tag, err := r.db.Exec(ctx, `
+		UPDATE checkout_sessions
+		SET status = 'ready', payment_method_token = $3, updated_at = now()
+		WHERE id = $1 AND status = $2`, id, from, token)
+	if err != nil {
+		return fmt.Errorf("set payment token: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrStaleTransition
+	}
+	return nil
+}
+
 // Touch bumps expires_at — the reset-on-activity half of the expiry contract
 // (RFC-0015 P2): every successful mutation both signals the abandonment
 // workflow (timer reset) and bumps the DB expiry here, so the lazy backstop
