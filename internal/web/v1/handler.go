@@ -10,6 +10,7 @@
 package v1
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -135,32 +136,24 @@ func (h *Handler) SetAddress(c *gin.Context) {
 // SetShipping handles PUT /checkout/v1/private/checkout/sessions/:id/shipping.
 // P2 records the method with a zero fee/tax stub (GetQuote lands in P3).
 func (h *Handler) SetShipping(c *gin.Context) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	defer span.End()
-
 	var req shippingRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		span.RecordError(err)
-		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, msgInvalidRequestBody)
-		return
-	}
-
-	session, err := h.svc.SetShipping(ctx, c.GetString(authmw.CtxUserID), c.Param("id"), req.ShippingMethod)
-	if err != nil {
-		h.respondSessionError(c, span, err)
-		return
-	}
-	c.JSON(http.StatusOK, toSessionResponse(session))
+	h.updateSession(c, &req, func(ctx context.Context, userID, id string) (*domain.Session, error) {
+		return h.svc.SetShipping(ctx, userID, id, req.ShippingMethod)
+	})
 }
 
 // SetPayment handles PUT /checkout/v1/private/checkout/sessions/:id/payment.
 // Only opaque tok_ references are accepted; PAN-like input is 400 before any
 // persistence (the order/payment PCI-shaped rule).
 func (h *Handler) SetPayment(c *gin.Context) {
+	var req paymentRequest
+	h.updateSession(c, &req, func(ctx context.Context, userID, id string) (*domain.Session, error) {
+		return h.svc.SetPayment(ctx, userID, id, req.PaymentMethodToken)
+	})
+}
+
+// updateSession is the shared bind → call → respond shape of the PUT steps.
+func (h *Handler) updateSession(c *gin.Context, req any, call func(ctx context.Context, userID, id string) (*domain.Session, error)) {
 	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
 		attribute.String("layer", "web"),
 		attribute.String("method", c.Request.Method),
@@ -168,14 +161,13 @@ func (h *Handler) SetPayment(c *gin.Context) {
 	))
 	defer span.End()
 
-	var req paymentRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(req); err != nil {
 		span.RecordError(err)
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, msgInvalidRequestBody)
 		return
 	}
 
-	session, err := h.svc.SetPayment(ctx, c.GetString(authmw.CtxUserID), c.Param("id"), req.PaymentMethodToken)
+	session, err := call(ctx, c.GetString(authmw.CtxUserID), c.Param("id"))
 	if err != nil {
 		h.respondSessionError(c, span, err)
 		return

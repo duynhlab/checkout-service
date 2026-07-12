@@ -283,6 +283,52 @@ func (r *SessionRepository) SetPaymentToken(ctx context.Context, id string, from
 	return nil
 }
 
+// ExpireDue is the abandonment timer's write (RFC-0015 P2, ADR-019): expire
+// the session ONLY if its DB deadline has actually elapsed — the timer firing
+// is a wake-up, never a verdict. Returns the outcome plus, for OutcomeNotDue,
+// how long until the real deadline so the workflow can re-arm.
+func (r *SessionRepository) ExpireDue(ctx context.Context, id string) (domain.ExpireOutcome, time.Duration, error) {
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	tag, err := r.db.Exec(ctx, `
+		UPDATE checkout_sessions
+		SET status = 'expired', expired_reason = 'timer', updated_at = now()
+		WHERE id = $1
+		  AND status NOT IN ('completed','cancelled','expired','confirming')
+		  AND expires_at <= now()`, id)
+	if err != nil {
+		return "", 0, fmt.Errorf("expire due: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return domain.OutcomeExpired, 0, nil
+	}
+
+	// Not expired: find out why — deadline moved (re-arm) or the session is
+	// out of the timer's jurisdiction (terminal or confirming → exit).
+	var status string
+	var expiresAt time.Time
+	err = r.db.QueryRow(ctx, `
+		SELECT status, expires_at FROM checkout_sessions WHERE id = $1`, id).
+		Scan(&status, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OutcomeGone, 0, nil
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("expire due read-back: %w", err)
+	}
+	switch domain.SessionStatus(status) { //nolint:exhaustive // non-terminal statuses fall through to re-arm
+	case domain.StatusCompleted, domain.StatusCancelled, domain.StatusExpired, domain.StatusConfirming:
+		return domain.OutcomeGone, 0, nil
+	}
+	remaining := time.Until(expiresAt)
+	if remaining <= 0 {
+		// Raced the deadline between UPDATE and SELECT: ask for a quick retry.
+		remaining = time.Second
+	}
+	return domain.OutcomeNotDue, remaining, nil
+}
+
 // Touch bumps expires_at — the reset-on-activity half of the expiry contract
 // (RFC-0015 P2): every successful mutation both signals the abandonment
 // workflow (timer reset) and bumps the DB expiry here, so the lazy backstop

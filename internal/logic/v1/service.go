@@ -32,6 +32,15 @@ type ProductInfo struct {
 	AvailableQty   int
 }
 
+// AbandonmentNotifier is the logic-layer port for the abandonment-workflow
+// signals (RFC-0015 P2, ADR-019). All methods are best-effort fire-and-forget;
+// a nil notifier disables them (Temporal absent → lazy-only expiry).
+type AbandonmentNotifier interface {
+	SessionStarted(ctx context.Context, sessionID string)
+	SessionActivity(ctx context.Context, sessionID string)
+	SessionFinalized(ctx context.Context, sessionID string)
+}
+
 // CartFetcher is the logic-layer port for the cart snapshot.
 type CartFetcher interface {
 	GetCart(ctx context.Context, userID string) ([]CartLine, error)
@@ -60,6 +69,14 @@ type CheckoutService struct {
 	// P2 confirm dependencies, wired via WithConfirm (nil pre-P2).
 	idem   IdemStore
 	orders OrderCreator
+	// P2 abandonment notifier, wired via WithAbandonment (nil = disabled).
+	notifier AbandonmentNotifier
+}
+
+// WithAbandonment wires the abandonment-workflow notifier (nil-safe).
+func (s *CheckoutService) WithAbandonment(n AbandonmentNotifier) *CheckoutService {
+	s.notifier = n
+	return s
 }
 
 // NewCheckoutService wires the logic layer. ttl <= 0 falls back to
@@ -88,6 +105,9 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	if existing, err := s.repo.FindActiveByUserID(ctx, userID); err == nil {
 		if !s.lazyExpire(ctx, existing) {
 			span.SetAttributes(attribute.Bool("session.reused", true))
+			// Re-opening checkout is user presence: reset BOTH expiry clocks
+			// (DB deadline + workflow timer), like any other activity.
+			s.touch(ctx, existing)
 			return existing, false, nil
 		}
 	} else if !errors.Is(err, domain.ErrSessionNotFound) {
@@ -170,6 +190,9 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 		attribute.Int("items.count", len(items)),
 		attribute.Int("items.price_changed", priceChanged),
 	)
+	if s.notifier != nil {
+		s.notifier.SessionStarted(ctx, session.ID)
+	}
 	return session, true, nil
 }
 
@@ -291,6 +314,9 @@ func (s *CheckoutService) SetPayment(ctx context.Context, userID, id, token stri
 func (s *CheckoutService) touch(ctx context.Context, session *domain.Session) {
 	session.ExpiresAt = s.now().Add(s.ttl)
 	_ = s.repo.Touch(ctx, session.ID, session.ExpiresAt)
+	if s.notifier != nil {
+		s.notifier.SessionActivity(ctx, session.ID)
+	}
 }
 
 // Cancel moves the session to the terminal cancelled state. Cancelling an
@@ -316,8 +342,19 @@ func (s *CheckoutService) Cancel(ctx context.Context, userID, id string) error {
 		return ErrInvalidTransition
 	}
 	if err := s.repo.UpdateStatus(ctx, session.ID, session.Status, domain.StatusCancelled); err != nil {
+		if errors.Is(err, domain.ErrStaleTransition) {
+			// The abandonment timer can expire the row between our read and
+			// this CAS; a cancel of an already-terminal session is a success
+			// for the user, not a conflict.
+			if fresh, ferr := s.repo.FindByID(ctx, session.ID); ferr == nil && fresh.Status.Terminal() {
+				return nil
+			}
+		}
 		span.RecordError(err)
 		return err
+	}
+	if s.notifier != nil {
+		s.notifier.SessionFinalized(ctx, session.ID)
 	}
 	return nil
 }

@@ -39,6 +39,17 @@ func ActiveStatuses() []SessionStatus {
 
 // ExpiredReason records who noticed the expiry: the durable Temporal timer
 // (P2) or the lazy check on a read/mutation.
+// ExpireOutcome is ExpireDue's answer to the abandonment timer (ADR-019):
+// the row was expired now, is not due yet (re-arm to the DB deadline), or is
+// out of the timer's jurisdiction (terminal/confirming/absent → exit).
+type ExpireOutcome string
+
+const (
+	OutcomeExpired ExpireOutcome = "expired"
+	OutcomeNotDue  ExpireOutcome = "not_due"
+	OutcomeGone    ExpireOutcome = "gone"
+)
+
 type ExpiredReason string
 
 const (

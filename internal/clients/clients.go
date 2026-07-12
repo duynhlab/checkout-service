@@ -5,6 +5,7 @@ package clients
 
 import (
 	"context"
+	"math"
 
 	"google.golang.org/grpc"
 
@@ -71,10 +72,14 @@ func NewOrderClient(conn grpc.ClientConnInterface) *OrderClient {
 func (c *OrderClient) CreateOrder(ctx context.Context, userID string, items []domain.SessionItem, paymentToken, idemKey string) (string, string, error) {
 	reqItems := make([]*orderv1.OrderItem, 0, len(items))
 	for _, it := range items {
+		qty := it.Quantity
+		if qty > math.MaxInt32 {
+			qty = math.MaxInt32 // unreachable: confirm bounds cap at 10000
+		}
 		reqItems = append(reqItems, &orderv1.OrderItem{
 			ProductId:      it.ProductID,
 			ProductName:    it.ProductName,
-			Quantity:       int32(it.Quantity),
+			Quantity:       int32(qty), //nolint:gosec // clamped above
 			UnitPriceMinor: it.UnitPriceMinor,
 		})
 	}

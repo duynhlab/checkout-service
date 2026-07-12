@@ -122,40 +122,18 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 		return nil, err
 	}
 
-	key, proceed, err := s.idem.Claim(ctx, uid, idemKey, "POST", confirmPath, id)
+	key, replay, err := s.claimConfirm(ctx, uid, idemKey, id)
 	if err != nil {
-		switch {
-		case errors.Is(err, idempotency.ErrConflict):
-			return nil, ErrKeyConflict
-		case errors.Is(err, idempotency.ErrLocked):
-			return nil, ErrConfirmInFlight
-		default:
-			span.RecordError(err)
-			return nil, err
-		}
+		span.RecordError(err)
+		return nil, err
 	}
-	if !proceed {
-		return replaySession(key)
+	if replay != nil {
+		return replay, nil
 	}
 
 	// Entry gate + session↔key mutual exclusion.
-	switch session.Status {
-	case domain.StatusReady:
-		if err := s.repo.BeginConfirm(ctx, session.ID, key.ID); err != nil {
-			return nil, ErrConfirmInFlight
-		}
-	case domain.StatusConfirming:
-		if session.ConfirmKeyID == nil || *session.ConfirmKeyID != key.ID {
-			return nil, ErrConfirmInFlight
-		}
-	case domain.StatusCompleted:
-		if session.ConfirmKeyID != nil && *session.ConfirmKeyID == key.ID {
-			// Crash between completion and Finish: rebuild and cache.
-			return session, s.finishConfirm(ctx, key.ID, session)
-		}
-		return nil, ErrInvalidTransition
-	default:
-		return nil, ErrInvalidTransition
+	if done, err := s.enterConfirm(ctx, session, key.ID); done || err != nil {
+		return session, err
 	}
 
 	// Re-validate ONLY while no order attempt was ever authorized: the marker
@@ -170,51 +148,116 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 		}
 	}
 
-	// Order attempt / re-drive — always call CreateOrder: it is idempotent by
-	// the deterministic composed key, and its response carries the canonical
-	// order id string + actual status (may be past pending on a late replay).
+	orderID, err := s.placeOrder(ctx, session, key.ID, userID, idemKey)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	session, err = s.completeConfirm(ctx, session, key.ID, orderID)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	confirmedCounter.Add(ctx, 1)
+	if s.notifier != nil {
+		s.notifier.SessionFinalized(ctx, session.ID)
+	}
+	return session, s.finishConfirm(ctx, key.ID, session)
+}
+
+// claimConfirm claims the idempotency key, translating the pkg sentinels and
+// decoding a finished record into its cached replay session.
+func (s *CheckoutService) claimConfirm(ctx context.Context, uid int64, idemKey, sessionID string) (*idempotency.Record, *domain.Session, error) {
+	key, proceed, err := s.idem.Claim(ctx, uid, idemKey, "POST", confirmPath, sessionID)
+	if err != nil {
+		switch {
+		case errors.Is(err, idempotency.ErrConflict):
+			return nil, nil, ErrKeyConflict
+		case errors.Is(err, idempotency.ErrLocked):
+			return nil, nil, ErrConfirmInFlight
+		default:
+			return nil, nil, err
+		}
+	}
+	if !proceed {
+		replay, rerr := replaySession(key)
+		return nil, replay, rerr
+	}
+	return key, nil, nil
+}
+
+// enterConfirm applies the entry gate and the session↔key mutual exclusion.
+// done=true means the completed-recovery path already produced the answer
+// (rebuild + Finish); a non-nil error rejects the confirm.
+func (s *CheckoutService) enterConfirm(ctx context.Context, session *domain.Session, keyID int64) (bool, error) {
+	switch session.Status { //nolint:exhaustive // every other status has no confirm entry
+	case domain.StatusReady:
+		if err := s.repo.BeginConfirm(ctx, session.ID, keyID); err != nil {
+			return false, ErrConfirmInFlight
+		}
+		return false, nil
+	case domain.StatusConfirming:
+		if session.ConfirmKeyID == nil || *session.ConfirmKeyID != keyID {
+			return false, ErrConfirmInFlight
+		}
+		return false, nil
+	case domain.StatusCompleted:
+		if session.ConfirmKeyID != nil && *session.ConfirmKeyID == keyID {
+			// Crash between completion and Finish: rebuild and cache.
+			return true, s.finishConfirm(ctx, keyID, session)
+		}
+		return false, ErrInvalidTransition
+	default:
+		return false, ErrInvalidTransition
+	}
+}
+
+// placeOrder runs the order attempt / re-drive — always calling CreateOrder:
+// it is idempotent by the deterministic composed key, and its response
+// carries the canonical order id string + actual status (which may be past
+// pending on a late replay).
+func (s *CheckoutService) placeOrder(ctx context.Context, session *domain.Session, keyID int64, userID, idemKey string) (string, error) {
 	orderID, _, err := s.orders.CreateOrder(ctx, userID, session.Items, session.PaymentMethodToken,
 		"checkout:"+session.ID+":"+idemKey)
 	if err != nil {
-		span.RecordError(err)
 		if isOrderValidationBug(err) {
-			return nil, ErrOrderRejected
+			return "", ErrOrderRejected
 		}
 		// Transient (order down, timeout): stay confirming+bound, unlock the
 		// key so an immediate same-key retry re-drives. Release failure only
 		// delays that retry until the takeover window.
-		if relErr := s.idem.Release(ctx, key.ID); relErr != nil {
-			span.RecordError(relErr)
-		}
-		return nil, ErrUpstream
+		_ = s.idem.Release(ctx, keyID)
+		return "", ErrUpstream
 	}
 	if oid, perr := strconv.ParseInt(orderID, 10, 64); perr == nil {
-		// Best-effort provenance; completion below uses the string id.
-		if cerr := s.idem.Checkpoint(ctx, key.ID, &oid); cerr != nil {
-			span.RecordError(cerr)
-		}
+		// Best-effort provenance; completion uses the string id.
+		_ = s.idem.Checkpoint(ctx, keyID, &oid)
 	}
+	return orderID, nil
+}
 
-	if err := s.repo.CompleteSession(ctx, session.ID, key.ID, orderID); err != nil {
-		if !errors.Is(err, domain.ErrStaleTransition) {
-			span.RecordError(err)
-			return nil, err
-		}
-		// Stale: only a same-key re-entry may have completed it (foreign keys
-		// are fenced out). Verify before caching anything.
-		fresh, ferr := s.repo.FindByID(ctx, session.ID)
-		if ferr != nil || fresh.Status != domain.StatusCompleted ||
-			fresh.ConfirmKeyID == nil || *fresh.ConfirmKeyID != key.ID {
-			return nil, ErrConfirmInFlight
-		}
-		session = fresh
-	} else {
+// completeConfirm CASes the session to completed under the claim binding. A
+// stale answer is only tolerated when a same-key re-entry already completed
+// it (foreign keys are fenced out) — never cache an outcome the session does
+// not show.
+func (s *CheckoutService) completeConfirm(ctx context.Context, session *domain.Session, keyID int64, orderID string) (*domain.Session, error) {
+	err := s.repo.CompleteSession(ctx, session.ID, keyID, orderID)
+	if err == nil {
 		session.Status = domain.StatusCompleted
 		session.OrderID = orderID
+		return session, nil
 	}
-
-	confirmedCounter.Add(ctx, 1)
-	return session, s.finishConfirm(ctx, key.ID, session)
+	if !errors.Is(err, domain.ErrStaleTransition) {
+		return nil, err
+	}
+	fresh, ferr := s.repo.FindByID(ctx, session.ID)
+	if ferr != nil || fresh.Status != domain.StatusCompleted ||
+		fresh.ConfirmKeyID == nil || *fresh.ConfirmKeyID != keyID {
+		return nil, ErrConfirmInFlight
+	}
+	return fresh, nil
 }
 
 // revalidate re-checks prices and stock against product (the checkout-time
