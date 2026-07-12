@@ -1,138 +1,206 @@
+// checkout-service — RFC-0015: the session/UX orchestrator between the SPA
+// and order-service. Client-only (no gRPC server): it dials cart (item-list
+// authority) and product (price authority) to snapshot and re-validate
+// checkout sessions. Subcommands: `migrate` applies the embedded schema
+// migrations; no `seed` — checkout has no demo data in P1.
 package main
 
 import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"os/signal"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/rs/zerolog/log"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"google.golang.org/grpc"
+
+	"github.com/duynhlab/pkg/authmw"
+	"github.com/duynhlab/pkg/grpcx"
+	"github.com/duynhlab/pkg/logger/zapx"
+	"github.com/duynhlab/pkg/migratex"
+	"github.com/duynhlab/pkg/obsx"
 
 	"github.com/duynhlab/checkout-service/config"
+	migrations "github.com/duynhlab/checkout-service/db/migrations"
+	"github.com/duynhlab/checkout-service/internal/clients"
+	database "github.com/duynhlab/checkout-service/internal/core"
+	"github.com/duynhlab/checkout-service/internal/core/repository/postgres"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
 	webv1 "github.com/duynhlab/checkout-service/internal/web/v1"
 	"github.com/duynhlab/checkout-service/middleware"
-	"github.com/duynhlab/pkg/logger/zerolog"
-	"github.com/duynhlab/pkg/obsx"
 )
 
 func main() {
-	// Load configuration
 	cfg := config.Load()
 
-	// Initialize Zerolog with LOG_LEVEL from config
-	zerolog.Setup(cfg.Logging.Level)
+	logger, err := zapx.New(os.Getenv("LOG_LEVEL"))
+	if err != nil {
+		panic("Failed to initialize logger: " + err.Error())
+	}
+	defer func() { _ = logger.Sync() }()
+
+	// Subcommand `migrate` runs the embedded SQL set and exits.
+	if len(os.Args) > 1 && runSubcommand(os.Args[1], cfg, logger) {
+		return
+	}
 
 	if err := cfg.Validate(); err != nil {
 		panic("Configuration validation failed: " + err.Error())
 	}
 
-	log.Info().
-		Str("service", cfg.Service.Name).
-		Str("version", cfg.Service.Version).
-		Str("env", cfg.Service.Env).
-		Str("port", cfg.Service.Port).
-		Msg("Service starting")
+	logger.Info("Service starting",
+		zap.String("service", cfg.Service.Name),
+		zap.String("version", cfg.Service.Version),
+		zap.String("env", cfg.Service.Env),
+		zap.String("port", cfg.Service.Port),
+	)
 
-	// Initialize OpenTelemetry tracing
-	var tp interface{ Shutdown(context.Context) error }
-	var err error
-	if cfg.Tracing.Enabled {
-		tp, err = middleware.InitTracing(cfg)
-		if err != nil {
-			log.Warn().Err(err).Msg("Failed to initialize tracing")
-		} else {
-			log.Info().
-				Str("endpoint", cfg.Tracing.Endpoint).
-				Float64("sample_rate", cfg.Tracing.SampleRate).
-				Msg("Tracing initialized")
-		}
-	} else {
-		log.Info().Msg("Tracing disabled (TRACING_ENABLED=false)")
+	pool, err := database.Connect(context.Background(), cfg)
+	if err != nil {
+		logger.Error("Failed to connect to database", zap.Error(err))
+		return
 	}
+	defer pool.Close()
+	logger.Info("Database connection pool established")
 
-	// Initialize metrics: install the global OTel MeterProvider bridged onto the
-	// Prometheus /metrics endpoint.
-	if cfg.Metrics.Enabled {
-		shutdownMetrics, metricsErr := obsx.SetupMetrics()
-		if metricsErr != nil {
-			log.Warn().Err(metricsErr).Msg("Failed to initialize metrics")
-		} else {
-			log.Info().Msg("Metrics initialized")
-			defer func() { _ = shutdownMetrics(context.Background()) }()
-		}
-	}
+	// RFC-0014: single OTel wiring point — traces, OTLP metrics, logs.
+	tp, logger := initObservability(logger)
 
-	// Initialize Pyroscope profiling
 	if cfg.Profiling.Enabled {
-		stopProfiling, profErr := obsx.SetupProfiling()
-		if profErr != nil {
-			log.Warn().Err(profErr).Msg("Failed to initialize profiling")
+		stopProfiling, err := obsx.SetupProfiling()
+		if err != nil {
+			logger.Warn("Failed to initialize profiling", zap.Error(err))
 		} else {
-			log.Info().
-				Str("endpoint", cfg.Profiling.Endpoint).
-				Msg("Profiling initialized")
-			defer func() { _ = stopProfiling(context.Background()) }()
+			logger.Info("Profiling initialized", zap.String("endpoint", cfg.Profiling.Endpoint))
+			defer func() {
+				if err := stopProfiling(context.Background()); err != nil {
+					logger.Error("Profiling shutdown error", zap.Error(err))
+				}
+			}()
 		}
 	} else {
-		log.Info().Msg("Profiling disabled (PROFILING_ENABLED=false)")
+		logger.Info("Profiling disabled (PROFILING_ENABLED=false)")
 	}
 
-	// Wire dependencies: Logic service -> Web handler
-	checkoutSvc := logicv1.NewCheckoutService()
-	handler := webv1.NewHandler(checkoutSvc, cfg)
+	// East-west gRPC clients (lazy dial — grpcx.Dial uses grpc.NewClient, so
+	// an unreachable target fails per-call, not at startup).
+	cartConn, err := grpcx.Dial(cfg.Checkout.CartGRPCAddr)
+	if err != nil {
+		logger.Error("Failed to dial cart gRPC", zap.String("addr", cfg.Checkout.CartGRPCAddr), zap.Error(err))
+		return
+	}
+	defer closeConn(cartConn, logger, "cart")
+	productConn, err := grpcx.Dial(cfg.Checkout.ProductGRPCAddr)
+	if err != nil {
+		logger.Error("Failed to dial product gRPC", zap.String("addr", cfg.Checkout.ProductGRPCAddr), zap.Error(err))
+		return
+	}
+	defer closeConn(productConn, logger, "product")
 
-	// Setup router and server, then run with graceful shutdown
+	repo := postgres.NewSessionRepository(pool)
+	svc := logicv1.NewCheckoutService(repo,
+		clients.NewCartClient(cartConn),
+		clients.NewProductClient(productConn),
+		cfg.Checkout.SessionTTL,
+	)
+	handler := webv1.NewHandler(svc)
+
+	// Local JWT verification via JWKS — fail-closed, the only credential path.
+	verifier, err := authmw.NewVerifier(cfg.JWKSURL, cfg.JWTIssuer, cfg.JWTAudience)
+	if err != nil {
+		logger.Error("JWT verifier init failed", zap.Error(err))
+		return
+	}
+
 	var isShuttingDown atomic.Bool
-	srv := setupServer(cfg, handler, &isShuttingDown)
-	runGracefulShutdown(cfg, srv, tp, &isShuttingDown)
+	srv := setupServer(cfg, logger, handler, verifier, pool, &isShuttingDown)
+	runGracefulShutdown(cfg, logger, srv, tp, pool, &isShuttingDown)
 }
 
-// setupServer creates and configures the HTTP server with all routes and middleware.
-func setupServer(cfg *config.Config, handler *webv1.Handler, isShuttingDown *atomic.Bool) *http.Server {
-	if cfg.IsProduction() {
-		gin.SetMode(gin.ReleaseMode)
+
+// initObservability wires the RFC-0014 OTel pipeline (traces, OTLP metrics,
+// logs) and tees application logs into it. Returns the shutdown handle (nil
+// when setup failed — the service still runs) and the possibly-teed logger.
+func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context) error }, *zap.Logger) {
+	otelCfg := obsx.ConfigFromEnv()
+	middleware.SetServiceName(otelCfg.ServiceName)
+	obs, err := obsx.SetupObservability(context.Background(), otelCfg)
+	if err != nil {
+		logger.Warn("Failed to initialize OpenTelemetry", zap.Error(err))
+		return nil, logger
 	}
+	minLevel, lvlErr := zapcore.ParseLevel(os.Getenv("LOG_LEVEL"))
+	if lvlErr != nil {
+		minLevel = zapcore.InfoLevel
+	}
+	logger = logger.WithOptions(zap.WrapCore(func(c zapcore.Core) zapcore.Core {
+		return zapcore.NewTee(c, obs.ZapCore(otelCfg.ServiceName, minLevel))
+	}))
+	logger.Info("OpenTelemetry initialized",
+		zap.Bool("traces", obs.TracerProvider != nil),
+		zap.Bool("otlp_metrics", obs.MeterProvider != nil),
+		zap.Bool("otlp_logs", obs.LoggerProvider != nil),
+		zap.String("endpoint", otelCfg.Endpoint),
+		zap.Float64("sample_rate", otelCfg.SampleRate),
+	)
+	return obs, logger
+}
 
-	r := gin.New()
-	r.Use(gin.Recovery())
+// runSubcommand handles `migrate`; returns true when it handled the command.
+func runSubcommand(cmd string, cfg *config.Config, logger *zap.Logger) bool {
+	if cmd != "migrate" {
+		return false
+	}
+	if err := migratex.Run(migrations.FS, "sql", cfg.Database.BuildDSN()); err != nil {
+		logger.Fatal("Schema migration failed", zap.Error(err))
+	}
+	logger.Info("Schema migrations applied")
+	return true
+}
 
-	// Tracing middleware
+// setupServer builds the gin engine: tracing → logging → metrics-free infra
+// endpoints, then the session routes behind the JWT middleware.
+func setupServer(
+	cfg *config.Config,
+	logger *zap.Logger,
+	handler *webv1.Handler,
+	verifier *authmw.Verifier,
+	pool interface {
+		Ping(context.Context) error
+	},
+	isShuttingDown *atomic.Bool,
+) *http.Server {
+	r := gin.Default()
 	r.Use(middleware.TracingMiddleware())
+	r.Use(middleware.LoggingMiddleware(logger))
 
-	// Logging middleware
-	r.Use(middleware.LoggingMiddleware())
-
-	// Prometheus middleware
-	r.Use(middleware.PrometheusMiddleware())
-
-	// Health check
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
-
-	// Readiness check
-	// Returns 503 once shutdown has started, to drain traffic before HTTP shutdown.
 	r.GET("/ready", func(c *gin.Context) {
 		if isShuttingDown.Load() {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "shutting_down"})
 			return
 		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), time.Second)
+		defer cancel()
+		if err := pool.Ping(ctx); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "db_unavailable"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	// Metrics endpoint
-	r.GET(cfg.Metrics.Path, gin.WrapH(promhttp.Handler()))
+	// Checkout v1 routes — Variant A collection-noun paths (`sessions`,
+	// naming convention v3.0.0 / ADR-017), all private.
+	webv1.RegisterRoutes(r, handler, authmw.MiddlewareJWT(verifier))
 
-	// Checkout v1 routes
-	handler.RegisterRoutes(r)
-
-	// Create HTTP server with ReadHeaderTimeout to prevent Slowloris attacks
 	return &http.Server{
 		Addr:              ":" + cfg.Service.Port,
 		Handler:           r,
@@ -140,63 +208,59 @@ func setupServer(cfg *config.Config, handler *webv1.Handler, isShuttingDown *ato
 	}
 }
 
-// runGracefulShutdown starts the server and handles graceful shutdown.
-// Shutdown sequence (VictoriaMetrics pattern): /ready → 503 → drain delay → HTTP → Tracer.
+// runGracefulShutdown serves until SIGTERM/SIGINT, then drains: readiness
+// flips first, the HTTP server shuts down, the pool closes, OTel flushes.
 func runGracefulShutdown(
 	cfg *config.Config,
+	logger *zap.Logger,
 	srv *http.Server,
 	tp interface{ Shutdown(context.Context) error },
+	pool interface{ Close() },
 	isShuttingDown *atomic.Bool,
 ) {
-	// Start server in a goroutine
 	go func() {
-		log.Info().Str("port", cfg.Service.Port).Msg("Starting checkout service")
+		logger.Info("Starting checkout service", zap.String("port", cfg.Service.Port))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal().Err(err).Msg("Failed to start server")
+			logger.Error("Failed to start server", zap.Error(err))
 		}
 	}()
 
-	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-
-	// Wait for shutdown signal
 	<-ctx.Done()
-	log.Info().Msg("Shutdown signal received")
 
-	// Mark service as shutting down so /ready returns 503 immediately.
 	isShuttingDown.Store(true)
+	drain := cfg.GetReadinessDrainDelayDuration()
+	logger.Info("Draining before shutdown", zap.Duration("delay", drain))
+	time.Sleep(drain)
 
-	// Fail readiness first and wait for propagation (best practice for K8s rollout).
-	drainDelay := cfg.GetReadinessDrainDelayDuration()
-	if drainDelay > 0 {
-		log.Info().Dur("delay", drainDelay).Msg("Readiness drain delay started")
-		time.Sleep(drainDelay)
-		log.Info().Dur("delay", drainDelay).Msg("Readiness drain delay completed")
-	}
-
-	// Shutdown context with configurable timeout
 	shutdownTimeout := cfg.GetShutdownTimeoutDuration()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	log.Info().Dur("timeout", shutdownTimeout).Msg("Shutting down server...")
-
-	// 1. Shutdown HTTP server
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error().Err(err).Msg("HTTP server shutdown error")
+		logger.Error("HTTP server shutdown error", zap.Error(err))
 	} else {
-		log.Info().Msg("HTTP server shutdown complete")
+		logger.Info("HTTP server shutdown complete")
 	}
 
-	// 2. Shutdown tracer
+	pool.Close()
+	logger.Info("Database pool closed")
+
 	if tp != nil {
 		if err := tp.Shutdown(shutdownCtx); err != nil {
-			log.Error().Err(err).Msg("Tracer shutdown error")
+			logger.Error("OpenTelemetry shutdown error", zap.Error(err))
 		} else {
-			log.Info().Msg("Tracer shutdown complete")
+			logger.Info("OpenTelemetry shutdown complete")
 		}
 	}
 
-	log.Info().Msg("Graceful shutdown complete")
+	logger.Info("Graceful shutdown complete")
+}
+
+// closeConn closes a gRPC client connection at shutdown.
+func closeConn(conn *grpc.ClientConn, logger *zap.Logger, name string) {
+	if err := conn.Close(); err != nil {
+		logger.Error("gRPC connection close error", zap.String("target", name), zap.Error(err))
+	}
 }

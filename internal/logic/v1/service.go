@@ -1,96 +1,278 @@
-// Package logicv1 contains the checkout business logic, kept free of
-// transport concerns so it is trivially unit-testable.
-package logicv1
+// Package v1 holds checkout's business logic: the session FSM, the cart
+// snapshot with product-authoritative price re-validation (RFC-0015), and the
+// lazy-expiry backstop. Transport-free: web handlers and (in P2) the Temporal
+// worker both drive this layer.
+package v1
 
 import (
+	"context"
 	"errors"
-	"fmt"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/duynhlab/checkout-service/internal/core/domain"
+	"github.com/duynhlab/checkout-service/middleware"
 )
 
-// Pricing rules. Amounts are integer cents to avoid float rounding drift.
-const (
-	// FreeShippingThresholdCents is the subtotal at which shipping becomes free.
-	FreeShippingThresholdCents = 50_00
-	// ShippingFeeCents is the flat shipping fee below the free threshold.
-	ShippingFeeCents = 5_99
-	// MaxQuantityPerItem bounds a single line item quantity.
-	MaxQuantityPerItem = 100
-)
-
-var (
-	// ErrEmptyCart is returned when a quote is requested for no items.
-	ErrEmptyCart = errors.New("cart must contain at least one item")
-	// ErrInvalidItem is returned when a line item fails validation.
-	ErrInvalidItem = errors.New("invalid line item")
-)
-
-// Item is one line in the cart.
-type Item struct {
-	SKU            string `json:"sku"`
-	Quantity       int    `json:"quantity"`
-	UnitPriceCents int    `json:"unit_price_cents"`
+// CartLine is the item-list view checkout snapshots (from cart.v1/GetCart).
+type CartLine struct {
+	ProductID      string
+	ProductName    string
+	Quantity       int
+	CartPriceMinor int64
 }
 
-// Quote is the priced result of a checkout request.
-type Quote struct {
-	Items         int  `json:"items"`
-	SubtotalCents int  `json:"subtotal_cents"`
-	ShippingCents int  `json:"shipping_cents"`
-	TotalCents    int  `json:"total_cents"`
-	FreeShipping  bool `json:"free_shipping"`
+// ProductInfo is the price/stock authority view (from product.v1/GetProducts).
+type ProductInfo struct {
+	ProductID      string
+	Name           string
+	UnitPriceMinor int64
+	AvailableQty   int
 }
 
-// CheckoutService prices carts.
-type CheckoutService struct{}
-
-// NewCheckoutService wires the checkout business logic.
-func NewCheckoutService() *CheckoutService {
-	return &CheckoutService{}
+// CartFetcher is the logic-layer port for the cart snapshot.
+type CartFetcher interface {
+	GetCart(ctx context.Context, userID string) ([]CartLine, error)
 }
 
-// Quote validates the cart and computes subtotal, shipping and total.
-func (s *CheckoutService) Quote(items []Item) (*Quote, error) {
-	if len(items) == 0 {
-		return nil, ErrEmptyCart
+// ProductFetcher is the logic-layer port for price/stock re-validation.
+type ProductFetcher interface {
+	GetProducts(ctx context.Context, ids []string) ([]ProductInfo, error)
+}
+
+// DefaultSessionTTL is the reset-on-activity session deadline (RFC-0015: the
+// clock models user presence, nothing is reserved).
+const DefaultSessionTTL = 30 * time.Minute
+
+// defaultCurrency mirrors the platform's single-currency posture (RFC-0010).
+const defaultCurrency = "USD"
+
+// CheckoutService orchestrates checkout sessions.
+type CheckoutService struct {
+	repo     domain.SessionRepository
+	cart     CartFetcher
+	products ProductFetcher
+	ttl      time.Duration
+	// now is injectable for lazy-expiry tests.
+	now func() time.Time
+}
+
+// NewCheckoutService wires the logic layer. ttl <= 0 falls back to
+// DefaultSessionTTL.
+func NewCheckoutService(repo domain.SessionRepository, cart CartFetcher, products ProductFetcher, ttl time.Duration) *CheckoutService {
+	if ttl <= 0 {
+		ttl = DefaultSessionTTL
 	}
+	return &CheckoutService{repo: repo, cart: cart, products: products, ttl: ttl, now: time.Now}
+}
 
-	subtotal := 0
-	count := 0
-	for i, it := range items {
-		if err := validateItem(i, it); err != nil {
-			return nil, err
+// CreateSession snapshots the user's cart into a new session — or returns the
+// existing active session (created=false): POST /sessions is idempotent, one
+// active session per user. Prices come from product (the checkout-time
+// authority); cart's denormalized price is kept per line for the
+// price-changed diff. An empty cart is ErrEmptyCart.
+func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*domain.Session, bool, error) {
+	ctx, span := middleware.StartSpan(ctx, "checkout.session.create", trace.WithAttributes(
+		attribute.String("layer", "logic"),
+		attribute.String("user.id", userID),
+	))
+	defer span.End()
+
+	// Idempotent create: an active session short-circuits (after the lazy
+	// expiry check — an expired "active" session is retired first).
+	if existing, err := s.repo.FindActiveByUserID(ctx, userID); err == nil {
+		if !s.lazyExpire(ctx, existing) {
+			span.SetAttributes(attribute.Bool("session.reused", true))
+			return existing, false, nil
 		}
-		subtotal += it.Quantity * it.UnitPriceCents
-		count += it.Quantity
+	} else if !errors.Is(err, domain.ErrSessionNotFound) {
+		span.RecordError(err)
+		return nil, false, err
 	}
 
-	shipping := ShippingFeeCents
-	free := subtotal >= FreeShippingThresholdCents
-	if free {
-		shipping = 0
+	lines, err := s.cart.GetCart(ctx, userID)
+	if err != nil {
+		span.RecordError(err)
+		return nil, false, ErrUpstream
+	}
+	if len(lines) == 0 {
+		return nil, false, ErrEmptyCart
 	}
 
-	return &Quote{
-		Items:         count,
-		SubtotalCents: subtotal,
-		ShippingCents: shipping,
-		TotalCents:    subtotal + shipping,
-		FreeShipping:  free,
-	}, nil
+	ids := make([]string, 0, len(lines))
+	for _, l := range lines {
+		ids = append(ids, l.ProductID)
+	}
+	infos, err := s.products.GetProducts(ctx, ids)
+	if err != nil {
+		span.RecordError(err)
+		return nil, false, ErrUpstream
+	}
+	byID := make(map[string]ProductInfo, len(infos))
+	for _, p := range infos {
+		byID[p.ProductID] = p
+	}
+
+	items := make([]domain.SessionItem, 0, len(lines))
+	var subtotal int64
+	priceChanged := 0
+	for _, l := range lines {
+		info, ok := byID[l.ProductID]
+		if !ok {
+			// Product gone from the catalog since it was carted: snapshot the
+			// line with the cart price and flag it — confirm-time
+			// re-validation (P2) is the gate that blocks it.
+			info = ProductInfo{ProductID: l.ProductID, Name: l.ProductName, UnitPriceMinor: l.CartPriceMinor}
+		}
+		item := domain.SessionItem{
+			ProductID:      l.ProductID,
+			ProductName:    l.ProductName,
+			Quantity:       l.Quantity,
+			UnitPriceMinor: info.UnitPriceMinor,
+			CartPriceMinor: l.CartPriceMinor,
+			PriceChanged:   !ok || info.UnitPriceMinor != l.CartPriceMinor,
+		}
+		if item.PriceChanged {
+			priceChanged++
+		}
+		subtotal += item.UnitPriceMinor * int64(item.Quantity)
+		items = append(items, item)
+	}
+
+	now := s.now()
+	session := &domain.Session{
+		UserID:        userID,
+		Status:        domain.StatusOpen,
+		Items:         items,
+		SubtotalMinor: subtotal,
+		// Shipping fee, tax, and discount join in P2/P3; a fresh session's
+		// total is its subtotal.
+		TotalMinor: subtotal,
+		Currency:   defaultCurrency,
+		ExpiresAt:  now.Add(s.ttl),
+	}
+	if err := s.repo.Create(ctx, session); err != nil {
+		if errors.Is(err, domain.ErrActiveSessionExists) {
+			// Lost a concurrent-create race: surface the winner.
+			if winner, ferr := s.repo.FindActiveByUserID(ctx, userID); ferr == nil {
+				return winner, false, nil
+			}
+		}
+		span.RecordError(err)
+		return nil, false, err
+	}
+	span.SetAttributes(
+		attribute.Int("items.count", len(items)),
+		attribute.Int("items.price_changed", priceChanged),
+	)
+	return session, true, nil
 }
 
-// validateItem enforces per-line invariants.
-func validateItem(idx int, it Item) error {
-	switch {
-	case it.SKU == "":
-		return fmt.Errorf("%w: item %d has empty sku", ErrInvalidItem, idx)
-	case it.Quantity <= 0:
-		return fmt.Errorf("%w: item %d (%s) quantity must be positive", ErrInvalidItem, idx, it.SKU)
-	case it.Quantity > MaxQuantityPerItem:
-		return fmt.Errorf("%w: item %d (%s) quantity exceeds %d", ErrInvalidItem, idx, it.SKU, MaxQuantityPerItem)
-	case it.UnitPriceCents < 0:
-		return fmt.Errorf("%w: item %d (%s) unit price must not be negative", ErrInvalidItem, idx, it.SKU)
-	default:
-		return nil
+// GetSession returns the caller's session. Foreign or unknown ids are both
+// ErrSessionNotFound (anti-IDOR); an elapsed TTL is recorded lazily and
+// surfaces as ErrSessionExpired.
+func (s *CheckoutService) GetSession(ctx context.Context, userID, id string) (*domain.Session, error) {
+	ctx, span := middleware.StartSpan(ctx, "checkout.session.get", trace.WithAttributes(
+		attribute.String("layer", "logic"),
+	))
+	defer span.End()
+
+	session, err := s.ownedSession(ctx, userID, id)
+	if err != nil {
+		return nil, err
 	}
+	if s.lazyExpire(ctx, session) {
+		return nil, ErrSessionExpired
+	}
+	return session, nil
+}
+
+// SetAddress stores the shipping address and moves the session to
+// address_set (a legal re-entry from any pre-confirm state).
+func (s *CheckoutService) SetAddress(ctx context.Context, userID, id string, addr *domain.Address) (*domain.Session, error) {
+	ctx, span := middleware.StartSpan(ctx, "checkout.session.set_address", trace.WithAttributes(
+		attribute.String("layer", "logic"),
+	))
+	defer span.End()
+
+	session, err := s.ownedSession(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	if s.lazyExpire(ctx, session) {
+		return nil, ErrSessionExpired
+	}
+	if !CanTransition(session.Status, domain.StatusAddressSet) {
+		return nil, ErrInvalidTransition
+	}
+	if err := s.repo.SetAddress(ctx, session.ID, session.Status, addr); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	session.Status = domain.StatusAddressSet
+	session.Address = addr
+	return session, nil
+}
+
+// Cancel moves the session to the terminal cancelled state. Cancelling an
+// already-cancelled session is idempotent (no error); terminal states other
+// than cancelled reject with ErrInvalidTransition.
+func (s *CheckoutService) Cancel(ctx context.Context, userID, id string) error {
+	ctx, span := middleware.StartSpan(ctx, "checkout.session.cancel", trace.WithAttributes(
+		attribute.String("layer", "logic"),
+	))
+	defer span.End()
+
+	session, err := s.ownedSession(ctx, userID, id)
+	if err != nil {
+		return err
+	}
+	if session.Status == domain.StatusCancelled {
+		return nil // idempotent
+	}
+	if s.lazyExpire(ctx, session) {
+		return ErrSessionExpired
+	}
+	if !CanTransition(session.Status, domain.StatusCancelled) {
+		return ErrInvalidTransition
+	}
+	if err := s.repo.UpdateStatus(ctx, session.ID, session.Status, domain.StatusCancelled); err != nil {
+		span.RecordError(err)
+		return err
+	}
+	return nil
+}
+
+// ownedSession loads a session and enforces ownership: a foreign session is
+// reported exactly like a missing one.
+func (s *CheckoutService) ownedSession(ctx context.Context, userID, id string) (*domain.Session, error) {
+	session, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, domain.ErrSessionNotFound) {
+			return nil, ErrSessionNotFound
+		}
+		return nil, err
+	}
+	if session.UserID != userID {
+		return nil, ErrSessionNotFound
+	}
+	return session, nil
+}
+
+// lazyExpire is the correctness backstop (RFC-0015): a session past its
+// deadline is treated as expired on EVERY read and mutation, regardless of
+// what the Temporal timer (P2) has done. It records the expiry best-effort —
+// the predicate's answer never depends on the write succeeding.
+func (s *CheckoutService) lazyExpire(ctx context.Context, session *domain.Session) bool {
+	if session.Status.Terminal() {
+		return session.Status == domain.StatusExpired
+	}
+	if s.now().Before(session.ExpiresAt) {
+		return false
+	}
+	// Best-effort record; MarkExpired is conditional and idempotent.
+	_ = s.repo.MarkExpired(ctx, session.ID, domain.ExpiredByLazy)
+	return true
 }

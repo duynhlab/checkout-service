@@ -1,12 +1,11 @@
-// Package config provides centralized configuration management for the
-// checkout service with validation, type safety, and clear documentation for
-// SRE/DevOps teams.
+// Package config provides centralized configuration management for all microservices
+// with validation, type safety, and clear documentation for SRE/DevOps teams.
 //
 // Configuration Sources (12-factor app principles):
 //  1. Default values (hardcoded)
 //  2. .env file (local development via godotenv)
 //  3. Environment variables (Kubernetes runtime)
-//  4. Helm values → deployment.yaml → env → container environment
+//  4. Helm values → deployment.yaml → env/extraEnv → container environment
 //
 // Usage:
 //
@@ -33,26 +32,37 @@ import (
 )
 
 // defaultServiceName is the fallback service name when SERVICE_NAME is not set
-const defaultServiceName = "unknown"
+const defaultServiceName = "checkout"
 
-// Config holds all configuration for the checkout service
+// Config holds all configuration for a microservice
 type Config struct {
 	Service         ServiceConfig   // Service-specific settings (port, name, version)
+	Checkout        CheckoutConfig  // Checkout-domain settings (session TTL, downstream gRPC targets)
 	Tracing         TracingConfig   // OpenTelemetry/Tempo configuration
 	Profiling       ProfilingConfig // Pyroscope continuous profiling
-	Logging         LoggingConfig   // Structured logging (zerolog)
-	Metrics         MetricsConfig   // Prometheus metrics
-	Database        DatabaseConfig  // PostgreSQL configuration (unused until checkout persists state)
+	Logging         LoggingConfig   // Structured logging (Zap)
+	Database        DatabaseConfig  // PostgreSQL database configuration
 	ShutdownTimeout int             // Graceful shutdown timeout in seconds - from SHUTDOWN_TIMEOUT env (default: 10)
 	// ReadinessDrainDelay: delay after failing readiness before shutting down the HTTP server.
 	// This gives Kubernetes/Service routing time to stop sending new traffic.
 	// From READINESS_DRAIN_DELAY env (default: 5s, max: 30s).
 	ReadinessDrainDelay int
+	JWKSURL             string // Auth JWKS endpoint for local JWT verification - from AUTH_JWKS_URL env
+	JWTIssuer           string // Expected JWT issuer - from JWT_ISSUER env
+	JWTAudience         string // Expected JWT audience - from JWT_AUDIENCE env
+}
+
+// CheckoutConfig holds the checkout-domain settings. checkout runs NO gRPC
+// server (client-only service, RFC-0015); it dials cart and product.
+type CheckoutConfig struct {
+	SessionTTL      time.Duration // reset-on-activity session deadline - from SESSION_TTL_SECONDS env (default: 1800)
+	CartGRPCAddr    string        // cart.v1 target - from CART_GRPC_ADDR env
+	ProductGRPCAddr string        // product.v1 target - from PRODUCT_GRPC_ADDR env
 }
 
 // ServiceConfig defines basic service configuration
 type ServiceConfig struct {
-	Name    string // Service name (e.g., "checkout") - from SERVICE_NAME env
+	Name    string // Service name (e.g., "auth", "user") - from SERVICE_NAME env
 	Port    string // HTTP server port (default: "8080") - from PORT env
 	Version string // Service version (optional) - from VERSION env
 	Env     string // Environment (dev/staging/production) - from ENV env
@@ -61,11 +71,10 @@ type ServiceConfig struct {
 // TracingConfig defines OpenTelemetry tracing configuration
 // Traces are sent to OpenTelemetry Collector for distributed tracing analysis
 type TracingConfig struct {
-	Enabled            bool    // Enable tracing (default: true) - from TRACING_ENABLED env
-	Endpoint           string  // OTel Collector endpoint - from OTEL_COLLECTOR_ENDPOINT env
-	SampleRate         float64 // Trace sampling rate (0.0-1.0) - from OTEL_SAMPLE_RATE env
-	ServiceName        string  // Service name for traces (defaults to ServiceConfig.Name)
-	MaxExportBatchSize int     // Max spans per batch (default: 512)
+	Enabled     bool    // Enable tracing (default: true) - from TRACING_ENABLED env
+	Endpoint    string  // OTel Collector endpoint - from OTEL_COLLECTOR_ENDPOINT env
+	SampleRate  float64 // Trace sampling rate (0.0-1.0) - from OTEL_SAMPLE_RATE env
+	ServiceName string  // Service name for traces (defaults to ServiceConfig.Name)
 }
 
 // ProfilingConfig defines Pyroscope continuous profiling configuration
@@ -81,20 +90,13 @@ type LoggingConfig struct {
 	Format string // Log format: json, console (default: "json") - from LOG_FORMAT env
 }
 
-// MetricsConfig defines Prometheus metrics configuration
-type MetricsConfig struct {
-	Enabled bool   // Enable metrics (default: true) - from METRICS_ENABLED env
-	Path    string // Metrics endpoint path (default: "/metrics") - from METRICS_PATH env
-}
-
 // DatabaseConfig defines PostgreSQL database configuration
 // All database connections use separate environment variables (not DATABASE_URL string)
 type DatabaseConfig struct {
-	Host string // Database host - from DB_HOST env
-	Port string // Database port - from DB_PORT env (default: "5432")
-	Name string // Database name - from DB_NAME env
-	User string // Database user - from DB_USER env
-	// nolint:gosec // G117: This is a configuration field for the database password
+	Host           string // Database host - from DB_HOST env
+	Port           string // Database port - from DB_PORT env (default: "5432")
+	Name           string // Database name - from DB_NAME env
+	User           string // Database user - from DB_USER env
 	Password       string // Database password - from DB_PASSWORD env
 	SSLMode        string // SSL mode - from DB_SSLMODE env (default: "disable")
 	MaxConnections int    // Max connections - from DB_POOL_MAX_CONNECTIONS env (default: 25)
@@ -102,10 +104,15 @@ type DatabaseConfig struct {
 	PoolerType     string // Pooler type - from DB_POOLER_TYPE env (optional)
 }
 
-// BuildDSN constructs PostgreSQL connection string from config
+// BuildDSN constructs the PostgreSQL connection string from config. It is the
+// single source of truth for the DSN: both the `migrate` subcommand and the
+// app's connection pool use it, so they connect identically.
 func (c *DatabaseConfig) BuildDSN() string {
 	// Format: postgresql://user:password@host:port/dbname?sslmode=disable
 	hostPort := net.JoinHostPort(c.Host, c.Port)
+	// Pool sizing is applied on the parsed pgxpool.Config in database.Connect (not
+	// the DSN) so the migrate subcommand can share this exact DSN (its pgx stdlib
+	// driver rejects pool_* params).
 	return fmt.Sprintf("postgresql://%s:%s@%s/%s?sslmode=%s",
 		c.User, c.Password, hostPort, c.Name, c.SSLMode)
 }
@@ -127,12 +134,16 @@ func Load() *Config {
 			Version: getEnv("VERSION", "dev"),
 			Env:     getEnv("ENV", "development"),
 		},
+		Checkout: CheckoutConfig{
+			SessionTTL:      time.Duration(getEnvDurationSeconds("SESSION_TTL_SECONDS", 1800)) * time.Second,
+			CartGRPCAddr:    getEnv("CART_GRPC_ADDR", "dns:///cart-grpc.cart.svc.cluster.local:9090"),
+			ProductGRPCAddr: getEnv("PRODUCT_GRPC_ADDR", "dns:///product-grpc.product.svc.cluster.local:9090"),
+		},
 		Tracing: TracingConfig{
-			Enabled:            getEnvBool("TRACING_ENABLED", true),
-			Endpoint:           getEnv("OTEL_COLLECTOR_ENDPOINT", "otel-collector-opentelemetry-collector.monitoring.svc.cluster.local:4318"),
-			SampleRate:         getEnvFloat("OTEL_SAMPLE_RATE", 0.1), // 10% default (production)
-			ServiceName:        getEnv("SERVICE_NAME", defaultServiceName),
-			MaxExportBatchSize: getEnvInt("OTEL_BATCH_SIZE", 512),
+			Enabled:     getEnvBool("TRACING_ENABLED", true),
+			Endpoint:    getEnv("OTEL_COLLECTOR_ENDPOINT", "otel-collector-opentelemetry-collector.monitoring.svc.cluster.local:4318"),
+			SampleRate:  getEnvFloat("OTEL_SAMPLE_RATE", 0.1), // 10% default (production)
+			ServiceName: getEnv("SERVICE_NAME", defaultServiceName),
 		},
 		Profiling: ProfilingConfig{
 			Enabled:     getEnvBool("PROFILING_ENABLED", true),
@@ -142,10 +153,6 @@ func Load() *Config {
 		Logging: LoggingConfig{
 			Level:  getEnv("LOG_LEVEL", "info"),
 			Format: getEnv("LOG_FORMAT", "json"),
-		},
-		Metrics: MetricsConfig{
-			Enabled: getEnvBool("METRICS_ENABLED", true),
-			Path:    getEnv("METRICS_PATH", "/metrics"),
 		},
 		Database: DatabaseConfig{
 			Host:           getEnv("DB_HOST", ""),
@@ -160,6 +167,9 @@ func Load() *Config {
 		},
 		ShutdownTimeout:     getEnvDurationSeconds("SHUTDOWN_TIMEOUT", 10),
 		ReadinessDrainDelay: getEnvDurationSecondsWithMax("READINESS_DRAIN_DELAY", 5, 30),
+		JWKSURL:             getEnv("AUTH_JWKS_URL", "http://auth.auth.svc.cluster.local:8080/auth/v1/public/auth/jwks"),
+		JWTIssuer:           getEnv("JWT_ISSUER", "https://gateway.duynh.me"),
+		JWTAudience:         getEnv("JWT_AUDIENCE", "duynhlab-platform"),
 	}
 }
 
@@ -181,12 +191,10 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// validateService validates service configuration fields
 func (c *Config) validateService() []string {
 	var errs []string
-
 	if c.Service.Name == "" || c.Service.Name == defaultServiceName {
-		errs = append(errs, "SERVICE_NAME is required (e.g., 'checkout')")
+		errs = append(errs, "SERVICE_NAME is required (e.g., 'auth', 'user', 'product')")
 	}
 	if c.Service.Port == "" {
 		errs = append(errs, "PORT is required (e.g., '8080')")
@@ -198,18 +206,14 @@ func (c *Config) validateService() []string {
 	if !contains(validEnvs, c.Service.Env) {
 		errs = append(errs, fmt.Sprintf("ENV must be one of %v, got: %s", validEnvs, c.Service.Env))
 	}
-
 	return errs
 }
 
-// validateTracing validates tracing configuration fields
 func (c *Config) validateTracing() []string {
 	if !c.Tracing.Enabled {
 		return nil
 	}
-
 	var errs []string
-
 	if c.Tracing.Endpoint == "" {
 		errs = append(errs, "OTEL_COLLECTOR_ENDPOINT is required when tracing is enabled")
 	}
@@ -219,32 +223,25 @@ func (c *Config) validateTracing() []string {
 	if c.Tracing.ServiceName == "" || c.Tracing.ServiceName == defaultServiceName {
 		errs = append(errs, "SERVICE_NAME is required for tracing (used in Tempo queries)")
 	}
-
 	return errs
 }
 
-// validateProfiling validates profiling configuration fields
 func (c *Config) validateProfiling() []string {
 	if !c.Profiling.Enabled {
 		return nil
 	}
-
 	var errs []string
-
 	if c.Profiling.Endpoint == "" {
 		errs = append(errs, "PYROSCOPE_ENDPOINT is required when profiling is enabled")
 	}
 	if c.Profiling.ServiceName == "" || c.Profiling.ServiceName == defaultServiceName {
 		errs = append(errs, "SERVICE_NAME is required for profiling (used in Pyroscope UI)")
 	}
-
 	return errs
 }
 
-// validateLogging validates logging configuration fields
 func (c *Config) validateLogging() []string {
 	var errs []string
-
 	validLogLevels := []string{"debug", "info", "warn", "error"}
 	if !contains(validLogLevels, strings.ToLower(c.Logging.Level)) {
 		errs = append(errs, fmt.Sprintf("LOG_LEVEL must be one of %v, got: %s", validLogLevels, c.Logging.Level))
@@ -253,18 +250,14 @@ func (c *Config) validateLogging() []string {
 	if !contains(validLogFormats, strings.ToLower(c.Logging.Format)) {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT must be one of %v, got: %s", validLogFormats, c.Logging.Format))
 	}
-
 	return errs
 }
 
-// validateDatabase validates database configuration fields
 func (c *Config) validateDatabase() []string {
 	if c.Database.Host == "" {
 		return nil
 	}
-
 	var errs []string
-
 	if c.Database.Name == "" {
 		errs = append(errs, "DB_NAME is required when DB_HOST is set")
 	}
@@ -279,7 +272,6 @@ func (c *Config) validateDatabase() []string {
 			errs = append(errs, "DB_PORT must be a valid number, got: "+c.Database.Port)
 		}
 	}
-
 	return errs
 }
 
@@ -375,12 +367,6 @@ func getEnvDurationSeconds(key string, defaultValueSeconds int) int {
 	return seconds
 }
 
-// GetShutdownTimeoutDuration returns shutdown timeout as time.Duration
-// Convenience method for use in main.go
-func (c *Config) GetShutdownTimeoutDuration() time.Duration {
-	return time.Duration(c.ShutdownTimeout) * time.Second
-}
-
 // getEnvDurationSecondsWithMax reads a duration env var and returns seconds as int.
 // Accepts Go duration format (e.g., "5s", "30s", "1m").
 // Returns default on invalid values (silent fallback for startup safety).
@@ -401,6 +387,12 @@ func getEnvDurationSecondsWithMax(key string, defaultValueSeconds int, maxSecond
 	}
 
 	return seconds
+}
+
+// GetShutdownTimeoutDuration returns shutdown timeout as time.Duration
+// Convenience method for use in main.go
+func (c *Config) GetShutdownTimeoutDuration() time.Duration {
+	return time.Duration(c.ShutdownTimeout) * time.Second
 }
 
 // GetReadinessDrainDelayDuration returns readiness drain delay as time.Duration.

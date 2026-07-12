@@ -1,78 +1,188 @@
-// Package webv1 exposes the checkout HTTP API (v1).
-package webv1
+// Package v1 implements checkout's HTTP transport: Variant A collection-noun
+// routes under /checkout/v1/private/sessions (naming convention v3.0.0,
+// ADR-017 — checkout's registered collection noun is `sessions`). Handlers
+// validate, call the logic layer, and translate domain errors to the shared
+// httpx envelope. All routes are private: Kong edge-JWT pre-filters, the
+// in-service authmw verification is authoritative, and sessions are
+// owner-scoped by the JWT user_id (anti-IDOR).
+package v1
 
 import (
 	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
-	"github.com/duynhlab/checkout-service/config"
+	"github.com/duynhlab/pkg/authmw"
+	"github.com/duynhlab/pkg/httpx"
+
+	"github.com/duynhlab/checkout-service/internal/core/domain"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
+	"github.com/duynhlab/checkout-service/middleware"
 )
 
-// Handler wires HTTP transport to the checkout business logic.
+// msgInvalidRequestBody is the shared 400 message for malformed JSON.
+const msgInvalidRequestBody = "Invalid request body"
+
+// Handler serves the checkout session API.
 type Handler struct {
 	svc *logicv1.CheckoutService
-	cfg *config.Config
 }
 
-// NewHandler creates the v1 HTTP handler.
-func NewHandler(svc *logicv1.CheckoutService, cfg *config.Config) *Handler {
-	return &Handler{svc: svc, cfg: cfg}
+// NewHandler wires the handler over the logic layer.
+func NewHandler(svc *logicv1.CheckoutService) *Handler {
+	return &Handler{svc: svc}
 }
 
-// RegisterRoutes mounts the v1 API on the router.
-func (h *Handler) RegisterRoutes(r *gin.Engine) {
-	v1 := r.Group("/api/v1")
-	v1.POST("/checkout", h.quote)
-	v1.GET("/info", h.info)
-}
-
-// quoteRequest is the POST /api/v1/checkout payload.
-type quoteRequest struct {
-	Items []logicv1.Item `json:"items" binding:"required"`
-}
-
-// quote prices a cart.
-func (h *Handler) quote(c *gin.Context) {
-	var req quoteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
-		return
+// RegisterRoutes mounts the session routes on the private group. The caller
+// passes the JWT middleware so tests can inject a fake.
+func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
+	private := r.Group("/checkout/v1/private", jwtMW)
+	{
+		private.POST("/sessions", h.CreateSession)
+		private.GET("/sessions/:id", h.GetSession)
+		private.PUT("/sessions/:id/address", h.SetAddress)
+		private.DELETE("/sessions/:id", h.CancelSession)
 	}
+}
 
-	q, err := h.svc.Quote(req.Items)
+// CreateSession handles POST /checkout/v1/private/sessions — snapshot the
+// cart, re-validate prices against product, return 201 (created) or 200 (an
+// active session already exists; POST is idempotent).
+func (h *Handler) CreateSession(c *gin.Context) {
+	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
+		attribute.String("layer", "web"),
+		attribute.String("method", c.Request.Method),
+		attribute.String("path", c.Request.URL.Path),
+	))
+	defer span.End()
+	logger := middleware.GetLoggerFromGinContext(c)
+
+	session, created, err := h.svc.CreateSession(ctx, c.GetString(authmw.CtxUserID))
 	if err != nil {
+		span.RecordError(err)
 		switch {
-		case errors.Is(err, logicv1.ErrEmptyCart), errors.Is(err, logicv1.ErrInvalidItem):
-			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
+		case errors.Is(err, logicv1.ErrEmptyCart):
+			httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "Cart is empty")
+		case errors.Is(err, logicv1.ErrUpstream):
+			logger.Error("Session create upstream failure", zap.Error(err))
+			httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
 		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			logger.Error("Session create failed", zap.Error(err))
+			httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
 		}
 		return
 	}
 
-	c.JSON(http.StatusOK, q)
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	logger.Info("Checkout session ready",
+		zap.String("session_id", session.ID), zap.Bool("created", created))
+	c.JSON(status, gin.H{"session": session})
 }
 
-// info reports the service identity and effective runtime configuration —
-// the fastest way to confirm which env/version a pod is running.
-// Secrets never appear here.
-func (h *Handler) info(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"service": h.cfg.Service.Name,
-		"version": h.cfg.Service.Version,
-		"env":     h.cfg.Service.Env,
-		"logging": gin.H{
-			"level":  h.cfg.Logging.Level,
-			"format": h.cfg.Logging.Format,
-		},
-		"tracing": gin.H{
-			"enabled":     h.cfg.Tracing.Enabled,
-			"sample_rate": h.cfg.Tracing.SampleRate,
-		},
-		"profiling": gin.H{"enabled": h.cfg.Profiling.Enabled},
-		"metrics":   gin.H{"enabled": h.cfg.Metrics.Enabled, "path": h.cfg.Metrics.Path},
-	})
+// GetSession handles GET /checkout/v1/private/sessions/:id.
+func (h *Handler) GetSession(c *gin.Context) {
+	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
+		attribute.String("layer", "web"),
+		attribute.String("method", c.Request.Method),
+		attribute.String("path", c.Request.URL.Path),
+	))
+	defer span.End()
+
+	session, err := h.svc.GetSession(ctx, c.GetString(authmw.CtxUserID), c.Param("id"))
+	if err != nil {
+		h.respondSessionError(c, span, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"session": session})
+}
+
+// SetAddress handles PUT /checkout/v1/private/sessions/:id/address.
+func (h *Handler) SetAddress(c *gin.Context) {
+	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
+		attribute.String("layer", "web"),
+		attribute.String("method", c.Request.Method),
+		attribute.String("path", c.Request.URL.Path),
+	))
+	defer span.End()
+
+	var addr addressRequest
+	if err := c.ShouldBindJSON(&addr); err != nil {
+		span.RecordError(err)
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, msgInvalidRequestBody)
+		return
+	}
+
+	session, err := h.svc.SetAddress(ctx, c.GetString(authmw.CtxUserID), c.Param("id"), addr.toDomain())
+	if err != nil {
+		h.respondSessionError(c, span, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"session": session})
+}
+
+// CancelSession handles DELETE /checkout/v1/private/sessions/:id.
+func (h *Handler) CancelSession(c *gin.Context) {
+	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
+		attribute.String("layer", "web"),
+		attribute.String("method", c.Request.Method),
+		attribute.String("path", c.Request.URL.Path),
+	))
+	defer span.End()
+
+	if err := h.svc.Cancel(ctx, c.GetString(authmw.CtxUserID), c.Param("id")); err != nil {
+		h.respondSessionError(c, span, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "session cancelled"})
+}
+
+// respondSessionError maps logic errors to the shared envelope. Unknown and
+// foreign sessions are both 404 (anti-IDOR); an elapsed TTL is 410
+// SESSION_EXPIRED (the session existed — distinct from 404).
+func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error) {
+	span.RecordError(err)
+	switch {
+	case errors.Is(err, logicv1.ErrSessionNotFound):
+		httpx.RespondError(c, http.StatusNotFound, httpx.CodeNotFound, "Checkout session not found")
+	case errors.Is(err, logicv1.ErrSessionExpired):
+		httpx.RespondError(c, http.StatusGone, httpx.CodeSessionExpired, "Checkout session expired")
+	case errors.Is(err, logicv1.ErrInvalidTransition):
+		httpx.RespondError(c, http.StatusConflict, httpx.CodeInvalidTransition, "Session state does not allow this operation")
+	case errors.Is(err, domain.ErrStaleTransition):
+		httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "Session was modified concurrently; reload and retry")
+	default:
+		middleware.GetLoggerFromGinContext(c).Error("Session operation failed", zap.Error(err))
+		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
+	}
+}
+
+// addressRequest is the PUT …/address payload; snake_case per the platform
+// JSON convention, validated at this boundary.
+type addressRequest struct {
+	FullName string `json:"full_name" binding:"required"`
+	Line1    string `json:"line1" binding:"required"`
+	Line2    string `json:"line2"`
+	City     string `json:"city" binding:"required"`
+	Region   string `json:"region"`
+	PostCode string `json:"post_code"`
+	Country  string `json:"country" binding:"required"`
+}
+
+func (a *addressRequest) toDomain() *domain.Address {
+	return &domain.Address{
+		FullName: a.FullName,
+		Line1:    a.Line1,
+		Line2:    a.Line2,
+		City:     a.City,
+		Region:   a.Region,
+		PostCode: a.PostCode,
+		Country:  a.Country,
+	}
 }
