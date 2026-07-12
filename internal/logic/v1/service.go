@@ -57,6 +57,9 @@ type CheckoutService struct {
 	ttl      time.Duration
 	// now is injectable for lazy-expiry tests.
 	now func() time.Time
+	// P2 confirm dependencies, wired via WithConfirm (nil pre-P2).
+	idem   IdemStore
+	orders OrderCreator
 }
 
 // NewCheckoutService wires the logic layer. ttl <= 0 falls back to

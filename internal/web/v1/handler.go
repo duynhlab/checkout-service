@@ -49,6 +49,7 @@ func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
 		private.PUT("/sessions/:id/address", h.SetAddress)
 		private.PUT("/sessions/:id/shipping", h.SetShipping)
 		private.PUT("/sessions/:id/payment", h.SetPayment)
+		private.POST("/sessions/:id/confirm", h.ConfirmSession)
 		private.DELETE("/sessions/:id", h.CancelSession)
 	}
 }
@@ -180,6 +181,65 @@ func (h *Handler) SetPayment(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, toSessionResponse(session))
+}
+
+// maxIdempotencyKeyLen caps the client key so the composed order-side key
+// ("checkout:<uuid>:<key>") always fits order's 200-char limit.
+const maxIdempotencyKeyLen = 120
+
+// ConfirmSession handles POST …/sessions/:id/confirm — the idempotent order
+// handoff. The Idempotency-Key header is REQUIRED: the SPA generates one per
+// checkout attempt and persists it so a retry always converges.
+func (h *Handler) ConfirmSession(c *gin.Context) {
+	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
+		attribute.String("layer", "web"),
+		attribute.String("method", c.Request.Method),
+		attribute.String("path", c.Request.URL.Path),
+	))
+	defer span.End()
+	logger := middleware.GetLoggerFromGinContext(c)
+
+	key := c.GetHeader("Idempotency-Key")
+	if key == "" {
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeIdempotencyKeyRequired, "Idempotency-Key header is required")
+		return
+	}
+	if len(key) > maxIdempotencyKeyLen {
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Idempotency-Key too long (max 120 chars)")
+		return
+	}
+
+	session, err := h.svc.Confirm(ctx, c.GetString(authmw.CtxUserID), c.Param("id"), key)
+	if err != nil {
+		span.RecordError(err)
+		switch {
+		case errors.Is(err, logicv1.ErrPriceChanged):
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   gin.H{"code": httpx.CodePriceChanged, "message": "Prices changed; session requoted — review and confirm again"},
+				"session": toSessionResponse(session),
+			})
+		case errors.Is(err, logicv1.ErrStockUnavailable):
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   gin.H{"code": httpx.CodeStockUnavailable, "message": "Some items are no longer available"},
+				"session": toSessionResponse(session),
+			})
+		case errors.Is(err, logicv1.ErrConfirmInFlight):
+			httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "A confirm is already in flight for this session")
+		case errors.Is(err, logicv1.ErrKeyConflict):
+			httpx.RespondError(c, http.StatusConflict, httpx.CodeIdempotencyConflict, "Idempotency-Key was used for a different request")
+		case errors.Is(err, logicv1.ErrUpstream):
+			c.Header("Retry-After", "2")
+			logger.Error("Confirm upstream failure", zap.Error(err))
+			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Confirm temporarily unavailable, retry with the same Idempotency-Key")
+		default:
+			h.respondSessionError(c, span, err)
+		}
+		return
+	}
+
+	logger.Info("Checkout confirmed",
+		zap.String("session_id", session.ID), zap.String("order_id", session.OrderID))
+	c.JSON(http.StatusCreated, toSessionResponse(session))
 }
 
 // CancelSession handles DELETE /checkout/v1/private/checkout/sessions/:id.
