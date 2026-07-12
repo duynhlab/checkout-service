@@ -166,13 +166,13 @@ func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error
 // addressRequest is the PUT …/address payload; snake_case per the platform
 // JSON convention, validated at this boundary.
 type addressRequest struct {
-	FullName string `json:"full_name" binding:"required"`
-	Line1    string `json:"line1" binding:"required"`
-	Line2    string `json:"line2"`
-	City     string `json:"city" binding:"required"`
-	Region   string `json:"region"`
-	PostCode string `json:"post_code"`
-	Country  string `json:"country" binding:"required"`
+	FullName string `json:"full_name" binding:"required,max=120"`
+	Line1    string `json:"line1" binding:"required,max=200"`
+	Line2    string `json:"line2" binding:"max=200"`
+	City     string `json:"city" binding:"required,max=100"`
+	Region   string `json:"region" binding:"max=100"`
+	PostCode string `json:"post_code" binding:"max=20"`
+	Country  string `json:"country" binding:"required,max=56"`
 }
 
 func (a *addressRequest) toDomain() *domain.Address {
