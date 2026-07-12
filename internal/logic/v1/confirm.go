@@ -94,6 +94,8 @@ func (s *CheckoutService) WithConfirm(idem IdemStore, orders OrderCreator) *Chec
 func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey string) (*domain.Session, error) {
 	ctx, cancel := context.WithTimeout(ctx, ConfirmDeadline)
 	defer cancel()
+	start := s.now()
+	defer func() { confirmDuration.Record(ctx, s.now().Sub(start).Seconds()) }()
 	ctx, span := middleware.StartSpan(ctx, "checkout.session.confirm", trace.WithAttributes(
 		attribute.String("layer", "logic"),
 	))
@@ -211,6 +213,7 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 		session.OrderID = orderID
 	}
 
+	confirmedCounter.Add(ctx, 1)
 	return session, s.finishConfirm(ctx, key.ID, session)
 }
 
@@ -273,6 +276,7 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 	session.SubtotalMinor = subtotal
 	session.TotalMinor = total
 	session.ConfirmKeyID = nil
+	priceChangedCounter.Add(ctx, 1)
 	if stockShort {
 		return session, ErrStockUnavailable
 	}
