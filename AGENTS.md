@@ -30,9 +30,11 @@ and saga-starter.
 
 - **Client-only service**: no gRPC server. It dials cart (`cart.v1/GetCart`)
   and product (`product.v1/GetProducts`) over `pkg/grpcx`.
-- Routes are Variant A collection-noun paths (naming convention v3.0.0,
-  ADR-017): `/checkout/v1/private/sessions[…]` — checkout's registered
-  collection noun is **`sessions`**. All routes private (Kong edge-JWT +
+- Routes are Variant A collection-noun paths (naming convention v3.0.1,
+  ADR-017): `/checkout/v1/private/checkout/sessions[…]` — checkout, like
+  auth, is a process-named service, so its owning segment is the literal
+  **`checkout`** with resources (`sessions`) nested beneath it. All routes
+  private (Kong edge-JWT +
   authoritative in-service `pkg/authmw`), owner-scoped by JWT `user_id`.
 - **Lazy-expiry backstop**: every read/mutation treats `now > expires_at` as
   expired regardless of the (P2) Temporal timer — correctness never depends

@@ -54,10 +54,10 @@ someone else's session id behaves exactly like one that doesn't exist (404).
 
 | Method | Path | What it does |
 |--------|------|--------------|
-| `POST` | `/checkout/v1/private/sessions` | Start checking out: snapshots your cart, re-checks every price against the catalog. Creating twice is safe — you get your existing session back (**201** new, **200** existing) |
-| `GET` | `/checkout/v1/private/sessions/:id` | See the session: items, prices, totals, status |
-| `PUT` | `/checkout/v1/private/sessions/:id/address` | Save your shipping address |
-| `DELETE` | `/checkout/v1/private/sessions/:id` | Cancel the session (your cart is untouched) |
+| `POST` | `/checkout/v1/private/checkout/sessions` | Start checking out: snapshots your cart, re-checks every price against the catalog. Creating twice is safe — you get your existing session back (**201** new, **200** existing) |
+| `GET` | `/checkout/v1/private/checkout/sessions/:id` | See the session: items, prices, totals, status |
+| `PUT` | `/checkout/v1/private/checkout/sessions/:id/address` | Save your shipping address |
+| `DELETE` | `/checkout/v1/private/checkout/sessions/:id` | Cancel the session (your cart is untouched) |
 
 Errors come in the platform envelope `{"error", "code"}`. The ones you'll
 actually meet: `409 CONFLICT` (empty cart), `410 SESSION_EXPIRED` (took longer
@@ -73,9 +73,9 @@ Each session line keeps **two** prices: the catalog price right now
 (`unit_price_minor` — this is what you'd pay) and the price cart remembered
 from when you added the item (`cart_price_minor`). If they differ, the line is
 flagged `price_changed: true` so the UI can say "heads up, this changed since
-you carted it" — instead of silently charging something you never saw. Prices
-are integers in cents (`2999` = $29.99); floats never cross a service
-boundary.
+you carted it" — instead of silently charging something you never saw. On the
+wire you see dollars (`"unit_price": 29.99`) like every sibling API; inside
+the service and between services money is integer cents.
 
 ## Who checkout talks to
 
