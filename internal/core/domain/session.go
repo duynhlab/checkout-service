@@ -114,3 +114,10 @@ type SessionRepository interface {
 	// no-op, not an error — late timers must be harmless.
 	MarkExpired(ctx context.Context, id string, reason ExpiredReason) error
 }
+
+// Dollars converts integer minor units (cents) to a dollars amount for
+// display/serialization boundaries — the same helper order-service uses so
+// browser-facing money renders identically across the funnel.
+func Dollars(minor int64) float64 {
+	return float64(minor) / 100
+}

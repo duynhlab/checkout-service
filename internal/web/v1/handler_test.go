@@ -119,14 +119,18 @@ func TestCreateSession_201WithSnapshot(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
 	}
-	var body struct {
-		Session domain.Session `json:"session"`
-	}
+	var body sessionResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("invalid body: %v", err)
 	}
-	if !body.Session.Items[0].PriceChanged || body.Session.Items[0].UnitPriceMinor != 3499 {
-		t.Errorf("item = %+v, want price_changed with product price 3499", body.Session.Items[0])
+	if !body.Items[0].PriceChanged || body.Items[0].UnitPrice != 34.99 {
+		t.Errorf("item = %+v, want price_changed with product price 34.99 (dollars on the wire)", body.Items[0])
+	}
+	if body.ID == "" {
+		t.Error("id missing from unwrapped response")
+	}
+	if body.Total != 34.99 {
+		t.Errorf("total = %v, want 34.99 (dollars on the wire)", body.Total)
 	}
 }
 

@@ -83,7 +83,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 	logger.Info("Checkout session ready",
 		zap.String("session_id", session.ID), zap.Bool("created", created))
-	c.JSON(status, gin.H{"session": session})
+	c.JSON(status, toSessionResponse(session))
 }
 
 // GetSession handles GET /checkout/v1/private/sessions/:id.
@@ -100,7 +100,7 @@ func (h *Handler) GetSession(c *gin.Context) {
 		h.respondSessionError(c, span, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"session": session})
+	c.JSON(http.StatusOK, toSessionResponse(session))
 }
 
 // SetAddress handles PUT /checkout/v1/private/sessions/:id/address.
@@ -124,7 +124,7 @@ func (h *Handler) SetAddress(c *gin.Context) {
 		h.respondSessionError(c, span, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"session": session})
+	c.JSON(http.StatusOK, toSessionResponse(session))
 }
 
 // CancelSession handles DELETE /checkout/v1/private/sessions/:id.
@@ -140,7 +140,7 @@ func (h *Handler) CancelSession(c *gin.Context) {
 		h.respondSessionError(c, span, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "session cancelled"})
+	c.JSON(http.StatusOK, gin.H{"message": "Session cancelled"})
 }
 
 // respondSessionError maps logic errors to the shared envelope. Unknown and

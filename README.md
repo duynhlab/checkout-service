@@ -73,9 +73,9 @@ Each session line keeps **two** prices: the catalog price right now
 (`unit_price_minor` — this is what you'd pay) and the price cart remembered
 from when you added the item (`cart_price_minor`). If they differ, the line is
 flagged `price_changed: true` so the UI can say "heads up, this changed since
-you carted it" — instead of silently charging something you never saw. Prices
-are integers in cents (`2999` = $29.99); floats never cross a service
-boundary.
+you carted it" — instead of silently charging something you never saw. On the
+wire you see dollars (`"unit_price": 29.99`) like every sibling API; inside
+the service and between services money is integer cents.
 
 ## Who checkout talks to
 
