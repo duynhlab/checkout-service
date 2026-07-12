@@ -1,99 +1,126 @@
 # checkout-service
 
-Checkout session orchestrator (RFC-0015): the service between the SPA and
-order-service that owns the multi-step purchase funnel. It snapshots the
-user's cart into a short-TTL **checkout session**, re-validates **price and
-stock against product-service** (the price authority at checkout time — the
-fix for the platform's stale-price gap), and drives an explicit state machine
-to the confirm handoff. order-service remains the only orders-writer and
-saga-starter.
+The checkout counter of the duynhlab shop: when you're ready to buy, this
+service walks you through the purchase step by step — your cart is snapshotted
+into a **checkout session**, prices are double-checked against the catalog so
+the price you see is the price you pay, and once everything looks right the
+session is handed to order-service to actually place the order.
 
-## Session state machine
+Why a whole service for that? Before checkout-service existed, "checkout" was
+a single button press straight into order-service. That worked, but prices
+could silently go stale between "add to cart" and "buy", there was nowhere to
+keep your address or shipping choice between steps, and an interrupted
+checkout couldn't resume. The checkout session fixes all three — the full
+story lives in [RFC-0015](https://github.com/duynhlab/homelab/tree/main/docs/proposals/rfc/RFC-0015)
+and the friendly subsystem guide in
+[docs/api/checkout.md](https://github.com/duynhlab/homelab/blob/main/docs/api/checkout.md).
+
+## How a session flows
+
+A session is a short-lived quote (30 minutes) that moves forward through the
+funnel one step at a time. You can edit earlier steps (it hops back), cancel
+whenever you like, or just walk away — it quietly expires.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> open : POST /sessions (snapshot + re-validate)
-    open --> address_set : PUT address
-    address_set --> shipping_set : PUT shipping (P2)
-    shipping_set --> ready : PUT payment (P2)
-    ready --> confirming : POST confirm (P2)
-    confirming --> completed : order created
-    confirming --> shipping_set : PRICE_CHANGED (409)
-    open --> cancelled : DELETE session
-    address_set --> cancelled : DELETE session
-    shipping_set --> cancelled : DELETE session
-    ready --> cancelled : DELETE session
-    open --> expired : TTL (timer P2 / lazy)
-    address_set --> expired : TTL
-    shipping_set --> expired : TTL
-    ready --> expired : TTL
+    [*] --> open : create (cart snapshot + price check)
+    open --> address_set : set address
+    address_set --> shipping_set : choose shipping*
+    shipping_set --> ready : attach payment*
+    ready --> confirming : confirm*
+    confirming --> completed : order placed
+    confirming --> shipping_set : price changed — re-quote
+    open --> cancelled : cancel
+    address_set --> cancelled : cancel
+    shipping_set --> cancelled : cancel
+    ready --> cancelled : cancel
+    open --> expired : 30 min idle
+    address_set --> expired : 30 min idle
+    shipping_set --> expired : 30 min idle
+    ready --> expired : 30 min idle
 ```
 
-`expired` and `cancelled` are terminal. **Lazy-expiry backstop**: every read
-and mutation treats `now > expires_at` as expired regardless of the Temporal
-timer (P2) — an expired session is never honored, even with the worker down.
+Steps marked `*` (shipping, payment, confirm — plus promo codes) are being
+built next; the roadmap is RFC-0015's phase table. `completed`, `cancelled`
+and `expired` are final. One nice guarantee: a session that's mid-confirm is
+never expired out from under you — it either completes or drops back for a
+re-quote.
 
-## API Endpoints (P1 surface)
+## What you can call today
 
-Variant A collection-noun paths (naming convention v3.0.0 / ADR-017 —
-checkout's registered collection noun is **`sessions`**). All routes
-`private`: Kong edge-JWT pre-filters, in-service `pkg/authmw` is
-authoritative, sessions are owner-scoped by JWT `user_id`.
+Every route needs a logged-in user (JWT — Kong checks it at the edge, the
+service verifies it again), and you can only ever see **your own** sessions:
+someone else's session id behaves exactly like one that doesn't exist (404).
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/checkout/v1/private/sessions` | Create (201) or return the active session (200 — idempotent); snapshots cart, re-validates prices, flags `price_changed` lines |
-| `GET` | `/checkout/v1/private/sessions/:id` | Session + items + totals (owner-scoped) |
-| `PUT` | `/checkout/v1/private/sessions/:id/address` | Set shipping address → `address_set` |
-| `DELETE` | `/checkout/v1/private/sessions/:id` | Cancel (idempotent on cancelled) |
+| Method | Path | What it does |
+|--------|------|--------------|
+| `POST` | `/checkout/v1/private/sessions` | Start checking out: snapshots your cart, re-checks every price against the catalog. Creating twice is safe — you get your existing session back (**201** new, **200** existing) |
+| `GET` | `/checkout/v1/private/sessions/:id` | See the session: items, prices, totals, status |
+| `PUT` | `/checkout/v1/private/sessions/:id/address` | Save your shipping address |
+| `DELETE` | `/checkout/v1/private/sessions/:id` | Cancel the session (your cart is untouched) |
 
-Shipping/payment/promo/confirm steps land in P2–P4 (RFC-0015 phases).
-Errors use the shared envelope `{"error","code"}`; notable codes:
-`SESSION_EXPIRED` (410), `INVALID_TRANSITION` (409), `NOT_FOUND` (404 — also
-for foreign sessions, anti-IDOR).
+Errors come in the platform envelope `{"error", "code"}`. The ones you'll
+actually meet: `409 CONFLICT` (empty cart), `410 SESSION_EXPIRED` (took longer
+than 30 minutes — just create a new session), `409 INVALID_TRANSITION` (that
+step isn't allowed from the session's current state), `404` (not yours / not
+there).
 
-Operational endpoints: `GET /health`, `GET /ready` (DB ping + drain-aware),
-`GET /metrics`.
+Also serving: `GET /health`, `GET /ready`, `GET /metrics`.
 
-## East-west calls (all gRPC, client-only)
+## The honest-price trick (worth knowing)
 
-| Target | RPC | Why |
-|--------|-----|-----|
-| cart `:9090` | `cart.v1/GetCart` | Item-list authority: which products, what quantities (+ denormalized price for the diff) |
-| product `:9090` | `product.v1/GetProducts` | Price/stock authority at checkout time (cache-bypassing batch read) |
+Each session line keeps **two** prices: the catalog price right now
+(`unit_price_minor` — this is what you'd pay) and the price cart remembered
+from when you added the item (`cart_price_minor`). If they differ, the line is
+flagged `price_changed: true` so the UI can say "heads up, this changed since
+you carted it" — instead of silently charging something you never saw. Prices
+are integers in cents (`2999` = $29.99); floats never cross a service
+boundary.
 
-checkout runs **no gRPC server** — nothing dials into it except Kong.
+## Who checkout talks to
 
-## Money
+| Service | How | Why |
+|---------|-----|-----|
+| cart | gRPC `GetCart` (read-only) | What's in your cart — items and quantities |
+| product | gRPC `GetProducts` | The real, current price and stock (skips the browse cache on purpose) |
+| order *(next)* | gRPC `CreateOrder` | Places the order once you confirm — order-service stays the only place orders are created |
 
-int64 **minor units** everywhere (RFC-0010 P3 representation). Floats never
-cross a service boundary; cart/product convert once at their gRPC boundary.
+Nothing calls into checkout except the gateway — it has no gRPC server and no
+internal HTTP routes.
 
-## Data model
+## Data
 
-`checkout_sessions` (uuid id, FSM status, jsonb address, money columns,
-`expires_at`, `expired_reason` timer|lazy) + `checkout_session_items`
-(snapshot: `unit_price_minor` from product, `cart_price_minor` from cart,
-`price_changed`). One active session per user via a partial unique index.
+One database (`checkout`): `checkout_sessions` (status, address, totals,
+expiry) + `checkout_session_items` (the snapshot). A partial unique index
+guarantees you can only have one active session at a time — even two
+double-clicked "create" requests end up sharing one session.
+
+Sessions past their deadline are rejected on **every** read and write
+(`410`), whether or not the background expiry timer is running — the deadline
+column is the truth, the timer is just the janitor.
 
 ## Development
 
 ```bash
 GOTOOLCHAIN=auto go build ./...
-GOTOOLCHAIN=auto go test -race ./...                                       # unit
-GOTOOLCHAIN=auto go test -tags=integration ./internal/core/repository/...  # real Postgres (Docker)
+GOTOOLCHAIN=auto go test -race ./...                                       # unit tests
+GOTOOLCHAIN=auto go test -tags=integration ./internal/core/repository/...  # real Postgres via Docker
 golangci-lint run --timeout=10m
-go run ./cmd migrate   # apply embedded schema migrations
+go run ./cmd migrate   # apply the schema migrations
 ```
 
-Key env: `PORT` (8080), `DB_*`, `AUTH_JWKS_URL`, `JWT_ISSUER`/`JWT_AUDIENCE`,
-`CART_GRPC_ADDR`, `PRODUCT_GRPC_ADDR`, `SESSION_TTL_SECONDS` (1800),
-`TRACING_ENABLED`, `OTEL_COLLECTOR_ENDPOINT`, `PROFILING_ENABLED`.
+Config is all environment variables — the ones you'll touch: `DB_*`,
+`AUTH_JWKS_URL`, `CART_GRPC_ADDR`, `PRODUCT_GRPC_ADDR`,
+`SESSION_TTL_SECONDS` (default 1800). The easiest way to run the whole thing
+is the platform's [local-stack](https://github.com/duynhlab/homelab/tree/main/local-stack)
+(`docker compose up -d --build` next to the sibling repos) — its README has a
+ready-made audit script (section A9) that exercises this service end to end.
 
 ## Observability
 
-`pkg/obsx` OTLP push (RFC-0014): traces + RED metrics + teed logs; middleware
-chain **tracing → logging → metrics**; Pyroscope profiling optional.
+OpenTelemetry everything (traces, RED metrics, logs) pushed via the shared
+`pkg/obsx` pipeline; optional Pyroscope profiling. Middleware order is
+tracing → logging → metrics, like every sibling service.
 
 ## License
 
