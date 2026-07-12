@@ -22,6 +22,7 @@ import (
 
 	"github.com/duynhlab/pkg/authmw"
 	"github.com/duynhlab/pkg/grpcx"
+	"github.com/duynhlab/pkg/idempotency"
 	"github.com/duynhlab/pkg/logger/zapx"
 	"github.com/duynhlab/pkg/migratex"
 	"github.com/duynhlab/pkg/obsx"
@@ -102,12 +103,31 @@ func main() {
 		return
 	}
 	defer closeConn(productConn, logger, "product")
+	orderConn, err := grpcx.Dial(cfg.Checkout.OrderGRPCAddr)
+	if err != nil {
+		logger.Error("Failed to dial order gRPC", zap.String("addr", cfg.Checkout.OrderGRPCAddr), zap.Error(err))
+		return
+	}
+	defer closeConn(orderConn, logger, "order")
+
+	// Deadline-fencing invariant (RFC-0015 P2 confirm): a lock takeover must
+	// PROVE the previous owner is dead, which holds only when the takeover
+	// window dwarfs the longest possible confirm execution.
+	if cfg.Checkout.IdempotencyLockTakeover <= 4*logicv1.ConfirmDeadline {
+		logger.Error("IDEMPOTENCY_LOCK_TAKEOVER must exceed 4× the confirm deadline",
+			zap.Duration("takeover", cfg.Checkout.IdempotencyLockTakeover),
+			zap.Duration("confirm_deadline", logicv1.ConfirmDeadline))
+		return
+	}
 
 	repo := postgres.NewSessionRepository(pool)
 	svc := logicv1.NewCheckoutService(repo,
 		clients.NewCartClient(cartConn),
 		clients.NewProductClient(productConn),
 		cfg.Checkout.SessionTTL,
+	).WithConfirm(
+		idempotency.New(pool, cfg.Checkout.IdempotencyLockTakeover),
+		clients.NewOrderClient(orderConn),
 	)
 	handler := webv1.NewHandler(svc)
 

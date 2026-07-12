@@ -39,13 +39,14 @@ var (
 	ErrOrderRejected = errors.New("order rejected the confirm handoff")
 )
 
-// confirmDeadline bounds the WHOLE confirm execution. This is the fencing
+// ConfirmDeadline bounds the WHOLE confirm execution. This is the fencing
 // invariant (doubt-cycle b): every write this flow performs is ctx-bound, so
 // no execution can write after confirmDeadline — and the idempotency lock
 // takeover window is startup-validated to be much larger, so a takeover
 // PROVES the previous owner is dead. Two live same-key executions cannot
 // exist.
-const confirmDeadline = 15 * time.Second
+// Exported so cmd can validate lockTakeover > 4×ConfirmDeadline at startup.
+const ConfirmDeadline = 15 * time.Second
 
 // confirmPath is the Claim scope (same key on another endpoint = conflict).
 const confirmPath = "/checkout/v1/private/checkout/sessions/confirm"
@@ -91,7 +92,7 @@ func (s *CheckoutService) WithConfirm(idem IdemStore, orders OrderCreator) *Chec
 // handoff (RFC-0015 P2, design: doubt-cycle b v3). On ErrPriceChanged /
 // ErrStockUnavailable the returned session is the freshly requoted one.
 func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey string) (*domain.Session, error) {
-	ctx, cancel := context.WithTimeout(ctx, confirmDeadline)
+	ctx, cancel := context.WithTimeout(ctx, ConfirmDeadline)
 	defer cancel()
 	ctx, span := middleware.StartSpan(ctx, "checkout.session.confirm", trace.WithAttributes(
 		attribute.String("layer", "logic"),

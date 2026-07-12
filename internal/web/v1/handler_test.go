@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/duynhlab/pkg/authmw"
+	"github.com/duynhlab/pkg/idempotency"
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
@@ -332,5 +333,122 @@ func TestSetPayment_PANLikeIs400AndNeverPersisted(t *testing.T) {
 	}
 	if repo.persistedToken != "" {
 		t.Error("PAN-shaped token reached the repository")
+	}
+}
+
+// --- POST confirm (P2) ---
+
+// confirmRouter wires the real logic layer with confirm deps faked at the
+// port level (idempotency + order), mirroring how newRouter drives everything
+// through the genuine service.
+func confirmRouter(repo *fakeRepo, idem logicv1.IdemStore, orders logicv1.OrderCreator, userID string) *gin.Engine {
+	r := gin.New()
+	prods := &fakeProducts{infos: []logicv1.ProductInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5}}}
+	svc := logicv1.NewCheckoutService(repo, &fakeCart{}, prods, time.Minute).WithConfirm(idem, orders)
+	RegisterRoutes(r, NewHandler(svc), func(c *gin.Context) {
+		c.Set(authmw.CtxUserID, userID)
+		c.Next()
+	})
+	return r
+}
+
+type webIdem struct{ rec *idempotency.Record }
+
+func (f *webIdem) Claim(_ context.Context, _ int64, _, _, _, _ string) (*idempotency.Record, bool, error) {
+	return f.rec, true, nil
+}
+func (f *webIdem) Checkpoint(_ context.Context, _ int64, subjectID *int64) error {
+	v := *subjectID
+	f.rec.SubjectID = &v
+	return nil
+}
+func (f *webIdem) Release(_ context.Context, _ int64) error                 { return nil }
+func (f *webIdem) Finish(_ context.Context, _ int64, _ int, _ []byte) error { return nil }
+
+type webOrders struct{ err error }
+
+func (f *webOrders) CreateOrder(_ context.Context, _ string, _ []domain.SessionItem, _, _ string) (string, string, error) {
+	if f.err != nil {
+		return "", "", f.err
+	}
+	return "42", "pending", nil
+}
+
+func readyWebSession(userID string) *domain.Session {
+	s := liveSession(userID, domain.StatusReady)
+	s.Items = []domain.SessionItem{{ProductID: "1", ProductName: "Mouse", Quantity: 1, UnitPriceMinor: 2999, CartPriceMinor: 2999}}
+	s.SubtotalMinor, s.TotalMinor = 2999, 2999
+	s.PaymentMethodToken = "tok_visa_ok"
+	return s
+}
+
+func doConfirm(r *gin.Engine, key string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost,
+		"/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/confirm", nil)
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestConfirm_201WithOrderID(t *testing.T) {
+	repo := &fakeRepo{byID: readyWebSession("7")}
+	r := confirmRouter(repo, &webIdem{rec: &idempotency.Record{ID: 11}}, &webOrders{}, "7")
+
+	rec := doConfirm(r, "key-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	var body sessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid body: %v", err)
+	}
+	if body.Status != "completed" || body.OrderID != "42" {
+		t.Errorf("body = %+v, want completed with order 42", body)
+	}
+	if strings.Contains(rec.Body.String(), "tok_visa_ok") {
+		t.Error("payment token leaked into the confirm response")
+	}
+}
+
+func TestConfirm_MissingKeyIs400IdempotencyKeyRequired(t *testing.T) {
+	repo := &fakeRepo{byID: readyWebSession("7")}
+	r := confirmRouter(repo, &webIdem{rec: &idempotency.Record{ID: 11}}, &webOrders{}, "7")
+
+	rec := doConfirm(r, "")
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "IDEMPOTENCY_KEY_REQUIRED") {
+		t.Fatalf("resp = %d %s, want 400 IDEMPOTENCY_KEY_REQUIRED", rec.Code, rec.Body.String())
+	}
+}
+
+func TestConfirm_OversizedKeyIs400(t *testing.T) {
+	repo := &fakeRepo{byID: readyWebSession("7")}
+	r := confirmRouter(repo, &webIdem{rec: &idempotency.Record{ID: 11}}, &webOrders{}, "7")
+
+	if rec := doConfirm(r, strings.Repeat("k", 121)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (key cap keeps the composed order key under 200)", rec.Code)
+	}
+}
+
+func TestConfirm_UpstreamDownIs503WithRetryAfter(t *testing.T) {
+	repo := &fakeRepo{byID: readyWebSession("7")}
+	r := confirmRouter(repo, &webIdem{rec: &idempotency.Record{ID: 11}}, &webOrders{err: errors.New("dial refused")}, "7")
+
+	rec := doConfirm(r, "key-1")
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("resp = %d retry-after=%q, want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+}
+
+func TestConfirm_NotReadyIs409InvalidTransition(t *testing.T) {
+	s := readyWebSession("7")
+	s.Status = domain.StatusOpen
+	r := confirmRouter(&fakeRepo{byID: s}, &webIdem{rec: &idempotency.Record{ID: 11}}, &webOrders{}, "7")
+
+	rec := doConfirm(r, "key-1")
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "INVALID_TRANSITION") {
+		t.Fatalf("resp = %d %s, want 409 INVALID_TRANSITION", rec.Code, rec.Body.String())
 	}
 }
