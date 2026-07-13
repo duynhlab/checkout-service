@@ -71,40 +71,6 @@ jobs:
       packages: write
       id-token: write
 
-  # Continuous delivery to the dev environment: every main build bumps the
-  # image tag in the gitops repo. uat/prod promotion goes through Backstage
-  # PRs reviewed by DevOps/SRE.
-  update-gitops-dev:
-    needs: [docker-build, docker-sign]
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout gitops repo
-        uses: actions/checkout@v4
-        with:
-          repository: duynhlab/gitops
-          token: ${{ secrets.GITOPS_TOKEN }}
-
-      - name: Bump dev image tag
-        run: |
-          NEW_TAG="sha-${GITHUB_SHA::7}"
-          yq -i ".spec.values.image.tag = \"${NEW_TAG}\"" apps/dev/checkout/release-patch.yaml
-          yq -i "(.spec.values.env[] | select(.name == \"VERSION\") | .value) = \"${NEW_TAG}\"" apps/dev/checkout/release-patch.yaml
-          git diff --stat
-
-      - name: Commit and push
-        run: |
-          NEW_TAG="sha-${GITHUB_SHA::7}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet; then
-            echo "dev already at ${NEW_TAG}, nothing to do"
-            exit 0
-          fi
-          git add apps/dev/checkout/release-patch.yaml
-          git commit -m "Deploy checkout ${NEW_TAG} to dev"
-          git push origin main
-
   # Enable once SONAR_TOKEN / SLACK_BOT_TOKEN / GSHEET_* secrets exist:
   # sonar:
   #   needs: [go-check, gitleaks]
