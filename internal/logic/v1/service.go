@@ -51,6 +51,13 @@ type ProductFetcher interface {
 	GetProducts(ctx context.Context, ids []string) ([]ProductInfo, error)
 }
 
+// ShippingQuoter is the logic-layer port for shipping.v1/GetQuote (RFC-0015
+// P3): the fee authority for PUT …/shipping. ErrInvalidQuote marks an unknown
+// method/region (→ 400); any other error is transport trouble (→ 503).
+type ShippingQuoter interface {
+	GetQuote(ctx context.Context, method, region string) (feeMinor int64, etaDays int32, err error)
+}
+
 // DefaultSessionTTL is the reset-on-activity session deadline (RFC-0015: the
 // clock models user presence, nothing is reserved).
 const DefaultSessionTTL = 30 * time.Minute
@@ -69,8 +76,17 @@ type CheckoutService struct {
 	// P2 confirm dependencies, wired via WithConfirm (nil pre-P2).
 	idem   IdemStore
 	orders OrderCreator
+	// P3 shipping-quote dependency, wired via WithQuoter (nil = 0-fee stub).
+	quoter ShippingQuoter
 	// P2 abandonment notifier, wired via WithAbandonment (nil = disabled).
 	notifier AbandonmentNotifier
+}
+
+// WithQuoter wires the shipping GetQuote port (nil keeps the P2 0-fee stub —
+// local dev without shipping still works, totals just have no fee/tax).
+func (s *CheckoutService) WithQuoter(q ShippingQuoter) *CheckoutService {
+	s.quoter = q
+	return s
 }
 
 // WithAbandonment wires the abandonment-workflow notifier (nil-safe).
@@ -243,9 +259,10 @@ func (s *CheckoutService) SetAddress(ctx context.Context, userID, id string, add
 	return session, nil
 }
 
-// SetShipping records the chosen shipping method and moves the session to
-// shipping_set. P2 stubs the fee and tax at 0 — shipping's GetQuote and the
-// tax rules join in P3 — so the total stays subtotal − discount.
+// SetShipping prices the chosen method via shipping's GetQuote (the fee
+// authority, ADR: rates live in shipping-service), computes the flat tax on
+// (subtotal + fee) from the seeded rule table, and moves the session to
+// shipping_set with the total recomputed in SQL (RFC-0015 P3).
 func (s *CheckoutService) SetShipping(ctx context.Context, userID, id, method string) (*domain.Session, error) {
 	ctx, span := middleware.StartSpan(ctx, "checkout.session.set_shipping", trace.WithAttributes(
 		attribute.String("layer", "logic"),
@@ -262,17 +279,50 @@ func (s *CheckoutService) SetShipping(ctx context.Context, userID, id, method st
 	if !CanTransition(session.Status, domain.StatusShippingSet) {
 		return nil, ErrInvalidTransition
 	}
-	const feeMinor = 0 // P2 stub until the P3 GetQuote integration
-	if err := s.repo.SetShipping(ctx, session.ID, session.Status, method, feeMinor); err != nil {
+	if session.Address == nil {
+		// FSM should make this unreachable (shipping requires address_set),
+		// but the quote needs a region — fail closed, not with a nil deref.
+		return nil, ErrInvalidTransition
+	}
+
+	feeMinor, taxMinor, err := s.priceShipping(ctx, method, session.Address.Country, session.SubtotalMinor)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if err := s.repo.SetShipping(ctx, session.ID, session.Status, method, feeMinor, taxMinor); err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 	session.Status = domain.StatusShippingSet
 	session.ShippingMethod = method
 	session.ShippingFeeMinor = feeMinor
-	session.TotalMinor = session.SubtotalMinor + feeMinor + session.TaxMinor - session.DiscountMinor
+	session.TaxMinor = taxMinor
+	session.TotalMinor = session.SubtotalMinor + feeMinor + taxMinor - session.DiscountMinor
 	s.touch(ctx, session)
 	return session, nil
+}
+
+// priceShipping resolves the fee (shipping GetQuote) and the flat tax
+// (rate_bps on subtotal + fee). A nil quoter keeps the 0-stub for both —
+// degraded local dev, not an error.
+func (s *CheckoutService) priceShipping(ctx context.Context, method, region string, subtotalMinor int64) (int64, int64, error) {
+	if s.quoter == nil {
+		return 0, 0, nil
+	}
+	feeMinor, _, err := s.quoter.GetQuote(ctx, method, region)
+	if err != nil {
+		if errors.Is(err, ErrInvalidQuote) {
+			return 0, 0, ErrInvalidQuote
+		}
+		return 0, 0, ErrUpstream
+	}
+	bps, err := s.repo.GetTaxRateBps(ctx, region)
+	if err != nil {
+		return 0, 0, err
+	}
+	taxMinor := (subtotalMinor + feeMinor) * int64(bps) / 10_000
+	return feeMinor, taxMinor, nil
 }
 
 // SetPayment attaches an opaque tok_ payment reference and moves the session

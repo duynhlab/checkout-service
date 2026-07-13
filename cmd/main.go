@@ -112,7 +112,7 @@ func main() {
 		return
 	}
 	defer cleanup()
-	cartConn, productConn, orderConn := conns[0], conns[1], conns[2]
+	cartConn, productConn, orderConn, shippingConn := conns[0], conns[1], conns[2], conns[3]
 
 	// Deadline-fencing invariant (RFC-0015 P2 confirm): a lock takeover must
 	// PROVE the previous owner is dead, which holds only when the takeover
@@ -132,7 +132,7 @@ func main() {
 	).WithConfirm(
 		idempotency.New(pool, cfg.Checkout.IdempotencyLockTakeover),
 		clients.NewOrderClient(orderConn),
-	)
+	).WithQuoter(clients.NewShippingClient(shippingConn))
 
 	// Abandonment notifier (ADR-019): best-effort signals to the durable
 	// timer. Temporal being unreachable is NOT fatal — expiry degrades to
@@ -182,8 +182,8 @@ func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) 
 
 // dialEastWest opens the cart/product/order client connections (in that
 // order) and returns a single cleanup for all of them.
-func dialEastWest(cfg *config.Config, logger *zap.Logger) ([3]*grpc.ClientConn, func(), bool) {
-	var conns [3]*grpc.ClientConn
+func dialEastWest(cfg *config.Config, logger *zap.Logger) ([4]*grpc.ClientConn, func(), bool) {
+	var conns [4]*grpc.ClientConn
 	targets := []struct {
 		name string
 		addr string
@@ -191,6 +191,7 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([3]*grpc.ClientConn, 
 		{"cart", cfg.Checkout.CartGRPCAddr},
 		{"product", cfg.Checkout.ProductGRPCAddr},
 		{"order", cfg.Checkout.OrderGRPCAddr},
+		{"shipping", cfg.Checkout.ShippingGRPCAddr},
 	}
 	for i, tgt := range targets {
 		conn, err := grpcx.Dial(tgt.addr)

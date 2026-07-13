@@ -8,10 +8,13 @@ import (
 	"math"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	cartv1 "github.com/duynhlab/pkg/proto/cart/v1"
 	orderv1 "github.com/duynhlab/pkg/proto/order/v1"
 	productv1 "github.com/duynhlab/pkg/proto/product/v1"
+	shippingv1 "github.com/duynhlab/pkg/proto/shipping/v1"
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
@@ -111,4 +114,28 @@ func (c *ProductClient) GetProducts(ctx context.Context, ids []string) ([]logicv
 		})
 	}
 	return infos, nil
+}
+
+// ShippingClient satisfies logicv1.ShippingQuoter over shipping.v1/GetQuote —
+// the fee authority for PUT …/shipping (RFC-0015 P3). INVALID_ARGUMENT from
+// shipping maps to logicv1.ErrInvalidQuote so the web layer can answer 400.
+type ShippingClient struct {
+	c shippingv1.ShippingServiceClient
+}
+
+// NewShippingClient wraps an established gRPC connection.
+func NewShippingClient(conn grpc.ClientConnInterface) *ShippingClient {
+	return &ShippingClient{c: shippingv1.NewShippingServiceClient(conn)}
+}
+
+// GetQuote prices a method × region pair.
+func (c *ShippingClient) GetQuote(ctx context.Context, method, region string) (int64, int32, error) {
+	resp, err := c.c.GetQuote(ctx, &shippingv1.GetQuoteRequest{Method: method, Region: region})
+	if err != nil {
+		if status.Code(err) == codes.InvalidArgument {
+			return 0, 0, logicv1.ErrInvalidQuote
+		}
+		return 0, 0, err
+	}
+	return resp.GetFeeMinor(), resp.GetEtaDays(), nil
 }

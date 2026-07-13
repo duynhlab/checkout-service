@@ -322,7 +322,7 @@ func TestSessionRepository_ShippingAndPaymentWrites(t *testing.T) {
 	}
 
 	// Shipping write recomputes total in SQL from the persisted components.
-	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0); err != nil {
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0, 0); err != nil {
 		t.Fatalf("SetShipping: %v", err)
 	}
 	got, _ := repo.FindByID(ctx, s.ID)
@@ -361,7 +361,7 @@ func TestSessionRepository_ConfirmBindingLifecycle(t *testing.T) {
 		}
 	}
 	step("address", repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}))
-	step("shipping", repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0))
+	step("shipping", repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0, 0))
 	step("payment", repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"))
 
 	// BeginConfirm binds claim 11; re-entry with the same claim is idempotent;
@@ -378,7 +378,7 @@ func TestSessionRepository_ConfirmBindingLifecycle(t *testing.T) {
 	}
 
 	// A foreign claim cannot requote or complete.
-	if err := repo.RequoteItems(ctx, s.ID, 99, got.Items, 1, 1); !errors.Is(err, domain.ErrStaleTransition) {
+	if err := repo.RequoteItems(ctx, s.ID, 99, got.Items, 1, 1, 1); !errors.Is(err, domain.ErrStaleTransition) {
 		t.Fatalf("foreign requote err = %v, want ErrStaleTransition", err)
 	}
 	if err := repo.CompleteSession(ctx, s.ID, 99, "42"); !errors.Is(err, domain.ErrStaleTransition) {
@@ -404,7 +404,7 @@ func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
 	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
 		t.Fatalf("SetAddress: %v", err)
 	}
-	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0); err != nil {
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0, 0); err != nil {
 		t.Fatalf("SetShipping: %v", err)
 	}
 	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"); err != nil {
@@ -418,7 +418,7 @@ func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
 		{ProductID: "1", UnitPriceMinor: 3499, PriceChanged: true},
 		{ProductID: "2", UnitPriceMinor: 3999, PriceChanged: false},
 	}
-	if err := repo.RequoteItems(ctx, s.ID, 7, fresh, 2*3499+3999, 2*3499+3999); err != nil {
+	if err := repo.RequoteItems(ctx, s.ID, 7, fresh, 2*3499+3999, 0, 2*3499+3999); err != nil {
 		t.Fatalf("RequoteItems: %v", err)
 	}
 	got, _ := repo.FindByID(ctx, s.ID)
@@ -539,5 +539,44 @@ func TestSessionRepository_ExpireDueParkedConfirmRecovery(t *testing.T) {
 	got, _ = repo.FindByID(ctx, attemptedID)
 	if got.Status != domain.StatusConfirming {
 		t.Errorf("attempted row mutated: %+v, must stay parked", got)
+	}
+}
+
+func TestSessionRepository_TaxAndQuoteInvalidation(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	// Seeded rate table with DEFAULT fallback (migration 000004).
+	for region, want := range map[string]int32{"VN": 800, "vn": 800, "US": 725, "XX": 1000} {
+		bps, err := repo.GetTaxRateBps(ctx, region)
+		if err != nil || bps != want {
+			t.Errorf("GetTaxRateBps(%s) = (%d, %v), want %d", region, bps, err, want)
+		}
+	}
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+	// Fee + tax persist and the total composes in SQL.
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 300, 824); err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.ShippingFeeMinor != 300 || got.TaxMinor != 824 || got.TotalMinor != got.SubtotalMinor+300+824 {
+		t.Errorf("after shipping = fee %d tax %d total %d, want composed", got.ShippingFeeMinor, got.TaxMinor, got.TotalMinor)
+	}
+
+	// An address change INVALIDATES the quote: method/fee/tax reset, total
+	// drops back to subtotal − discount.
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusShippingSet, &domain.Address{FullName: "A", Line1: "9", City: "NY", Country: "US"}); err != nil {
+		t.Fatalf("re-address: %v", err)
+	}
+	got, _ = repo.FindByID(ctx, s.ID)
+	if got.ShippingMethod != "" || got.ShippingFeeMinor != 0 || got.TaxMinor != 0 || got.TotalMinor != got.SubtotalMinor {
+		t.Errorf("quote not invalidated: %+v", got)
 	}
 }

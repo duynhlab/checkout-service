@@ -33,6 +33,8 @@ type fakeRepo struct {
 	createCalls     int
 	shipMethod      string
 	shipFee         int64
+	shipTax         int64
+	taxBps          int32
 	setShipErr      error
 	payToken        string
 	setPayErr       error
@@ -50,6 +52,7 @@ type requoteCall struct {
 	keyID    int64
 	items    []domain.SessionItem
 	subtotal int64
+	tax      int64
 	total    int64
 }
 
@@ -99,13 +102,21 @@ func (f *fakeRepo) MarkExpired(_ context.Context, _ string, reason domain.Expire
 	return f.markExpErr
 }
 
-func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, method string, feeMinor int64) error {
+func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, method string, feeMinor, taxMinor int64) error {
 	if f.setShipErr != nil {
 		return f.setShipErr
 	}
 	f.shipMethod = method
 	f.shipFee = feeMinor
+	f.shipTax = taxMinor
 	return nil
+}
+
+func (f *fakeRepo) GetTaxRateBps(_ context.Context, region string) (int32, error) {
+	if f.taxBps != 0 {
+		return f.taxBps, nil
+	}
+	return 1000, nil // DEFAULT row
 }
 
 func (f *fakeRepo) SetPaymentToken(_ context.Context, _ string, _ domain.SessionStatus, token string) error {
@@ -136,11 +147,11 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 	return nil
 }
 
-func (f *fakeRepo) RequoteItems(_ context.Context, _ string, keyID int64, items []domain.SessionItem, subtotal, total int64) error {
+func (f *fakeRepo) RequoteItems(_ context.Context, _ string, keyID int64, items []domain.SessionItem, subtotal, tax, total int64) error {
 	if f.requoteErr != nil {
 		return f.requoteErr
 	}
-	f.requoted = &requoteCall{keyID: keyID, items: items, subtotal: subtotal, total: total}
+	f.requoted = &requoteCall{keyID: keyID, items: items, subtotal: subtotal, tax: tax, total: total}
 	return nil
 }
 
@@ -178,6 +189,7 @@ func newSvc(repo *fakeRepo, cart *fakeCart, prods *fakeProducts) *CheckoutServic
 func liveSession(status domain.SessionStatus) *domain.Session {
 	return &domain.Session{
 		ID: "sess-1", UserID: "7", Status: status,
+		Address:   &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"},
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 }
@@ -488,5 +500,75 @@ func TestSetAddress_BumpsExpiry(t *testing.T) {
 	}
 	if len(repo.touched) != 1 {
 		t.Errorf("touched %d times, want 1 (every successful mutation resets the clock)", len(repo.touched))
+	}
+}
+
+// --- P3: real quote + tax ---
+
+type fakeQuoter struct {
+	fee  int64
+	eta  int32
+	err  error
+	gotM string
+	gotR string
+}
+
+func (f *fakeQuoter) GetQuote(_ context.Context, method, region string) (int64, int32, error) {
+	f.gotM, f.gotR = method, region
+	return f.fee, f.eta, f.err
+}
+
+func TestSetShipping_QuotesFeeAndComputesTax(t *testing.T) {
+	sess := liveSession(domain.StatusAddressSet)
+	sess.SubtotalMinor = 10_000
+	sess.TotalMinor = 10_000
+	repo := &fakeRepo{byID: sess, taxBps: 800}
+	q := &fakeQuoter{fee: 300, eta: 5}
+
+	s, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).WithQuoter(q).
+		SetShipping(context.Background(), "7", "sess-1", "standard")
+	if err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	if q.gotM != "standard" || q.gotR != "VN" {
+		t.Errorf("quote asked (%s,%s), want (standard,VN) from the address", q.gotM, q.gotR)
+	}
+	// tax = (10000 + 300) * 800bps = 824
+	if repo.shipFee != 300 || repo.shipTax != 824 {
+		t.Errorf("persisted fee/tax = %d/%d, want 300/824", repo.shipFee, repo.shipTax)
+	}
+	if s.TotalMinor != 10_000+300+824 {
+		t.Errorf("total = %d, want %d", s.TotalMinor, 10_000+300+824)
+	}
+}
+
+func TestSetShipping_UnknownMethodIs400NotPersisted(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusAddressSet)}
+	q := &fakeQuoter{err: ErrInvalidQuote}
+
+	_, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).WithQuoter(q).
+		SetShipping(context.Background(), "7", "sess-1", "drone")
+	if !errors.Is(err, ErrInvalidQuote) || repo.shipMethod != "" {
+		t.Fatalf("err=%v persisted=%q, want ErrInvalidQuote and nothing written", err, repo.shipMethod)
+	}
+}
+
+func TestSetShipping_QuoteOutageIsRetryable503(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusAddressSet)}
+	q := &fakeQuoter{err: errors.New("dial refused")}
+
+	if _, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).WithQuoter(q).
+		SetShipping(context.Background(), "7", "sess-1", "standard"); !errors.Is(err, ErrUpstream) {
+		t.Fatalf("err = %v, want ErrUpstream", err)
+	}
+}
+
+func TestSetShipping_NilQuoterKeepsZeroStub(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusAddressSet)}
+
+	s, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).
+		SetShipping(context.Background(), "7", "sess-1", "standard")
+	if err != nil || repo.shipFee != 0 || repo.shipTax != 0 || s.TotalMinor != 0 {
+		t.Fatalf("stub mode broke: fee=%d tax=%d err=%v", repo.shipFee, repo.shipTax, err)
 	}
 }

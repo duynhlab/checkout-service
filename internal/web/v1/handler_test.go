@@ -64,9 +64,11 @@ func (f *fakeRepo) MarkExpired(_ context.Context, _ string, _ domain.ExpiredReas
 	return nil
 }
 
-func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ string, _ int64) error {
+func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ string, _, _ int64) error {
 	return nil
 }
+
+func (f *fakeRepo) GetTaxRateBps(_ context.Context, _ string) (int32, error) { return 1000, nil }
 
 func (f *fakeRepo) SetPaymentToken(_ context.Context, _ string, _ domain.SessionStatus, token string) error {
 	f.persistedToken = token
@@ -84,7 +86,7 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 	return nil
 }
 
-func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _ int64) error {
+func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _, _ int64) error {
 	return nil
 }
 
@@ -132,6 +134,7 @@ func doJSON(r *gin.Engine, method, path, body string) *httptest.ResponseRecorder
 func liveSession(userID string, status domain.SessionStatus) *domain.Session {
 	return &domain.Session{
 		ID: "11111111-1111-1111-1111-111111111111", UserID: userID, Status: status,
+		Address:   &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"},
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 }

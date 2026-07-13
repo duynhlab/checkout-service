@@ -57,10 +57,11 @@ type Config struct {
 // server (client-only service, RFC-0015); it dials cart, product, and (P2)
 // order for the confirm handoff.
 type CheckoutConfig struct {
-	SessionTTL      time.Duration // reset-on-activity session deadline - from SESSION_TTL_SECONDS env (default: 1800)
-	CartGRPCAddr    string        // cart.v1 target - from CART_GRPC_ADDR env
-	ProductGRPCAddr string        // product.v1 target - from PRODUCT_GRPC_ADDR env
-	OrderGRPCAddr   string        // order.v1 target (confirm handoff) - from ORDER_GRPC_ADDR env
+	SessionTTL       time.Duration // reset-on-activity session deadline - from SESSION_TTL_SECONDS env (default: 1800)
+	CartGRPCAddr     string        // cart.v1 target - from CART_GRPC_ADDR env
+	ProductGRPCAddr  string        // product.v1 target - from PRODUCT_GRPC_ADDR env
+	OrderGRPCAddr    string        // order.v1 target (confirm handoff) - from ORDER_GRPC_ADDR env
+	ShippingGRPCAddr string        // shipping.v1 target (GetQuote fee authority) - from SHIPPING_GRPC_ADDR env
 	// IdempotencyLockTakeover: how long a crashed confirm holds its
 	// idempotency-key lock before a same-key retry may take it over
 	// (pkg/idempotency stale-lock window). From IDEMPOTENCY_LOCK_TAKEOVER env.
@@ -154,6 +155,7 @@ func Load() *Config {
 			CartGRPCAddr:            getEnv("CART_GRPC_ADDR", "dns:///cart-grpc.cart.svc.cluster.local:9090"),
 			ProductGRPCAddr:         getEnv("PRODUCT_GRPC_ADDR", "dns:///product-grpc.product.svc.cluster.local:9090"),
 			OrderGRPCAddr:           getEnv("ORDER_GRPC_ADDR", "dns:///order-grpc.order.svc.cluster.local:9090"),
+			ShippingGRPCAddr:        getEnv("SHIPPING_GRPC_ADDR", "dns:///shipping-grpc.shipping.svc.cluster.local:9090"),
 			IdempotencyLockTakeover: time.Duration(getEnvDurationSecondsWithMax("IDEMPOTENCY_LOCK_TAKEOVER", 90, 600)) * time.Second,
 		},
 		Temporal: TemporalConfig{
