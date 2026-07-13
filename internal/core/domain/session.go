@@ -7,6 +7,7 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -120,11 +121,13 @@ type SessionRepository interface {
 	UpdateStatus(ctx context.Context, id string, from, to SessionStatus) error
 	// SetAddress persists the address and the address_set status in one write
 	// (same conditional semantics as UpdateStatus).
-	SetAddress(ctx context.Context, id string, from SessionStatus, addr *Address) error
+	// SetAddress also invalidates the shipping quote and re-clamps the promo
+	// discount to the shrunk total (fee/tax reset to 0).
+	SetAddress(ctx context.Context, id string, from SessionStatus, addr *Address, discountMinor int64) error
 	// SetShipping persists the shipping method, fee, and tax with the
 	// shipping_set status in one conditional write (same semantics as
 	// UpdateStatus). The total is recomputed in SQL from the components.
-	SetShipping(ctx context.Context, id string, from SessionStatus, asOf time.Time, method string, feeMinor, taxMinor int64) error
+	SetShipping(ctx context.Context, id string, from SessionStatus, asOf time.Time, method string, feeMinor, taxMinor, discountMinor int64) error
 	// GetTaxRateBps returns the flat tax rate (basis points) for a region,
 	// falling back to the DEFAULT rule.
 	GetTaxRateBps(ctx context.Context, region string) (int32, error)
@@ -139,7 +142,7 @@ type SessionRepository interface {
 	BeginConfirm(ctx context.Context, id string, keyID int64) error
 	// RequoteItems drops confirming → shipping_set with fresh prices and
 	// clears the binding, conditional on the claim still holding the session.
-	RequoteItems(ctx context.Context, id string, keyID int64, items []SessionItem, subtotalMinor, taxMinor int64) error
+	RequoteItems(ctx context.Context, id string, keyID int64, items []SessionItem, subtotalMinor, taxMinor, discountMinor int64) error
 	// CompleteSession CASes confirming → completed under the claim binding,
 	// recording the order id. The binding stays on the completed row.
 	CompleteSession(ctx context.Context, id string, keyID int64, orderID string) error
@@ -147,7 +150,32 @@ type SessionRepository interface {
 	// noticed (timer vs lazy). Expiring an already-terminal session is a
 	// no-op, not an error — late timers must be harmless.
 	MarkExpired(ctx context.Context, id string, reason ExpiredReason) error
+	// Promo surface (RFC-0015 P4, ADR-022).
+	GetPromo(ctx context.Context, code string) (*Promo, error)
+	CountUserRedemptions(ctx context.Context, code, userID string) (int, error)
+	SetPromo(ctx context.Context, id string, from SessionStatus, code string, discountMinor int64) error
+	StripPromo(ctx context.Context, id string, keyID int64) error
+	RedeemPromo(ctx context.Context, code, userID, sessionID string) error
+	BackfillRedemptionOrder(ctx context.Context, code, sessionID, orderID string) error
 }
+
+// Promo is a promo-code row (RFC-0015 P4). NULL-able limits mean unlimited.
+type Promo struct {
+	Code           string
+	Kind           string // "percent" | "fixed"
+	Value          int64  // percent points (1..100) or fixed minor units
+	ExpiresAt      *time.Time
+	MaxRedemptions *int
+	RedeemedCount  int
+	PerUserLimit   *int
+}
+
+// Promo errors (web maps: 404 PROMO_INVALID, 409 PROMO_EXPIRED/EXHAUSTED).
+var (
+	ErrPromoNotFound  = errors.New("promo code not found")
+	ErrPromoExpired   = errors.New("promo code expired")
+	ErrPromoExhausted = errors.New("promo code exhausted")
+)
 
 // Dollars converts integer minor units (cents) to a dollars amount for
 // display/serialization boundaries — the same helper order-service uses so

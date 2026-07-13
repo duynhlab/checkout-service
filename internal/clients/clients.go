@@ -71,8 +71,10 @@ func NewOrderClient(conn grpc.ClientConnInterface) *OrderClient {
 	return &OrderClient{c: orderv1.NewOrderServiceClient(conn)}
 }
 
-// CreateOrder places the order from the session's validated snapshot.
-func (c *OrderClient) CreateOrder(ctx context.Context, userID string, items []domain.SessionItem, paymentToken, idemKey string) (string, string, error) {
+// CreateOrder places the order from the session's validated snapshot. The
+// totals components cross the boundary so the charged total equals the
+// session total (P4; closes the P3 demo-fee gap).
+func (c *OrderClient) CreateOrder(ctx context.Context, userID string, items []domain.SessionItem, paymentToken, idemKey string, feeMinor, taxMinor, discountMinor int64) (string, string, error) {
 	reqItems := make([]*orderv1.OrderItem, 0, len(items))
 	for _, it := range items {
 		qty := it.Quantity
@@ -87,10 +89,13 @@ func (c *OrderClient) CreateOrder(ctx context.Context, userID string, items []do
 		})
 	}
 	resp, err := c.c.CreateOrder(ctx, &orderv1.CreateOrderRequest{
-		UserId:         userID,
-		Items:          reqItems,
-		PaymentMethod:  paymentToken,
-		IdempotencyKey: idemKey,
+		UserId:           userID,
+		Items:            reqItems,
+		PaymentMethod:    paymentToken,
+		IdempotencyKey:   idemKey,
+		ShippingFeeMinor: feeMinor,
+		TaxMinor:         taxMinor,
+		DiscountMinor:    discountMinor,
 	})
 	if err != nil {
 		return "", "", err

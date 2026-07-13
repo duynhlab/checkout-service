@@ -61,6 +61,8 @@ func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
 		private.PUT("/sessions/:id/address", h.SetAddress)
 		private.PUT("/sessions/:id/shipping", h.SetShipping)
 		private.PUT("/sessions/:id/payment", h.SetPayment)
+		private.POST("/sessions/:id/promo", h.ApplyPromo)
+		private.DELETE("/sessions/:id/promo", h.RemovePromo)
 		private.POST("/sessions/:id/confirm", h.ConfirmSession)
 		private.DELETE("/sessions/:id", h.CancelSession)
 	}
@@ -186,6 +188,39 @@ func (h *Handler) updateSession(c *gin.Context, req any, call func(ctx context.C
 	c.JSON(http.StatusOK, toSessionResponse(session))
 }
 
+// promoRequest is the POST …/promo payload.
+type promoRequest struct {
+	Code string `json:"code" binding:"required,max=40"`
+}
+
+// ApplyPromo handles POST …/sessions/:id/promo — attach a code (validated as
+// a preview; the authoritative gate is the atomic redemption at confirm).
+// Applying never consumes a use.
+func (h *Handler) ApplyPromo(c *gin.Context) {
+	var req promoRequest
+	h.updateSession(c, &req, func(ctx context.Context, userID, id string) (*domain.Session, error) {
+		return h.svc.ApplyPromo(ctx, userID, id, req.Code)
+	})
+}
+
+// RemovePromo handles DELETE …/sessions/:id/promo — detach the code (no use
+// was ever counted).
+func (h *Handler) RemovePromo(c *gin.Context) {
+	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
+		attribute.String("layer", "web"),
+		attribute.String("method", c.Request.Method),
+		attribute.String("path", c.Request.URL.Path),
+	))
+	defer span.End()
+
+	session, err := h.svc.RemovePromo(ctx, c.GetString(authmw.CtxUserID), c.Param("id"))
+	if err != nil {
+		h.respondSessionError(c, span, err)
+		return
+	}
+	c.JSON(http.StatusOK, toSessionResponse(session))
+}
+
 // maxIdempotencyKeyLen caps the client key so the composed order-side key
 // ("checkout:<uuid>:<key>") always fits order's 200-char limit.
 const maxIdempotencyKeyLen = 120
@@ -224,6 +259,16 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 		case errors.Is(err, logicv1.ErrStockUnavailable):
 			c.JSON(http.StatusConflict, gin.H{
 				"error":   gin.H{"code": httpx.CodeStockUnavailable, "message": "Some items are no longer available"},
+				"session": toSessionResponse(session),
+			})
+		case errors.Is(err, logicv1.ErrPromoExhausted):
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   gin.H{"code": httpx.CodePromoExhausted, "message": "Promo code is no longer available — totals updated"},
+				"session": toSessionResponse(session),
+			})
+		case errors.Is(err, logicv1.ErrPromoExpired):
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   gin.H{"code": httpx.CodePromoExpired, "message": "Promo code expired — totals updated"},
 				"session": toSessionResponse(session),
 			})
 		case errors.Is(err, logicv1.ErrConfirmInFlight):
@@ -267,6 +312,10 @@ func (h *Handler) CancelSession(c *gin.Context) {
 func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error) {
 	span.RecordError(err)
 	switch {
+	case errors.Is(err, logicv1.ErrPromoInvalid):
+		httpx.RespondError(c, http.StatusNotFound, httpx.CodePromoInvalid, "Promo code not found")
+	case errors.Is(err, logicv1.ErrPromoExpired):
+		httpx.RespondError(c, http.StatusConflict, httpx.CodePromoExpired, "Promo code has expired")
 	case errors.Is(err, logicv1.ErrInvalidQuote):
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Unknown shipping method for this destination")
 	case errors.Is(err, logicv1.ErrInvalidPaymentToken):

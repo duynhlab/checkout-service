@@ -250,7 +250,15 @@ func (s *CheckoutService) SetAddress(ctx context.Context, userID, id string, add
 	if !CanTransition(session.Status, domain.StatusAddressSet) {
 		return nil, ErrInvalidTransition
 	}
-	if err := s.repo.SetAddress(ctx, session.ID, session.Status, addr); err != nil {
+	// The invalidation zeroes fee/tax, so an applied promo must be re-clamped
+	// against the shrunk total (a fixed discount larger than the bare
+	// subtotal would otherwise push the composed total negative).
+	discount, err := s.sessionDiscount(ctx, session, session.SubtotalMinor, 0, 0)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if err := s.repo.SetAddress(ctx, session.ID, session.Status, addr, discount); err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -261,7 +269,8 @@ func (s *CheckoutService) SetAddress(ctx context.Context, userID, id string, add
 	session.ShippingMethod = ""
 	session.ShippingFeeMinor = 0
 	session.TaxMinor = 0
-	session.TotalMinor = session.SubtotalMinor - session.DiscountMinor
+	session.DiscountMinor = discount
+	session.TotalMinor = session.SubtotalMinor - discount
 	s.touch(ctx, session)
 	return session, nil
 }
@@ -297,7 +306,12 @@ func (s *CheckoutService) SetShipping(ctx context.Context, userID, id, method st
 		span.RecordError(err)
 		return nil, err
 	}
-	if err := s.repo.SetShipping(ctx, session.ID, session.Status, session.UpdatedAt, method, feeMinor, taxMinor); err != nil {
+	discount, err := s.sessionDiscount(ctx, session, session.SubtotalMinor, feeMinor, taxMinor)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if err := s.repo.SetShipping(ctx, session.ID, session.Status, session.UpdatedAt, method, feeMinor, taxMinor, discount); err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -305,7 +319,8 @@ func (s *CheckoutService) SetShipping(ctx context.Context, userID, id, method st
 	session.ShippingMethod = method
 	session.ShippingFeeMinor = feeMinor
 	session.TaxMinor = taxMinor
-	session.TotalMinor = session.SubtotalMinor + feeMinor + taxMinor - session.DiscountMinor
+	session.DiscountMinor = discount
+	session.TotalMinor = session.SubtotalMinor + feeMinor + taxMinor - discount
 	s.touch(ctx, session)
 	return session, nil
 }

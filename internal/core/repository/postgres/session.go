@@ -140,7 +140,7 @@ func (r *SessionRepository) UpdateStatus(ctx context.Context, id string, from, t
 // An address change INVALIDATES the shipping quote (RFC-0015: rates and tax
 // are destination-dependent): method, fee, and tax reset and the total drops
 // back to subtotal − discount, forcing the funnel through PUT shipping again.
-func (r *SessionRepository) SetAddress(ctx context.Context, id string, from domain.SessionStatus, addr *domain.Address) error {
+func (r *SessionRepository) SetAddress(ctx context.Context, id string, from domain.SessionStatus, addr *domain.Address, discountMinor int64) error {
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -152,8 +152,9 @@ func (r *SessionRepository) SetAddress(ctx context.Context, id string, from doma
 		UPDATE checkout_sessions
 		SET status = 'address_set', address = $3,
 		    shipping_method = NULL, shipping_fee_minor = 0, tax_minor = 0,
-		    total_minor = subtotal_minor - discount_minor, updated_at = now()
-		WHERE id = $1 AND status = $2`, id, from, addrJSON)
+		    discount_minor = $4,
+		    total_minor = subtotal_minor - $4, updated_at = now()
+		WHERE id = $1 AND status = $2`, id, from, addrJSON, discountMinor)
 	if err != nil {
 		return fmt.Errorf("set address: %w", err)
 	}
@@ -190,7 +191,7 @@ func (r *SessionRepository) BeginConfirm(ctx context.Context, id string, keyID i
 // PRICE_CHANGED / STOCK_UNAVAILABLE path. Every write is conditional on the
 // session still being confirming under THIS claim, so it can never race a
 // concurrent completion.
-func (r *SessionRepository) RequoteItems(ctx context.Context, id string, keyID int64, items []domain.SessionItem, subtotalMinor, taxMinor int64) error {
+func (r *SessionRepository) RequoteItems(ctx context.Context, id string, keyID int64, items []domain.SessionItem, subtotalMinor, taxMinor, discountMinor int64) error {
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -203,11 +204,11 @@ func (r *SessionRepository) RequoteItems(ctx context.Context, id string, keyID i
 	tag, err := tx.Exec(ctx, `
 		UPDATE checkout_sessions
 		SET status = 'shipping_set', confirm_key_id = NULL,
-		    subtotal_minor = $3, tax_minor = $4,
-		    total_minor = $3 + shipping_fee_minor + $4 - discount_minor,
+		    subtotal_minor = $3, tax_minor = $4, discount_minor = $5,
+		    total_minor = $3 + shipping_fee_minor + $4 - $5,
 		    updated_at = now()
 		WHERE id = $1 AND status = 'confirming' AND confirm_key_id = $2`,
-		id, keyID, subtotalMinor, taxMinor)
+		id, keyID, subtotalMinor, taxMinor, discountMinor)
 	if err != nil {
 		return fmt.Errorf("requote session: %w", err)
 	}
@@ -253,7 +254,7 @@ func (r *SessionRepository) CompleteSession(ctx context.Context, id string, keyI
 // SetShipping persists the shipping choice and shipping_set in one
 // conditional write. total_minor is recomputed in SQL from the persisted
 // components so the stored total can never drift from its parts.
-func (r *SessionRepository) SetShipping(ctx context.Context, id string, from domain.SessionStatus, asOf time.Time, method string, feeMinor, taxMinor int64) error {
+func (r *SessionRepository) SetShipping(ctx context.Context, id string, from domain.SessionStatus, asOf time.Time, method string, feeMinor, taxMinor, discountMinor int64) error {
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -264,11 +265,11 @@ func (r *SessionRepository) SetShipping(ctx context.Context, id string, from dom
 	tag, err := r.db.Exec(ctx, `
 		UPDATE checkout_sessions
 		SET status = 'shipping_set', shipping_method = $3, shipping_fee_minor = $4,
-		    tax_minor = $5,
-		    total_minor = subtotal_minor + $4 + $5 - discount_minor,
+		    tax_minor = $5, discount_minor = $6,
+		    total_minor = subtotal_minor + $4 + $5 - $6,
 		    updated_at = now()
-		WHERE id = $1 AND status = $2 AND updated_at = $6`,
-		id, from, method, feeMinor, taxMinor, asOf)
+		WHERE id = $1 AND status = $2 AND updated_at = $7`,
+		id, from, method, feeMinor, taxMinor, discountMinor, asOf)
 	if err != nil {
 		return fmt.Errorf("set shipping: %w", err)
 	}
