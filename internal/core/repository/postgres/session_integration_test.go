@@ -42,8 +42,15 @@ func newTestDB(t *testing.T) *pgxpool.Pool {
 		postgres.WithDatabase("checkout"),
 		postgres.WithUsername("checkout"),
 		postgres.WithPassword("secret"),
+		// The postgres entrypoint starts the server twice (initdb, then the
+		// real start) and the port already listens during the first — waiting
+		// on the port races the restart window and connects die with
+		// "connection reset by peer". Wait for the SECOND ready line instead
+		// (same strategy as payment-service).
 		testcontainers.WithWaitStrategy(
-			wait.ForListeningPort("5432/tcp").WithStartupTimeout(90*time.Second),
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(90*time.Second),
 		),
 	)
 	if err != nil {
