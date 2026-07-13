@@ -318,7 +318,9 @@ type addressRequest struct {
 	City     string `json:"city" binding:"required,max=100"`
 	Region   string `json:"region" binding:"max=100"`
 	PostCode string `json:"post_code" binding:"max=20"`
-	Country  string `json:"country" binding:"required,max=56"`
+	// ISO-3166 alpha-2 — the country drives money (tax bucket + fee region),
+	// so free text is not acceptable here (review finding).
+	Country string `json:"country" binding:"required,len=2,alpha"`
 }
 
 func (a *addressRequest) toDomain() *domain.Address {

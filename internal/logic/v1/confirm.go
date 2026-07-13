@@ -330,12 +330,20 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 	}
 
 	// Tax is destination-flat on (subtotal + fee): the requote's new subtotal
-	// changes it too (P3). The nil-quoter stub keeps tax at 0 either way.
+	// changes it too (P3). A failed rate lookup must FAIL the requote — never
+	// persist a tax that disagrees with its own formula (review finding).
+	// The nil-quoter stub keeps tax at 0 either way.
 	taxMinor := session.TaxMinor
 	if s.quoter != nil && session.Address != nil {
-		if bps, terr := s.repo.GetTaxRateBps(ctx, session.Address.Country); terr == nil {
-			taxMinor = (subtotal + session.ShippingFeeMinor) * int64(bps) / 10_000
+		bps, terr := s.repo.GetTaxRateBps(ctx, session.Address.Country)
+		if terr != nil {
+			_ = s.idem.Release(ctx, keyID)
+			return nil, ErrUpstream
 		}
+		// Floor division: both tax call sites truncate identically, so the
+		// stored total never disagrees with recomputation (≤1 minor unit in
+		// the shopper's favor).
+		taxMinor = (subtotal + session.ShippingFeeMinor) * int64(bps) / 10_000
 	}
 	total := subtotal + session.ShippingFeeMinor + taxMinor - session.DiscountMinor
 	if err := s.repo.RequoteItems(ctx, session.ID, keyID, fresh, subtotal, taxMinor, total); err != nil {

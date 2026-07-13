@@ -35,6 +35,7 @@ type fakeRepo struct {
 	shipFee         int64
 	shipTax         int64
 	taxBps          int32
+	taxErr          error
 	setShipErr      error
 	payToken        string
 	setPayErr       error
@@ -113,6 +114,9 @@ func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStat
 }
 
 func (f *fakeRepo) GetTaxRateBps(_ context.Context, region string) (int32, error) {
+	if f.taxErr != nil {
+		return 0, f.taxErr
+	}
 	if f.taxBps != 0 {
 		return f.taxBps, nil
 	}

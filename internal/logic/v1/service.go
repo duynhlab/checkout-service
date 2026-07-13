@@ -327,6 +327,8 @@ func (s *CheckoutService) priceShipping(ctx context.Context, method, region stri
 	if err != nil {
 		return 0, 0, err
 	}
+	// Floor division (see the confirm-path twin): truncation is deliberate
+	// and identical at both call sites — ≤1 minor unit, shopper's favor.
 	taxMinor := (subtotalMinor + feeMinor) * int64(bps) / 10_000
 	return feeMinor, taxMinor, nil
 }

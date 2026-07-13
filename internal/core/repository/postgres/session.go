@@ -380,10 +380,12 @@ func (r *SessionRepository) GetTaxRateBps(ctx context.Context, region string) (i
 	defer cancel()
 
 	var bps int32
+	// ORDER BY makes the exact-region row win deterministically — UNION ALL
+	// + LIMIT without it rides on unguaranteed planner row order (review).
 	err := r.db.QueryRow(ctx, `
-		SELECT rate_bps FROM tax_rules WHERE region = $1
-		UNION ALL
-		SELECT rate_bps FROM tax_rules WHERE region = 'DEFAULT'
+		SELECT rate_bps FROM tax_rules
+		WHERE region IN ($1, 'DEFAULT')
+		ORDER BY (region = 'DEFAULT')
 		LIMIT 1`, strings.ToUpper(region)).Scan(&bps)
 	if err != nil {
 		return 0, fmt.Errorf("tax rate lookup: %w", err)

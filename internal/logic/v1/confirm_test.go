@@ -367,3 +367,43 @@ func TestConfirm_StaleCompleteRecoversOnlyWhenSameKeyWon(t *testing.T) {
 		t.Errorf("finished = %d, want the recovered outcome cached", idem.finished)
 	}
 }
+
+func TestConfirm_RequoteRecomputesTaxOnFreshSubtotal(t *testing.T) {
+	sess := readySession() // subtotal 5998, VN address
+	sess.ShippingFeeMinor = 300
+	sess.TaxMinor = 504 // stale: computed on the old subtotal
+	repo := &fakeRepo{byID: sess, taxBps: 800}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "1", UnitPriceMinor: 3499, AvailableQty: 5}}}
+	q := &fakeQuoter{fee: 300}
+
+	s, err := confirmSvc(repo, prods, idem, &fakeOrders{}).WithQuoter(q).
+		Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrPriceChanged) {
+		t.Fatalf("err = %v, want ErrPriceChanged", err)
+	}
+	// New subtotal 2×3499 = 6998; tax = (6998+300)×800bps = 583 (floored).
+	wantTax := int64((6998 + 300) * 800 / 10_000)
+	if repo.requoted == nil || repo.requoted.tax != wantTax {
+		t.Fatalf("requoted tax = %+v, want %d recomputed on the fresh subtotal", repo.requoted, wantTax)
+	}
+	if s.TaxMinor != wantTax || s.TotalMinor != 6998+300+wantTax {
+		t.Errorf("session tax/total = %d/%d, want %d/%d", s.TaxMinor, s.TotalMinor, wantTax, 6998+300+wantTax)
+	}
+}
+
+func TestConfirm_RequoteTaxLookupFailureIsRetryable(t *testing.T) {
+	sess := readySession()
+	repo := &fakeRepo{byID: sess, taxErr: errors.New("db down")}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "1", UnitPriceMinor: 3499, AvailableQty: 5}}}
+
+	_, err := confirmSvc(repo, prods, idem, &fakeOrders{}).WithQuoter(&fakeQuoter{fee: 300}).
+		Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrUpstream) || idem.released != 1 {
+		t.Fatalf("err=%v released=%d, want ErrUpstream + key released (never persist a lying tax)", err, idem.released)
+	}
+	if repo.requoted != nil {
+		t.Error("requote persisted despite the failed rate lookup")
+	}
+}
