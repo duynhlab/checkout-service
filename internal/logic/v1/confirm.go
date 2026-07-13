@@ -329,14 +329,32 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 		return nil, nil
 	}
 
-	total := subtotal + session.ShippingFeeMinor + session.TaxMinor - session.DiscountMinor
-	if err := s.repo.RequoteItems(ctx, session.ID, keyID, fresh, subtotal, total); err != nil {
+	// Tax is destination-flat on (subtotal + fee): the requote's new subtotal
+	// changes it too (P3). A failed rate lookup must FAIL the requote — never
+	// persist a tax that disagrees with its own formula (review finding).
+	// The nil-quoter stub keeps tax at 0 either way.
+	taxMinor := session.TaxMinor
+	if s.quoter != nil && session.Address != nil {
+		bps, terr := s.repo.GetTaxRateBps(ctx, session.Address.Country)
+		if terr != nil {
+			_ = s.idem.Release(ctx, keyID)
+			return nil, ErrUpstream
+		}
+		taxMinor, terr = flatTax(subtotal+session.ShippingFeeMinor, bps)
+		if terr != nil {
+			_ = s.idem.Release(ctx, keyID)
+			return nil, ErrUpstream
+		}
+	}
+	total := subtotal + session.ShippingFeeMinor + taxMinor - session.DiscountMinor
+	if err := s.repo.RequoteItems(ctx, session.ID, keyID, fresh, subtotal, taxMinor); err != nil {
 		return nil, ErrConfirmInFlight
 	}
 	_ = s.idem.Release(ctx, keyID) // failure only delays the retry (takeover window)
 	session.Status = domain.StatusShippingSet
 	session.Items = fresh
 	session.SubtotalMinor = subtotal
+	session.TaxMinor = taxMinor
 	session.TotalMinor = total
 	session.ConfirmKeyID = nil
 	priceChangedCounter.Add(ctx, 1)

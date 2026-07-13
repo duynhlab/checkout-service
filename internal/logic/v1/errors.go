@@ -17,4 +17,6 @@ var (
 	ErrInvalidPaymentToken = errors.New("payment method must be an opaque tok_ reference")
 	// ErrUpstream — a dependency (cart/product) failed; 500 opaque.
 	ErrUpstream = errors.New("upstream dependency failed")
+	// ErrInvalidQuote — shipping rejected the method/region (400 VALIDATION).
+	ErrInvalidQuote = errors.New("unknown shipping method or region")
 )

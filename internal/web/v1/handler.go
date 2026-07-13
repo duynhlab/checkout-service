@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/attribute"
@@ -266,6 +267,8 @@ func (h *Handler) CancelSession(c *gin.Context) {
 func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error) {
 	span.RecordError(err)
 	switch {
+	case errors.Is(err, logicv1.ErrInvalidQuote):
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Unknown shipping method for this destination")
 	case errors.Is(err, logicv1.ErrInvalidPaymentToken):
 		// Generic message by design: the rejected value must never be echoed
 		// (it may be PAN-shaped).
@@ -316,7 +319,9 @@ type addressRequest struct {
 	City     string `json:"city" binding:"required,max=100"`
 	Region   string `json:"region" binding:"max=100"`
 	PostCode string `json:"post_code" binding:"max=20"`
-	Country  string `json:"country" binding:"required,max=56"`
+	// ISO-3166 alpha-2 — the country drives money (tax bucket + fee region),
+	// so free text is not acceptable here (review finding).
+	Country string `json:"country" binding:"required,len=2,alpha"`
 }
 
 func (a *addressRequest) toDomain() *domain.Address {
@@ -327,6 +332,9 @@ func (a *addressRequest) toDomain() *domain.Address {
 		City:     a.City,
 		Region:   a.Region,
 		PostCode: a.PostCode,
-		Country:  a.Country,
+		// Canonical uppercase: the country picks the tax bucket and fee
+		// region, so "us" and "US" must be the same jurisdiction everywhere
+		// (storage, order handoff, rate lookups).
+		Country: strings.ToUpper(a.Country),
 	}
 }
