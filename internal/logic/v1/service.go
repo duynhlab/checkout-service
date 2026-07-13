@@ -255,6 +255,12 @@ func (s *CheckoutService) SetAddress(ctx context.Context, userID, id string, add
 	}
 	session.Status = domain.StatusAddressSet
 	session.Address = addr
+	// Mirror the SQL quote invalidation (destination changed → the old fee,
+	// tax, and method are meaningless) so the response tells the truth.
+	session.ShippingMethod = ""
+	session.ShippingFeeMinor = 0
+	session.TaxMinor = 0
+	session.TotalMinor = session.SubtotalMinor - session.DiscountMinor
 	s.touch(ctx, session)
 	return session, nil
 }

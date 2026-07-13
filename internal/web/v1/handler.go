@@ -266,6 +266,8 @@ func (h *Handler) CancelSession(c *gin.Context) {
 func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error) {
 	span.RecordError(err)
 	switch {
+	case errors.Is(err, logicv1.ErrInvalidQuote):
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Unknown shipping method for this destination")
 	case errors.Is(err, logicv1.ErrInvalidPaymentToken):
 		// Generic message by design: the rejected value must never be echoed
 		// (it may be PAN-shaped).
