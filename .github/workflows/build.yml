@@ -20,7 +20,7 @@ jobs:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
       integration: true
-      integration-command: 'go test -tags=integration -coverprofile=coverage-integration.out ./internal/core/repository/...'
+      integration-command: 'go test -v -tags=integration -covermode=atomic -coverprofile=coverage-integration.out ./internal/core/repository/...'
     secrets: inherit
 
   gitleaks:
@@ -29,8 +29,19 @@ jobs:
       contents: read
       security-events: write
 
-  docker-build:
+  sonar:
     needs: [go-check, gitleaks]
+    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@main
+    with:
+      project-key: 'duynhlab_${{ github.event.repository.name }}'
+      organization: 'duynhlab'
+      fail-on-quality-gate: false
+      integration-coverage: true
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  docker-build:
+    needs: [go-check, sonar]
     uses: duynhlab/gha-workflows/.github/workflows/docker-build-go.yml@main
     with:
       image-name: ${{ github.event.repository.name }}
@@ -71,34 +82,24 @@ jobs:
       packages: write
       id-token: write
 
-  # Enable once SONAR_TOKEN / SLACK_BOT_TOKEN / GSHEET_* secrets exist:
-  # sonar:
-  #   needs: [go-check, gitleaks]
-  #   uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@main
-  #   with:
-  #     project-key: 'duynhlab_${{ github.event.repository.name }}'
-  #     organization: 'duynhlab'
-  #     fail-on-quality-gate: false
-  #   secrets:
-  #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-  #
+  # Binary release (GoReleaser, keyless-signed) — runs on v* tags.
   release-binary:
-    needs: [go-check]
+    needs: [go-check, sonar]
     if: startsWith(github.ref, 'refs/tags/v')
     uses: duynhlab/gha-workflows/.github/workflows/goreleaser.yml@main
     secrets: inherit
     permissions:
       contents: write
       id-token: write
-  #
-  # notify:
-  #   if: always()
-  #   needs: [go-check, gitleaks, docker-build, trivy-report, docker-sign]
-  #   uses: duynhlab/gha-workflows/.github/workflows/status.yml@main
-  #   with:
-  #     slack_channel_id: "C0AD82A9A74"
-  #     gsheet_spreadsheet_id: "1F2VUrAOyMGnETApp5yA-ldCW81ConiQXnWYZVxKas_0"
-  #   secrets:
-  #     SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-  #     GSHEET_CLIENT_EMAIL: ${{ secrets.GSHEET_CLIENT_EMAIL }}
-  #     GSHEET_PRIVATE_KEY: ${{ secrets.GSHEET_PRIVATE_KEY }}
+
+  notify:
+    if: always()
+    needs: [go-check, gitleaks, sonar, docker-build, trivy-report, docker-sign, release-binary]
+    uses: duynhlab/gha-workflows/.github/workflows/status.yml@main
+    with:
+      slack_channel_id: "C0AD82A9A74"
+      gsheet_spreadsheet_id: "1F2VUrAOyMGnETApp5yA-ldCW81ConiQXnWYZVxKas_0"
+    secrets:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      GSHEET_CLIENT_EMAIL: ${{ secrets.GSHEET_CLIENT_EMAIL }}
+      GSHEET_PRIVATE_KEY: ${{ secrets.GSHEET_PRIVATE_KEY }}
