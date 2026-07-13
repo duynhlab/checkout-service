@@ -56,18 +56,22 @@ func (f *fakeIdem) Finish(_ context.Context, _ int64, code int, body []byte) err
 }
 
 type fakeOrders struct {
-	orderID string
-	status  string
-	err     error
-	calls   int
-	gotKey  string
-	gotTok  string
+	orderID     string
+	status      string
+	err         error
+	calls       int
+	gotKey      string
+	gotTok      string
+	gotFee      int64
+	gotTax      int64
+	gotDiscount int64
 }
 
-func (f *fakeOrders) CreateOrder(_ context.Context, _ string, _ []domain.SessionItem, tok, idemKey string) (string, string, error) {
+func (f *fakeOrders) CreateOrder(_ context.Context, _ string, _ []domain.SessionItem, tok, idemKey string, fee, tax, discount int64) (string, string, error) {
 	f.calls++
 	f.gotTok = tok
 	f.gotKey = idemKey
+	f.gotFee, f.gotTax, f.gotDiscount = fee, tax, discount
 	if f.err != nil {
 		return "", "", f.err
 	}
@@ -405,5 +409,93 @@ func TestConfirm_RequoteTaxLookupFailureIsRetryable(t *testing.T) {
 	}
 	if repo.requoted != nil {
 		t.Error("requote persisted despite the failed rate lookup")
+	}
+}
+
+// --- P4: promo redemption inside confirm ---
+
+func readyPromoSession() *domain.Session {
+	s := readySession() // subtotal 5998
+	s.PromoCode = "SAVE5"
+	s.DiscountMinor = 500
+	s.TotalMinor = 5998 - 500
+	return s
+}
+
+func TestConfirm_RedeemsBeforeMarkerAndSendsComponents(t *testing.T) {
+	repo := &fakeRepo{byID: readyPromoSession(), promo: &domain.Promo{Code: "SAVE5", Kind: "fixed", Value: 500}}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	orders := &fakeOrders{orderID: "42", status: "pending"}
+
+	s, err := confirmSvc(repo, inStock(), idem, orders).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	if len(repo.redeemed) != 1 || repo.redeemed[0] != "SAVE5" {
+		t.Fatalf("redeemed = %v, want exactly one SAVE5", repo.redeemed)
+	}
+	if orders.gotDiscount != 500 {
+		t.Errorf("order discount = %d, want 500 (the charged total must match the session)", orders.gotDiscount)
+	}
+	if repo.backfilled != "42" {
+		t.Errorf("backfilled order = %q, want 42 (redemption provenance)", repo.backfilled)
+	}
+	if s.Status != domain.StatusCompleted {
+		t.Errorf("status = %s, want completed", s.Status)
+	}
+}
+
+func TestConfirm_MarkerReentrySkipsRedeem(t *testing.T) {
+	// Marker set ⇒ the redemption already committed (redeem sits strictly
+	// before the marker): a re-drive must NOT touch the promo tables — an
+	// expiry flip between attempts can never strip a session whose order may
+	// exist (doubt-cycle d).
+	sess := readyPromoSession()
+	sess.Status = domain.StatusConfirming
+	bound := int64(11)
+	sess.ConfirmKeyID = &bound
+	marker := int64(0)
+	repo := &fakeRepo{byID: sess}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11, SubjectID: &marker}, proceed: true}
+	orders := &fakeOrders{orderID: "42", status: "pending"}
+
+	if _, err := confirmSvc(repo, inStock(), idem, orders).Confirm(context.Background(), "7", "sess-1", "key-1"); err != nil {
+		t.Fatalf("re-drive: %v", err)
+	}
+	if len(repo.redeemed) != 0 {
+		t.Fatalf("redeemed = %v, want none on a marker re-entry", repo.redeemed)
+	}
+	if orders.calls != 1 {
+		t.Errorf("order calls = %d, want the re-drive", orders.calls)
+	}
+}
+
+func TestConfirm_ExhaustedStripsAndKeepsKeyUsable(t *testing.T) {
+	repo := &fakeRepo{byID: readyPromoSession(), redeemErr: domain.ErrPromoExhausted}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	orders := &fakeOrders{}
+
+	s, err := confirmSvc(repo, inStock(), idem, orders).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrPromoExhausted) {
+		t.Fatalf("err = %v, want ErrPromoExhausted", err)
+	}
+	if !repo.promoStripped || s.Status != domain.StatusShippingSet || s.DiscountMinor != 0 {
+		t.Fatalf("session = %+v stripped=%v, want promo stripped to shipping_set", s, repo.promoStripped)
+	}
+	if orders.calls != 0 || len(idem.checkpoints) != 0 {
+		t.Error("no order attempt and no marker may exist on the strip path")
+	}
+	if idem.released != 1 || idem.finished != 0 {
+		t.Errorf("released=%d finished=%d, want key released not consumed", idem.released, idem.finished)
+	}
+}
+
+func TestConfirm_RedeemTransientIsRetryable(t *testing.T) {
+	repo := &fakeRepo{byID: readyPromoSession(), redeemErr: errors.New("db down")}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+
+	_, err := confirmSvc(repo, inStock(), idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrUpstream) || idem.released != 1 || repo.promoStripped {
+		t.Fatalf("err=%v released=%d stripped=%v, want retryable with session intact", err, idem.released, repo.promoStripped)
 	}
 }

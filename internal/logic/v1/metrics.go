@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"errors"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -31,7 +32,20 @@ var (
 		metric.WithDescription("Sessions marked expired, by who noticed (timer = abandonment workflow, lazy = read-path backstop)"))
 	confirmDuration, _ = meter.Float64Histogram("checkout.confirm.duration",
 		metric.WithDescription("End-to-end confirm handler duration"), metric.WithUnit("s"))
+	promoRedeemedCounter, _ = meter.Int64Counter("checkout.promo.redeemed",
+		metric.WithDescription("Promo redemptions counted at confirm (P4)"))
+	promoRejectedCounter, _ = meter.Int64Counter("checkout.promo.rejected",
+		metric.WithDescription("Promo rejections at the authoritative confirm gate, by reason"))
 )
+
+// recordPromoRejected counts a confirm-gate rejection with its bounded reason.
+func recordPromoRejected(ctx context.Context, err error) {
+	reason := "exhausted"
+	if errors.Is(err, ErrPromoExpired) {
+		reason = "expired"
+	}
+	promoRejectedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+}
 
 // RecordSessionExpired counts an expiry with its bounded reason label
 // ("timer" | "lazy"). Exported for the worker's MarkSessionExpired activity.

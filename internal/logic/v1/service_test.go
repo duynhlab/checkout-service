@@ -47,6 +47,15 @@ type fakeRepo struct {
 	completeErr     error
 	completedOrder  string
 	afterComplete   *domain.Session // swapped into byID when CompleteSession errors (stale-race tests)
+	promo           *domain.Promo
+	userRedemptions int
+	promoSet        string
+	promoDiscount   int64
+	promoStripped   bool
+	redeemErr       error
+	redeemed        []string
+	shipDiscount    int64
+	backfilled      string
 }
 
 type requoteCall struct {
@@ -54,6 +63,7 @@ type requoteCall struct {
 	items    []domain.SessionItem
 	subtotal int64
 	tax      int64
+	discount int64
 }
 
 func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
@@ -89,7 +99,7 @@ func (f *fakeRepo) UpdateStatus(_ context.Context, _ string, from, to domain.Ses
 	return nil
 }
 
-func (f *fakeRepo) SetAddress(_ context.Context, _ string, _ domain.SessionStatus, addr *domain.Address) error {
+func (f *fakeRepo) SetAddress(_ context.Context, _ string, _ domain.SessionStatus, addr *domain.Address, _ int64) error {
 	if f.setAddrErr != nil {
 		return f.setAddrErr
 	}
@@ -102,13 +112,14 @@ func (f *fakeRepo) MarkExpired(_ context.Context, _ string, reason domain.Expire
 	return f.markExpErr
 }
 
-func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ time.Time, method string, feeMinor, taxMinor int64) error {
+func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ time.Time, method string, feeMinor, taxMinor, discountMinor int64) error {
 	if f.setShipErr != nil {
 		return f.setShipErr
 	}
 	f.shipMethod = method
 	f.shipFee = feeMinor
 	f.shipTax = taxMinor
+	f.shipDiscount = discountMinor
 	return nil
 }
 
@@ -150,11 +161,11 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 	return nil
 }
 
-func (f *fakeRepo) RequoteItems(_ context.Context, _ string, keyID int64, items []domain.SessionItem, subtotal, tax int64) error {
+func (f *fakeRepo) RequoteItems(_ context.Context, _ string, keyID int64, items []domain.SessionItem, subtotal, tax, discount int64) error {
 	if f.requoteErr != nil {
 		return f.requoteErr
 	}
-	f.requoted = &requoteCall{keyID: keyID, items: items, subtotal: subtotal, tax: tax}
+	f.requoted = &requoteCall{keyID: keyID, items: items, subtotal: subtotal, tax: tax, discount: discount}
 	return nil
 }
 
@@ -166,6 +177,52 @@ func (f *fakeRepo) CompleteSession(_ context.Context, _ string, keyID int64, ord
 		return f.completeErr
 	}
 	f.completedOrder = orderID
+	return nil
+}
+
+func (f *fakeRepo) GetPromo(_ context.Context, code string) (*domain.Promo, error) {
+	if f.promo == nil || f.promo.Code != code {
+		return nil, domain.ErrPromoNotFound
+	}
+	return f.promo, nil
+}
+
+func (f *fakeRepo) CountUserRedemptions(_ context.Context, _, _ string) (int, error) {
+	return f.userRedemptions, nil
+}
+
+func (f *fakeRepo) SetPromo(_ context.Context, _ string, _ domain.SessionStatus, code string, discountMinor int64) error {
+	f.promoSet, f.promoDiscount = code, discountMinor
+	if f.byID != nil {
+		f.byID.PromoCode = code
+		f.byID.DiscountMinor = discountMinor
+		f.byID.TotalMinor = f.byID.SubtotalMinor + f.byID.ShippingFeeMinor + f.byID.TaxMinor - discountMinor
+	}
+	return nil
+}
+
+func (f *fakeRepo) StripPromo(_ context.Context, _ string, _ int64) error {
+	f.promoStripped = true
+	if f.byID != nil {
+		f.byID.PromoCode = ""
+		f.byID.DiscountMinor = 0
+		f.byID.Status = domain.StatusReady
+		f.byID.ConfirmKeyID = nil
+		f.byID.TotalMinor = f.byID.SubtotalMinor + f.byID.ShippingFeeMinor + f.byID.TaxMinor
+	}
+	return nil
+}
+
+func (f *fakeRepo) RedeemPromo(_ context.Context, code, _, _ string) error {
+	if f.redeemErr != nil {
+		return f.redeemErr
+	}
+	f.redeemed = append(f.redeemed, code)
+	return nil
+}
+
+func (f *fakeRepo) BackfillRedemptionOrder(_ context.Context, _, _, orderID string) error {
+	f.backfilled = orderID
 	return nil
 }
 
@@ -592,5 +649,93 @@ func TestFlatTax_OverflowGuard(t *testing.T) {
 	tax, err := flatTax(10_300, 800)
 	if err != nil || tax != 824 {
 		t.Fatalf("flatTax = (%d, %v), want 824", tax, err)
+	}
+}
+
+// --- P4: promo apply/remove ---
+
+func TestApplyPromo_PercentComputesAndAttaches(t *testing.T) {
+	sess := liveSession(domain.StatusReady)
+	sess.SubtotalMinor, sess.ShippingFeeMinor, sess.TaxMinor = 10_000, 300, 824
+	sess.TotalMinor = 11_124
+	repo := &fakeRepo{byID: sess, promo: &domain.Promo{Code: "WELCOME10", Kind: "percent", Value: 10}}
+
+	s, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).ApplyPromo(context.Background(), "7", "sess-1", "WELCOME10")
+	if err != nil {
+		t.Fatalf("ApplyPromo: %v", err)
+	}
+	if s.DiscountMinor != 1000 || s.TotalMinor != 11_124-1000 {
+		t.Errorf("discount/total = %d/%d, want 1000/%d", s.DiscountMinor, s.TotalMinor, 11_124-1000)
+	}
+	if len(repo.touched) != 1 {
+		t.Error("apply must count as activity")
+	}
+}
+
+func TestApplyPromo_FixedClampsToTotal(t *testing.T) {
+	sess := liveSession(domain.StatusAddressSet)
+	sess.SubtotalMinor, sess.TotalMinor = 300, 300
+	repo := &fakeRepo{byID: sess, promo: &domain.Promo{Code: "SAVE5", Kind: "fixed", Value: 500}}
+
+	s, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).ApplyPromo(context.Background(), "7", "sess-1", "SAVE5")
+	if err != nil || s.DiscountMinor != 300 || s.TotalMinor != 0 {
+		t.Fatalf("discount/total = %d/%d (%v), want clamped 300/0", s.DiscountMinor, s.TotalMinor, err)
+	}
+}
+
+func TestApplyPromo_Rejections(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	limit1 := 1
+	max0used := 3
+	for name, tc := range map[string]struct {
+		promo *domain.Promo
+		mine  int
+		want  error
+	}{
+		"unknown":        {nil, 0, ErrPromoInvalid},
+		"expired":        {&domain.Promo{Code: "X", Kind: "fixed", Value: 100, ExpiresAt: &past}, 0, ErrPromoExpired},
+		"global cap":     {&domain.Promo{Code: "X", Kind: "fixed", Value: 100, MaxRedemptions: &max0used, RedeemedCount: 3}, 0, ErrPromoExhausted},
+		"per-user limit": {&domain.Promo{Code: "X", Kind: "fixed", Value: 100, PerUserLimit: &limit1}, 1, ErrPromoExhausted},
+	} {
+		repo := &fakeRepo{byID: liveSession(domain.StatusReady), promo: tc.promo, userRedemptions: tc.mine}
+		if _, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).ApplyPromo(context.Background(), "7", "sess-1", "X"); !errors.Is(err, tc.want) {
+			t.Errorf("%s: err = %v, want %v", name, err, tc.want)
+		}
+	}
+}
+
+func TestSetAddress_ReclampsPromoOnInvalidation(t *testing.T) {
+	// Fee/tax reset to zero shrinks the clampable total: a fixed 500 on a
+	// 300 subtotal must re-clamp to 300, never persist a negative total.
+	sess := liveSession(domain.StatusShippingSet)
+	sess.SubtotalMinor, sess.ShippingFeeMinor, sess.TaxMinor = 300, 200, 40
+	sess.PromoCode, sess.DiscountMinor = "SAVE5", 500
+	repo := &fakeRepo{byID: sess, promo: &domain.Promo{Code: "SAVE5", Kind: "fixed", Value: 500}}
+
+	s, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).SetAddress(context.Background(), "7", "sess-1",
+		&domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"})
+	if err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+	if s.DiscountMinor != 300 || s.TotalMinor != 0 {
+		t.Errorf("discount/total = %d/%d, want re-clamped 300/0", s.DiscountMinor, s.TotalMinor)
+	}
+}
+
+func TestSetShipping_RecomputesPercentDiscount(t *testing.T) {
+	sess := liveSession(domain.StatusAddressSet)
+	sess.SubtotalMinor = 10_000
+	sess.PromoCode, sess.DiscountMinor = "WELCOME10", 1000
+	repo := &fakeRepo{byID: sess, taxBps: 800, promo: &domain.Promo{Code: "WELCOME10", Kind: "percent", Value: 10}}
+	q := &fakeQuoter{fee: 300}
+
+	s, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).WithQuoter(q).
+		SetShipping(context.Background(), "7", "sess-1", "standard")
+	if err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	// tax = (10000+300)*8% = 824; discount = 10% of subtotal = 1000
+	if repo.shipDiscount != 1000 || s.TotalMinor != 10_000+300+824-1000 {
+		t.Errorf("discount/total = %d/%d, want 1000/%d", repo.shipDiscount, s.TotalMinor, 10_000+300+824-1000)
 	}
 }

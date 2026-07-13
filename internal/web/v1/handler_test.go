@@ -56,7 +56,7 @@ func (f *fakeRepo) UpdateStatus(_ context.Context, _ string, _, _ domain.Session
 	return nil
 }
 
-func (f *fakeRepo) SetAddress(_ context.Context, _ string, _ domain.SessionStatus, _ *domain.Address) error {
+func (f *fakeRepo) SetAddress(_ context.Context, _ string, _ domain.SessionStatus, _ *domain.Address, _ int64) error {
 	return nil
 }
 
@@ -64,7 +64,7 @@ func (f *fakeRepo) MarkExpired(_ context.Context, _ string, _ domain.ExpiredReas
 	return nil
 }
 
-func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ time.Time, _ string, _, _ int64) error {
+func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ time.Time, _ string, _, _, _ int64) error {
 	return nil
 }
 
@@ -86,11 +86,35 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 	return nil
 }
 
-func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _ int64) error {
+func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _, _ int64) error {
 	return nil
 }
 
 func (f *fakeRepo) CompleteSession(_ context.Context, _ string, _ int64, _ string) error { return nil }
+
+func (f *fakeRepo) GetPromo(_ context.Context, code string) (*domain.Promo, error) {
+	if code != "WELCOME10" {
+		return nil, domain.ErrPromoNotFound
+	}
+	return &domain.Promo{Code: code, Kind: "percent", Value: 10}, nil
+}
+
+func (f *fakeRepo) CountUserRedemptions(_ context.Context, _, _ string) (int, error) { return 0, nil }
+
+func (f *fakeRepo) SetPromo(_ context.Context, _ string, _ domain.SessionStatus, code string, discountMinor int64) error {
+	if f.byID != nil {
+		f.byID.PromoCode = code
+		f.byID.DiscountMinor = discountMinor
+		f.byID.TotalMinor = f.byID.SubtotalMinor + f.byID.ShippingFeeMinor + f.byID.TaxMinor - discountMinor
+	}
+	return nil
+}
+
+func (f *fakeRepo) StripPromo(_ context.Context, _ string, _ int64) error { return nil }
+
+func (f *fakeRepo) RedeemPromo(_ context.Context, _, _, _ string) error { return nil }
+
+func (f *fakeRepo) BackfillRedemptionOrder(_ context.Context, _, _, _ string) error { return nil }
 
 type fakeCart struct {
 	lines []logicv1.CartLine
@@ -377,7 +401,7 @@ func (f *webIdem) Finish(_ context.Context, _ int64, _ int, _ []byte) error { re
 
 type webOrders struct{ err error }
 
-func (f *webOrders) CreateOrder(_ context.Context, _ string, _ []domain.SessionItem, _, _ string) (string, string, error) {
+func (f *webOrders) CreateOrder(_ context.Context, _ string, _ []domain.SessionItem, _, _ string, _, _, _ int64) (string, string, error) {
 	if f.err != nil {
 		return "", "", f.err
 	}
