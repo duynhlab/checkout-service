@@ -54,7 +54,6 @@ type requoteCall struct {
 	items    []domain.SessionItem
 	subtotal int64
 	tax      int64
-	total    int64
 }
 
 func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
@@ -103,7 +102,7 @@ func (f *fakeRepo) MarkExpired(_ context.Context, _ string, reason domain.Expire
 	return f.markExpErr
 }
 
-func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, method string, feeMinor, taxMinor int64) error {
+func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ time.Time, method string, feeMinor, taxMinor int64) error {
 	if f.setShipErr != nil {
 		return f.setShipErr
 	}
@@ -151,11 +150,11 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 	return nil
 }
 
-func (f *fakeRepo) RequoteItems(_ context.Context, _ string, keyID int64, items []domain.SessionItem, subtotal, tax, total int64) error {
+func (f *fakeRepo) RequoteItems(_ context.Context, _ string, keyID int64, items []domain.SessionItem, subtotal, tax int64) error {
 	if f.requoteErr != nil {
 		return f.requoteErr
 	}
-	f.requoted = &requoteCall{keyID: keyID, items: items, subtotal: subtotal, tax: tax, total: total}
+	f.requoted = &requoteCall{keyID: keyID, items: items, subtotal: subtotal, tax: tax}
 	return nil
 }
 
@@ -574,5 +573,24 @@ func TestSetShipping_NilQuoterKeepsZeroStub(t *testing.T) {
 		SetShipping(context.Background(), "7", "sess-1", "standard")
 	if err != nil || repo.shipFee != 0 || repo.shipTax != 0 || s.TotalMinor != 0 {
 		t.Fatalf("stub mode broke: fee=%d tax=%d err=%v", repo.shipFee, repo.shipTax, err)
+	}
+}
+
+func TestSetShipping_NegativeFeeRejected(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession(domain.StatusAddressSet)}
+	q := &fakeQuoter{fee: -500}
+	if _, err := newSvc(repo, &fakeCart{}, &fakeProducts{}).WithQuoter(q).
+		SetShipping(context.Background(), "7", "sess-1", "standard"); !errors.Is(err, ErrUpstream) || repo.shipMethod != "" {
+		t.Fatalf("negative fee must never persist (err=%v persisted=%q)", err, repo.shipMethod)
+	}
+}
+
+func TestFlatTax_OverflowGuard(t *testing.T) {
+	if _, err := flatTax(int64(1)<<60, 10_000); !errors.Is(err, ErrUpstream) {
+		t.Fatalf("err = %v, want overflow rejected before the multiply wraps", err)
+	}
+	tax, err := flatTax(10_300, 800)
+	if err != nil || tax != 824 {
+		t.Fatalf("flatTax = (%d, %v), want 824", tax, err)
 	}
 }

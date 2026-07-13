@@ -124,7 +124,7 @@ type SessionRepository interface {
 	// SetShipping persists the shipping method, fee, and tax with the
 	// shipping_set status in one conditional write (same semantics as
 	// UpdateStatus). The total is recomputed in SQL from the components.
-	SetShipping(ctx context.Context, id string, from SessionStatus, method string, feeMinor, taxMinor int64) error
+	SetShipping(ctx context.Context, id string, from SessionStatus, asOf time.Time, method string, feeMinor, taxMinor int64) error
 	// GetTaxRateBps returns the flat tax rate (basis points) for a region,
 	// falling back to the DEFAULT rule.
 	GetTaxRateBps(ctx context.Context, region string) (int32, error)
@@ -139,7 +139,7 @@ type SessionRepository interface {
 	BeginConfirm(ctx context.Context, id string, keyID int64) error
 	// RequoteItems drops confirming → shipping_set with fresh prices and
 	// clears the binding, conditional on the claim still holding the session.
-	RequoteItems(ctx context.Context, id string, keyID int64, items []SessionItem, subtotalMinor, taxMinor, totalMinor int64) error
+	RequoteItems(ctx context.Context, id string, keyID int64, items []SessionItem, subtotalMinor, taxMinor int64) error
 	// CompleteSession CASes confirming → completed under the claim binding,
 	// recording the order id. The binding stays on the completed row.
 	CompleteSession(ctx context.Context, id string, keyID int64, orderID string) error

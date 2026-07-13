@@ -64,7 +64,7 @@ func (f *fakeRepo) MarkExpired(_ context.Context, _ string, _ domain.ExpiredReas
 	return nil
 }
 
-func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ string, _, _ int64) error {
+func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ time.Time, _ string, _, _ int64) error {
 	return nil
 }
 
@@ -86,7 +86,7 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 	return nil
 }
 
-func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _, _ int64) error {
+func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _ int64) error {
 	return nil
 }
 
@@ -460,5 +460,21 @@ func TestConfirm_NotReadyIs409InvalidTransition(t *testing.T) {
 	rec := doConfirm(r, "key-1")
 	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "INVALID_TRANSITION") {
 		t.Fatalf("resp = %d %s, want 409 INVALID_TRANSITION", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSetAddress_CanonicalizesCountry(t *testing.T) {
+	repo := &fakeRepo{byID: liveSession("7", domain.StatusOpen)}
+	r := newRouter(repo, &fakeCart{}, &fakeProducts{}, "7")
+	rec := doJSON(r, http.MethodPut,
+		"/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/address",
+		`{"full_name":"A","line1":"1","city":"NYC","country":"us"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body sessionResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body.Address == nil || body.Address.Country != "US" {
+		t.Errorf("country = %+v, want canonical US (it picks the money buckets)", body.Address)
 	}
 }

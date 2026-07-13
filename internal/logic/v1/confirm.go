@@ -340,13 +340,14 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 			_ = s.idem.Release(ctx, keyID)
 			return nil, ErrUpstream
 		}
-		// Floor division: both tax call sites truncate identically, so the
-		// stored total never disagrees with recomputation (≤1 minor unit in
-		// the shopper's favor).
-		taxMinor = (subtotal + session.ShippingFeeMinor) * int64(bps) / 10_000
+		taxMinor, terr = flatTax(subtotal+session.ShippingFeeMinor, bps)
+		if terr != nil {
+			_ = s.idem.Release(ctx, keyID)
+			return nil, ErrUpstream
+		}
 	}
 	total := subtotal + session.ShippingFeeMinor + taxMinor - session.DiscountMinor
-	if err := s.repo.RequoteItems(ctx, session.ID, keyID, fresh, subtotal, taxMinor, total); err != nil {
+	if err := s.repo.RequoteItems(ctx, session.ID, keyID, fresh, subtotal, taxMinor); err != nil {
 		return nil, ErrConfirmInFlight
 	}
 	_ = s.idem.Release(ctx, keyID) // failure only delays the retry (takeover window)

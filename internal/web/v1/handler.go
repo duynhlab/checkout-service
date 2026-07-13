@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/attribute"
@@ -331,6 +332,9 @@ func (a *addressRequest) toDomain() *domain.Address {
 		City:     a.City,
 		Region:   a.Region,
 		PostCode: a.PostCode,
-		Country:  a.Country,
+		// Canonical uppercase: the country picks the tax bucket and fee
+		// region, so "us" and "US" must be the same jurisdiction everywhere
+		// (storage, order handoff, rate lookups).
+		Country: strings.ToUpper(a.Country),
 	}
 }

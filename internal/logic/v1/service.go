@@ -7,6 +7,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -296,7 +297,7 @@ func (s *CheckoutService) SetShipping(ctx context.Context, userID, id, method st
 		span.RecordError(err)
 		return nil, err
 	}
-	if err := s.repo.SetShipping(ctx, session.ID, session.Status, method, feeMinor, taxMinor); err != nil {
+	if err := s.repo.SetShipping(ctx, session.ID, session.Status, session.UpdatedAt, method, feeMinor, taxMinor); err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -323,13 +324,18 @@ func (s *CheckoutService) priceShipping(ctx context.Context, method, region stri
 		}
 		return 0, 0, ErrUpstream
 	}
+	if feeMinor < 0 {
+		// Defense-in-depth: a negative fee would lower the payable amount.
+		return 0, 0, ErrUpstream
+	}
 	bps, err := s.repo.GetTaxRateBps(ctx, region)
 	if err != nil {
 		return 0, 0, err
 	}
-	// Floor division (see the confirm-path twin): truncation is deliberate
-	// and identical at both call sites — ≤1 minor unit, shopper's favor.
-	taxMinor := (subtotalMinor + feeMinor) * int64(bps) / 10_000
+	taxMinor, err := flatTax(subtotalMinor+feeMinor, bps)
+	if err != nil {
+		return 0, 0, err
+	}
 	return feeMinor, taxMinor, nil
 }
 
@@ -363,6 +369,17 @@ func (s *CheckoutService) SetPayment(ctx context.Context, userID, id, token stri
 	session.PaymentMethodToken = token
 	s.touch(ctx, session)
 	return session, nil
+}
+
+// flatTax computes base × bps/10000 with floor division (truncation is
+// deliberate and identical at every call site — ≤1 minor unit, shopper's
+// favor) and an overflow guard: the multiplication must not wrap before the
+// division (review finding — order-side bounds allow subtotals large enough).
+func flatTax(baseMinor int64, bps int32) (int64, error) {
+	if baseMinor < 0 || baseMinor > math.MaxInt64/10_001 {
+		return 0, ErrUpstream
+	}
+	return baseMinor * int64(bps) / 10_000, nil
 }
 
 // touch is the reset-on-activity half of the expiry contract: after any

@@ -322,7 +322,8 @@ func TestSessionRepository_ShippingAndPaymentWrites(t *testing.T) {
 	}
 
 	// Shipping write recomputes total in SQL from the persisted components.
-	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0, 0); err != nil {
+	cur, _ := repo.FindByID(ctx, s.ID)
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, cur.UpdatedAt, "standard", 0, 0); err != nil {
 		t.Fatalf("SetShipping: %v", err)
 	}
 	got, _ := repo.FindByID(ctx, s.ID)
@@ -361,7 +362,8 @@ func TestSessionRepository_ConfirmBindingLifecycle(t *testing.T) {
 		}
 	}
 	step("address", repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}))
-	step("shipping", repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0, 0))
+	cur, _ := repo.FindByID(ctx, s.ID)
+	step("shipping", repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, cur.UpdatedAt, "standard", 0, 0))
 	step("payment", repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"))
 
 	// BeginConfirm binds claim 11; re-entry with the same claim is idempotent;
@@ -378,7 +380,7 @@ func TestSessionRepository_ConfirmBindingLifecycle(t *testing.T) {
 	}
 
 	// A foreign claim cannot requote or complete.
-	if err := repo.RequoteItems(ctx, s.ID, 99, got.Items, 1, 1, 1); !errors.Is(err, domain.ErrStaleTransition) {
+	if err := repo.RequoteItems(ctx, s.ID, 99, got.Items, 1, 1); !errors.Is(err, domain.ErrStaleTransition) {
 		t.Fatalf("foreign requote err = %v, want ErrStaleTransition", err)
 	}
 	if err := repo.CompleteSession(ctx, s.ID, 99, "42"); !errors.Is(err, domain.ErrStaleTransition) {
@@ -404,7 +406,8 @@ func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
 	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
 		t.Fatalf("SetAddress: %v", err)
 	}
-	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 0, 0); err != nil {
+	cur, _ := repo.FindByID(ctx, s.ID)
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, cur.UpdatedAt, "standard", 0, 0); err != nil {
 		t.Fatalf("SetShipping: %v", err)
 	}
 	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"); err != nil {
@@ -418,7 +421,7 @@ func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
 		{ProductID: "1", UnitPriceMinor: 3499, PriceChanged: true},
 		{ProductID: "2", UnitPriceMinor: 3999, PriceChanged: false},
 	}
-	if err := repo.RequoteItems(ctx, s.ID, 7, fresh, 2*3499+3999, 0, 2*3499+3999); err != nil {
+	if err := repo.RequoteItems(ctx, s.ID, 7, fresh, 2*3499+3999, 0); err != nil {
 		t.Fatalf("RequoteItems: %v", err)
 	}
 	got, _ := repo.FindByID(ctx, s.ID)
@@ -562,7 +565,8 @@ func TestSessionRepository_TaxAndQuoteInvalidation(t *testing.T) {
 		t.Fatalf("SetAddress: %v", err)
 	}
 	// Fee + tax persist and the total composes in SQL.
-	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, "standard", 300, 824); err != nil {
+	cur, _ := repo.FindByID(ctx, s.ID)
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, cur.UpdatedAt, "standard", 300, 824); err != nil {
 		t.Fatalf("SetShipping: %v", err)
 	}
 	got, _ := repo.FindByID(ctx, s.ID)
@@ -578,5 +582,34 @@ func TestSessionRepository_TaxAndQuoteInvalidation(t *testing.T) {
 	got, _ = repo.FindByID(ctx, s.ID)
 	if got.ShippingMethod != "" || got.ShippingFeeMinor != 0 || got.TaxMinor != 0 || got.TotalMinor != got.SubtotalMinor {
 		t.Errorf("quote not invalidated: %+v", got)
+	}
+}
+
+func TestSessionRepository_ShippingFencedAgainstConcurrentAddressChange(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+	quotedAt, _ := repo.FindByID(ctx, s.ID)
+
+	// Concurrent address change (same-status re-entry) lands AFTER the quote
+	// was priced but BEFORE the shipping write: the fee for the old
+	// destination must lose the CAS, never persist next to the new address.
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusAddressSet, &domain.Address{FullName: "A", Line1: "5th Ave", City: "NYC", Country: "US"}); err != nil {
+		t.Fatalf("concurrent re-address: %v", err)
+	}
+	err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, quotedAt.UpdatedAt, "standard", 300, 824)
+	if !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("err = %v, want ErrStaleTransition (stale quote fenced out)", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.ShippingFeeMinor != 0 || got.Address.Country != "US" {
+		t.Errorf("row = fee %d country %s, want untouched US row", got.ShippingFeeMinor, got.Address.Country)
 	}
 }
