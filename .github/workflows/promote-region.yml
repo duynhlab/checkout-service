@@ -3,15 +3,15 @@ name: Promote region
 # Simulates a multi-region registry promotion on a single ghcr repo by
 # re-tagging an existing image with a region prefix. The prod-<region> Flux
 # ImagePolicy in duynhlab/gitops matches the new prefix and opens a reviewed PR
-# — this workflow never touches git.
+# — this workflow never touches git. Tags are semver (from the v* release CI):
 #
-#   main-<n>-<sha>  --to_region=us-->  us-<n>-<sha>
-#   us-<n>-<sha>    --to_region=eu-->  eu-<n>-<sha>
+#   1.2.3     --to_region=us-->  us-1.2.3
+#   us-1.2.3  --to_region=eu-->  eu-1.2.3
 on:
   workflow_dispatch:
     inputs:
       source_tag:
-        description: Existing image tag to promote (e.g. main-42-<sha> or us-42-<sha>)
+        description: Existing image tag to promote (e.g. 1.2.3 for →us, or us-1.2.3 for →eu)
         required: true
       to_region:
         description: Target region prefix
@@ -40,8 +40,9 @@ jobs:
           SRC: ${{ github.event.inputs.source_tag }}
           REGION: ${{ github.event.inputs.to_region }}
         run: |
-          # Strip the leading "<prefix>-" so the numeric run + sha are preserved.
-          REST="${SRC#*-}"
+          # Strip a known region prefix (if any) so the semver is preserved,
+          # then prepend the target region.
+          REST="${SRC#us-}"; REST="${REST#eu-}"
           DST="${REGION}-${REST}"
           echo "Promoting ${IMAGE}:${SRC} -> ${IMAGE}:${DST}"
           docker buildx imagetools create --tag "${IMAGE}:${DST}" "${IMAGE}:${SRC}"
