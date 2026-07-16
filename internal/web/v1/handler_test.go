@@ -276,6 +276,14 @@ func TestCancelSession_200(t *testing.T) {
 	}
 }
 
+func TestRemovePromo_200Detaches(t *testing.T) {
+	r := newRouter(&fakeRepo{byID: liveSession("7", domain.StatusShippingSet)}, &fakeCart{}, &fakeProducts{}, "7")
+	rec := doJSON(r, http.MethodDelete, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/promo", "")
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
 func TestRoutes_Unauthenticated401(t *testing.T) {
 	r := newRouter(&fakeRepo{}, &fakeCart{}, &fakeProducts{}, "")
 	for _, tc := range []struct{ method, path string }{
