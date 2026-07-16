@@ -18,15 +18,17 @@ const notifyTimeout = 2 * time.Second
 // Every method is best-effort: failures are logged and swallowed — a Temporal
 // outage degrades expiry to lazy-only (ADR-019), never the user request.
 type Notifier struct {
-	temporal  client.Client
+	temporal  Signaler
 	taskQueue string
 	ttl       time.Duration
 	logger    *zap.Logger
 }
 
-// NewNotifier wires the sender side. temporal must be non-nil (callers pass a
-// nil logic-port instead when Temporal is unavailable).
-func NewNotifier(temporal client.Client, taskQueue string, ttl time.Duration, logger *zap.Logger) *Notifier {
+// NewNotifier wires the sender side. temporal must be non-nil — pass a Lazy
+// when the startup dial lost the bring-up race; its signals return
+// ErrTemporalUnavailable (logged, swallowed) until the background redial
+// connects, and the lazy expires_at backstop covers those sessions.
+func NewNotifier(temporal Signaler, taskQueue string, ttl time.Duration, logger *zap.Logger) *Notifier {
 	return &Notifier{temporal: temporal, taskQueue: taskQueue, ttl: ttl, logger: logger}
 }
 

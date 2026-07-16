@@ -135,12 +135,13 @@ func main() {
 	).WithQuoter(clients.NewShippingClient(shippingConn))
 
 	// Abandonment notifier (ADR-019): best-effort signals to the durable
-	// timer. Temporal being unreachable is NOT fatal — expiry degrades to
-	// the lazy backstop only.
-	if tc, cleanup, ok := configureTemporal(cfg, logger); ok {
-		defer cleanup()
-		svc = svc.WithAbandonment(checkoutwf.NewNotifier(tc, cfg.Temporal.TaskQueue, cfg.Checkout.SessionTTL, logger))
-	}
+	// timer. Temporal being unreachable is NOT fatal — signals no-op (and
+	// expiry stays lazy-only) until the background redial connects (BUGS-6:
+	// the old flow gave up after the startup budget and never re-dialed, so
+	// AbandonedCheckoutWorkflow never started for any session).
+	lazyTemporal := configureTemporal(cfg, logger)
+	defer lazyTemporal.Close()
+	svc = svc.WithAbandonment(checkoutwf.NewNotifier(lazyTemporal, cfg.Temporal.TaskQueue, cfg.Checkout.SessionTTL, logger))
 	handler := webv1.NewHandler(svc)
 
 	// Retention: finished idempotency rows cache address-bearing session
@@ -269,19 +270,29 @@ func dialTemporalRetry(cfg *config.Config, logger *zap.Logger) (client.Client, e
 	return nil, lastErr
 }
 
-// configureTemporal dials Temporal for the serve path. Failure is non-fatal:
-// ok=false means the abandonment notifier stays nil and expiry is lazy-only.
-func configureTemporal(cfg *config.Config, logger *zap.Logger) (client.Client, func(), bool) {
+// temporalRedialInterval paces the serve path's background redial after the
+// startup budget is exhausted (order-service pattern).
+const temporalRedialInterval = 15 * time.Second
+
+// configureTemporal dials Temporal for the serve path. Failure is non-fatal
+// and no longer permanent: on exhaustion it hands back a Lazy whose
+// background loop keeps dialing until Temporal appears, so a checkout pod
+// that raced Temporal at bring-up heals itself instead of silently never
+// starting AbandonedCheckoutWorkflow until someone restarts it.
+func configureTemporal(cfg *config.Config, logger *zap.Logger) *checkoutwf.Lazy {
+	dial := func() (client.Client, error) {
+		return temporalx.Dial(temporalx.Config{HostPort: cfg.Temporal.HostPort, Namespace: cfg.Temporal.Namespace})
+	}
 	tc, err := dialTemporalRetry(cfg, logger)
 	if err != nil {
-		logger.Warn("Temporal unavailable; session expiry degrades to the lazy backstop only",
+		logger.Warn("Temporal unavailable at startup; background redial engaged — session expiry stays lazy-only until connected",
 			zap.String("hostport", cfg.Temporal.HostPort), zap.Error(err))
-		return nil, nil, false
+		return checkoutwf.NewLazy(dial, temporalRedialInterval, logger)
 	}
 	logger.Info("Temporal client initialized",
 		zap.String("hostport", cfg.Temporal.HostPort),
 		zap.String("namespace", cfg.Temporal.Namespace))
-	return tc, func() { tc.Close() }, true
+	return checkoutwf.NewLazySeeded(tc, logger)
 }
 
 // maybeRunWorker runs the Temporal worker for the abandonment workflow when
