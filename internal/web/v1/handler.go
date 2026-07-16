@@ -16,7 +16,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -39,6 +38,17 @@ type Handler struct {
 // NewHandler wires the handler over the logic layer.
 func NewHandler(svc *logicv1.CheckoutService) *Handler {
 	return &Handler{svc: svc}
+}
+
+// webSpan resolves the request context and the otelgin server span. The web
+// layer does not mint its own span — otelgin already opened the server span
+// for this request (method/route are on it), so handlers annotate that span
+// via the returned handle. The caller must NOT end it; otelgin owns its
+// lifecycle. Logic-layer business spans (checkout.session.*) stay in the logic
+// layer as children of this server span.
+func webSpan(c *gin.Context) (context.Context, trace.Span) {
+	ctx := c.Request.Context()
+	return ctx, trace.SpanFromContext(ctx)
 }
 
 // RegisterRoutes mounts the session routes on the private group. The caller
@@ -72,12 +82,7 @@ func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
 // cart, re-validate prices against product, return 201 (created) or 200 (an
 // active session already exists; POST is idempotent).
 func (h *Handler) CreateSession(c *gin.Context) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	defer span.End()
+	ctx, span := webSpan(c)
 	logger := middleware.GetLoggerFromGinContext(c)
 
 	session, created, err := h.svc.CreateSession(ctx, c.GetString(authmw.CtxUserID))
@@ -107,12 +112,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 
 // GetSession handles GET /checkout/v1/private/checkout/sessions/:id.
 func (h *Handler) GetSession(c *gin.Context) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	defer span.End()
+	ctx, span := webSpan(c)
 
 	session, err := h.svc.GetSession(ctx, c.GetString(authmw.CtxUserID), c.Param("id"))
 	if err != nil {
@@ -124,12 +124,7 @@ func (h *Handler) GetSession(c *gin.Context) {
 
 // SetAddress handles PUT /checkout/v1/private/checkout/sessions/:id/address.
 func (h *Handler) SetAddress(c *gin.Context) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	defer span.End()
+	ctx, span := webSpan(c)
 
 	var addr addressRequest
 	if err := c.ShouldBindJSON(&addr); err != nil {
@@ -167,12 +162,7 @@ func (h *Handler) SetPayment(c *gin.Context) {
 
 // updateSession is the shared bind → call → respond shape of the PUT steps.
 func (h *Handler) updateSession(c *gin.Context, req any, call func(ctx context.Context, userID, id string) (*domain.Session, error)) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	defer span.End()
+	ctx, span := webSpan(c)
 
 	if err := c.ShouldBindJSON(req); err != nil {
 		span.RecordError(err)
@@ -206,12 +196,7 @@ func (h *Handler) ApplyPromo(c *gin.Context) {
 // RemovePromo handles DELETE …/sessions/:id/promo — detach the code (no use
 // was ever counted).
 func (h *Handler) RemovePromo(c *gin.Context) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	defer span.End()
+	ctx, span := webSpan(c)
 
 	session, err := h.svc.RemovePromo(ctx, c.GetString(authmw.CtxUserID), c.Param("id"))
 	if err != nil {
@@ -229,12 +214,7 @@ const maxIdempotencyKeyLen = 120
 // handoff. The Idempotency-Key header is REQUIRED: the SPA generates one per
 // checkout attempt and persists it so a retry always converges.
 func (h *Handler) ConfirmSession(c *gin.Context) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	defer span.End()
+	ctx, span := webSpan(c)
 	logger := middleware.GetLoggerFromGinContext(c)
 
 	key := c.GetHeader("Idempotency-Key")
@@ -292,12 +272,7 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 
 // CancelSession handles DELETE /checkout/v1/private/checkout/sessions/:id.
 func (h *Handler) CancelSession(c *gin.Context) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	defer span.End()
+	ctx, span := webSpan(c)
 
 	if err := h.svc.Cancel(ctx, c.GetString(authmw.CtxUserID), c.Param("id")); err != nil {
 		h.respondSessionError(c, span, err)

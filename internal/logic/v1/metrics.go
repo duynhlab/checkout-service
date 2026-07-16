@@ -7,6 +7,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+
+	"github.com/duynhlab/pkg/obsx"
 )
 
 // Business metrics for the P2 confirm/abandonment slice, answering the
@@ -31,7 +33,12 @@ var (
 	expiredCounter, _ = meter.Int64Counter("checkout.sessions.expired",
 		metric.WithDescription("Sessions marked expired, by who noticed (timer = abandonment workflow, lazy = read-path backstop)"))
 	confirmDuration, _ = meter.Float64Histogram("checkout.confirm.duration",
-		metric.WithDescription("End-to-end confirm handler duration"), metric.WithUnit("s"))
+		metric.WithDescription("End-to-end confirm handler duration"), metric.WithUnit("s"),
+		// obsx installs SLO-tuned Views only for its named HTTP instruments;
+		// this business histogram needs its own second-scale boundaries, else
+		// the SDK's ms-scale default (0,5,…,10000) collapses every sub-5s
+		// confirm into bucket 0.
+		metric.WithExplicitBucketBoundaries(obsx.DurationBuckets...))
 	promoRedeemedCounter, _ = meter.Int64Counter("checkout.promo.redeemed",
 		metric.WithDescription("Promo redemptions counted at confirm (P4)"))
 	promoRejectedCounter, _ = meter.Int64Counter("checkout.promo.rejected",
