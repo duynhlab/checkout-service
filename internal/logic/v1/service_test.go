@@ -740,7 +740,11 @@ func TestSetShipping_RecomputesPercentDiscount(t *testing.T) {
 	}
 }
 
-// --- Abandonment notifier wiring (BUGS-6 regression guard) ---
+// --- Abandonment notifier wiring contract ---
+// These pin the port contract (SessionStarted fires on create; a missing
+// notifier never blocks create). The actual BUGS-6 regression (main.go wiring
+// after dial exhaustion) is pinned by workflow/lazy_test.go — unit tests
+// cannot reach cmd/main.go.
 
 // fakeNotifier records which lifecycle signals fired.
 type fakeNotifier struct {

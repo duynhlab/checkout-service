@@ -286,7 +286,8 @@ func configureTemporal(cfg *config.Config, logger *zap.Logger) *checkoutwf.Lazy 
 	tc, err := dialTemporalRetry(cfg, logger)
 	if err != nil {
 		logger.Warn("Temporal unavailable at startup; background redial engaged — session expiry stays lazy-only until connected",
-			zap.String("hostport", cfg.Temporal.HostPort), zap.Error(err))
+			zap.String("hostport", cfg.Temporal.HostPort),
+			zap.Duration("redial_interval", temporalRedialInterval), zap.Error(err))
 		return checkoutwf.NewLazy(dial, temporalRedialInterval, logger)
 	}
 	logger.Info("Temporal client initialized",
