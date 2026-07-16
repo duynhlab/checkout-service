@@ -739,3 +739,45 @@ func TestSetShipping_RecomputesPercentDiscount(t *testing.T) {
 		t.Errorf("discount/total = %d/%d, want 1000/%d", repo.shipDiscount, s.TotalMinor, 10_000+300+824-1000)
 	}
 }
+
+// --- Abandonment notifier wiring contract ---
+// These pin the port contract (SessionStarted fires on create; a missing
+// notifier never blocks create). The actual BUGS-6 regression (main.go wiring
+// after dial exhaustion) is pinned by workflow/lazy_test.go — unit tests
+// cannot reach cmd/main.go.
+
+// fakeNotifier records which lifecycle signals fired.
+type fakeNotifier struct {
+	started, activity, finalized []string
+}
+
+func (f *fakeNotifier) SessionStarted(_ context.Context, id string)   { f.started = append(f.started, id) }
+func (f *fakeNotifier) SessionActivity(_ context.Context, id string)  { f.activity = append(f.activity, id) }
+func (f *fakeNotifier) SessionFinalized(_ context.Context, id string) { f.finalized = append(f.finalized, id) }
+
+func TestCreateSession_FiresSessionStartedOnNotifier(t *testing.T) {
+	repo := &fakeRepo{}
+	cart := &fakeCart{lines: []CartLine{{ProductID: "1", ProductName: "Mouse", Quantity: 1, CartPriceMinor: 2999}}}
+	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5}}}
+	n := &fakeNotifier{}
+
+	s, created, err := newSvc(repo, cart, prods).WithAbandonment(n).CreateSession(context.Background(), "7")
+	if err != nil || !created {
+		t.Fatalf("CreateSession() = (%v, %v, %v), want created session", s, created, err)
+	}
+	if len(n.started) != 1 || n.started[0] != s.ID {
+		t.Fatalf("SessionStarted calls = %v, want exactly [%s]", n.started, s.ID)
+	}
+}
+
+func TestCreateSession_NilNotifierStillCreates(t *testing.T) {
+	repo := &fakeRepo{}
+	cart := &fakeCart{lines: []CartLine{{ProductID: "1", ProductName: "Mouse", Quantity: 1, CartPriceMinor: 2999}}}
+	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5}}}
+
+	// No WithAbandonment: the nil guard must keep create working (the
+	// pre-fix degraded mode and the not-yet-connected window share it).
+	if _, created, err := newSvc(repo, cart, prods).CreateSession(context.Background(), "7"); err != nil || !created {
+		t.Fatalf("CreateSession() without notifier = (%v, %v), want created", created, err)
+	}
+}
