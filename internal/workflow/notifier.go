@@ -54,7 +54,14 @@ func (n *Notifier) SessionFinalized(ctx context.Context, sessionID string) {
 		defer cancel()
 		err := n.temporal.SignalWorkflow(sctx, WorkflowID(sessionID), "", SignalFinalize, nil)
 		var notFound *serviceerror.NotFound
-		if err != nil && !errors.As(err, &notFound) {
+		switch {
+		case err == nil, errors.As(err, &notFound):
+		case errors.Is(err, ErrTemporalUnavailable):
+			// The redial loop already warns about the outage itself — one
+			// Debug per signal instead of a Warn per mutation.
+			n.logger.Debug("abandonment finalize skipped: Temporal not connected yet",
+				zap.String("session_id", sessionID))
+		default:
 			n.logger.Warn("abandonment finalize signal failed (lazy expiry still covers this session)",
 				zap.String("session_id", sessionID), zap.Error(err))
 		}
@@ -73,7 +80,14 @@ func (n *Notifier) signalWithStart(ctx context.Context, sessionID string) {
 				ID:        WorkflowID(sessionID),
 				TaskQueue: n.taskQueue,
 			}, AbandonedCheckoutWorkflow, Input{SessionID: sessionID, TTL: n.ttl})
-		if err != nil {
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrTemporalUnavailable):
+			// See SessionFinalized: outage noise belongs to the redial loop,
+			// not to every mutation.
+			n.logger.Debug("abandonment signal skipped: Temporal not connected yet",
+				zap.String("session_id", sessionID))
+		default:
 			n.logger.Warn("abandonment signal-with-start failed (lazy expiry still covers this session)",
 				zap.String("session_id", sessionID), zap.Error(err))
 		}
