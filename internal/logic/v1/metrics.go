@@ -43,7 +43,19 @@ var (
 		metric.WithDescription("Promo redemptions counted at confirm (P4)"))
 	promoRejectedCounter, _ = meter.Int64Counter("checkout.promo.rejected",
 		metric.WithDescription("Promo rejections at the authoritative confirm gate, by reason"))
+	// RFC-0021 P2-4: one increment per availability shadow-compare (create or
+	// confirm). result ∈ {ok,missing,unknown,error,skipped} — a STRUCTURAL check
+	// (does inventory know every SKU & answer sanely), not an exact-qty compare,
+	// since inventory is unwritten until phase 3. Bounded label only — no
+	// sku/user/order ids. Renders as inventory_shadow_compare_total{result}.
+	shadowCompareCounter, _ = meter.Int64Counter("inventory.shadow.compare",
+		metric.WithDescription("Checkout availability shadow-compares vs inventory-service (RFC-0021 P2-4), by result"))
 )
+
+// recordShadowCompare counts one shadow-compare outcome with its bounded result.
+func recordShadowCompare(ctx context.Context, result string) {
+	shadowCompareCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+}
 
 // recordPromoRejected counts a confirm-gate rejection with its bounded reason.
 func recordPromoRejected(ctx context.Context, err error) {

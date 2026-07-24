@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/duynhlab/pkg/flagx"
 	"github.com/joho/godotenv"
 )
 
@@ -62,6 +63,14 @@ type CheckoutConfig struct {
 	ProductGRPCAddr  string        // product.v1 target - from PRODUCT_GRPC_ADDR env
 	OrderGRPCAddr    string        // order.v1 target (confirm handoff) - from ORDER_GRPC_ADDR env
 	ShippingGRPCAddr string        // shipping.v1 target (GetQuote fee authority) - from SHIPPING_GRPC_ADDR env
+	// RFC-0021 P2-4: inventory.v1 target for availability shadow reads.
+	InventoryGRPCAddr string // inventory.v1 target - from INVENTORY_GRPC_ADDR env
+	// AvailabilitySource selects the availability read path (product|shadow|
+	// inventory) - from CHECKOUT_AVAILABILITY_SOURCE env, startup-validated.
+	AvailabilitySource string
+	// AvailabilityShadowSamplePct (0..100) throttles shadow-mode inventory
+	// reads - from CHECKOUT_AVAILABILITY_SHADOW_PCT env (default 100).
+	AvailabilityShadowSamplePct int
 	// IdempotencyLockTakeover: how long a crashed confirm holds its
 	// idempotency-key lock before a same-key retry may take it over
 	// (pkg/idempotency stale-lock window). From IDEMPOTENCY_LOCK_TAKEOVER env.
@@ -156,6 +165,11 @@ func Load() *Config {
 			ProductGRPCAddr:         getEnv("PRODUCT_GRPC_ADDR", "dns:///product-grpc.product.svc.cluster.local:9090"),
 			OrderGRPCAddr:           getEnv("ORDER_GRPC_ADDR", "dns:///order-grpc.order.svc.cluster.local:9090"),
 			ShippingGRPCAddr:        getEnv("SHIPPING_GRPC_ADDR", "dns:///shipping-grpc.shipping.svc.cluster.local:9090"),
+			InventoryGRPCAddr:       getEnv("INVENTORY_GRPC_ADDR", "dns:///inventory-grpc.inventory.svc.cluster.local:9090"),
+			// Startup-validated enum (RFC-0021 P2-4, ADR-029): an invalid value
+			// fails fast rather than silently defaulting.
+			AvailabilitySource:          flagx.MustEnum("CHECKOUT_AVAILABILITY_SOURCE", "product", "product", "shadow", "inventory"),
+			AvailabilityShadowSamplePct: flagx.MustPercent("CHECKOUT_AVAILABILITY_SHADOW_PCT", 100),
 			IdempotencyLockTakeover: time.Duration(getEnvDurationSecondsWithMax("IDEMPOTENCY_LOCK_TAKEOVER", 90, 600)) * time.Second,
 		},
 		Temporal: TemporalConfig{

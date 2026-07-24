@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"math"
+	"math/rand/v2"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -52,6 +54,34 @@ type ProductFetcher interface {
 	GetProducts(ctx context.Context, ids []string) ([]ProductInfo, error)
 }
 
+// SkuAvailability is inventory-service's availability view (from
+// inventory.v1/BatchGetAvailability). AvailableQty is the derived
+// available-to-promise (int64, no lossy narrowing); Known is true only when
+// inventory returned a definite status for the SKU (RFC-0021 P2-4 shadow reads).
+type SkuAvailability struct {
+	SKUID        string
+	AvailableQty int64
+	Known        bool
+}
+
+// InventoryAvailabilityFetcher is the logic-layer port for inventory-service's
+// availability, used ONLY for phase-2 shadow comparison — never for a checkout
+// decision in this phase (Product stays authoritative). Best-effort: a nil
+// fetcher or a non-shadow source disables it.
+type InventoryAvailabilityFetcher interface {
+	BatchGetAvailability(ctx context.Context, skuIDs []string) ([]SkuAvailability, error)
+}
+
+// Availability source modes for CHECKOUT_AVAILABILITY_SOURCE (RFC-0021 P2-4).
+// product: inventory is never called (default, current behavior). shadow:
+// inventory is called in parallel and compared, but Product decides. inventory:
+// reserved for P2-5 (inventory decides) — treated as product here.
+const (
+	AvailabilitySourceProduct   = "product"
+	AvailabilitySourceShadow    = "shadow"
+	AvailabilitySourceInventory = "inventory"
+)
+
 // ShippingQuoter is the logic-layer port for shipping.v1/GetQuote (RFC-0015
 // P3): the fee authority for PUT …/shipping. ErrInvalidQuote marks an unknown
 // method/region (→ 400); any other error is transport trouble (→ 503).
@@ -81,6 +111,15 @@ type CheckoutService struct {
 	quoter ShippingQuoter
 	// P2 abandonment notifier, wired via WithAbandonment (nil = disabled).
 	notifier AbandonmentNotifier
+	// RFC-0021 P2-4 availability shadow reads, wired via WithAvailabilitySource
+	// (nil fetcher or non-"shadow" source = disabled — Product-only path).
+	availabilitySource string
+	availability       InventoryAvailabilityFetcher
+	// shadowSamplePct (0..100) throttles how many ops are shadowed; 100 = every op.
+	shadowSamplePct int
+	// shadowWG tracks in-flight async shadow-compares so tests can await them;
+	// the shadow path itself never blocks the request.
+	shadowWG sync.WaitGroup
 }
 
 // WithQuoter wires the shipping GetQuote port (nil keeps the P2 0-fee stub —
@@ -95,6 +134,117 @@ func (s *CheckoutService) WithAbandonment(n AbandonmentNotifier) *CheckoutServic
 	s.notifier = n
 	return s
 }
+
+// WithAvailabilitySource wires phase-2 inventory shadow reads (RFC-0021 P2-4).
+// source is the validated CHECKOUT_AVAILABILITY_SOURCE flag; samplePct (0..100)
+// throttles the shadow volume. A nil fetcher or a non-"shadow" source disables
+// the inventory call entirely (Product-only path).
+func (s *CheckoutService) WithAvailabilitySource(source string, samplePct int, inv InventoryAvailabilityFetcher) *CheckoutService {
+	s.availabilitySource = source
+	s.shadowSamplePct = samplePct
+	s.availability = inv
+	return s
+}
+
+const (
+	// shadowCompareTimeout bounds the whole detached inventory read (created at
+	// admission, so scheduling delay counts against it too).
+	shadowCompareTimeout = 2 * time.Second
+	// shadowMaxInflight caps concurrent shadow compares so a slow inventory can
+	// never let goroutines/streams grow with request rate — excess is shed.
+	shadowMaxInflight = 32
+)
+
+// shadowSem is the process-wide admission bound for shadow compares. Buffered to
+// shadowMaxInflight; a full channel means "shed this one" (recorded "skipped").
+var shadowSem = make(chan struct{}, shadowMaxInflight)
+
+// maybeShadowCompare fires an availability shadow-compare against
+// inventory-service when the source is "shadow" (RFC-0021 P2-4). Fire-and-forget
+// on a detached, timeout-bounded, concurrency-capped, panic-safe goroutine: it
+// NEVER adds latency to, fails, crashes, or otherwise affects the caller's
+// request — it only emits inventory_shadow_compare_total{result}. Product stays
+// authoritative. ids is the SKU set just fetched.
+func (s *CheckoutService) maybeShadowCompare(ctx context.Context, ids []string) {
+	if s.availabilitySource != AvailabilitySourceShadow || s.availability == nil || len(ids) == 0 {
+		return
+	}
+	// Sample down the shadow volume (operator dial; 100 = every op).
+	//nolint:gosec // sampling decision for telemetry, not security-sensitive
+	if s.shadowSamplePct < 100 && rand.IntN(100) >= s.shadowSamplePct {
+		return
+	}
+	// Hard concurrency bound: shed load rather than pile up goroutines/streams
+	// when inventory is slow.
+	select {
+	case shadowSem <- struct{}{}:
+	default:
+		recordShadowCompare(ctx, "skipped")
+		return
+	}
+	skus := append([]string(nil), ids...)
+	// Detach from the request context (cancelled on handler return) but bound
+	// the whole thing — created HERE so time waiting to be scheduled also counts.
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), shadowCompareTimeout)
+
+	s.shadowWG.Add(1)
+	go func() {
+		defer s.shadowWG.Done()
+		defer cancel()
+		defer func() { <-shadowSem }()
+		// Best-effort contract: an unrecovered panic in ANY goroutine crashes
+		// the whole process, so a panic here (e.g. a nil deref mapping a
+		// malformed inventory reply) must be swallowed as a shadow "error".
+		defer func() {
+			if r := recover(); r != nil {
+				recordShadowCompare(context.Background(), "error")
+			}
+		}()
+
+		avails, err := s.availability.BatchGetAvailability(bg, skus)
+		if err != nil {
+			recordShadowCompare(bg, "error")
+			return
+		}
+		recordShadowCompare(bg, compareStructural(skus, avails))
+	}()
+}
+
+// compareStructural is the phase-2 shadow signal (RFC-0021 P2-4). It is
+// STRUCTURAL, not an exact-quantity compare: in phase 2 inventory is not yet
+// written (order writes land in phase 3), so its balances are the frozen
+// backfill snapshot and would legitimately drift from Product's live stock —
+// exact equality would be misleading. Instead it asks "does inventory KNOW every
+// requested SKU and answer sanely?", surfacing backfill/SKU-namespace gaps:
+//   - "missing"  — a requested SKU is absent from the inventory response
+//   - "unknown"  — a SKU is present but has no definite status, or negative ATP
+//   - "ok"       — every SKU present, definite status, non-negative ATP
+//
+// "missing" outranks "unknown" (a gap is the harder signal). Pure, no side effects.
+func compareStructural(ids []string, inventory []SkuAvailability) string {
+	inv := make(map[string]SkuAvailability, len(inventory))
+	for _, a := range inventory {
+		inv[a.SKUID] = a
+	}
+	unknown := false
+	for _, id := range ids {
+		a, ok := inv[id]
+		if !ok {
+			return "missing"
+		}
+		if !a.Known || a.AvailableQty < 0 {
+			unknown = true
+		}
+	}
+	if unknown {
+		return "unknown"
+	}
+	return "ok"
+}
+
+// awaitShadow blocks until all in-flight shadow-compares finish. Test-only
+// determinism helper; production never waits on best-effort telemetry.
+func (s *CheckoutService) awaitShadow() { s.shadowWG.Wait() }
 
 // NewCheckoutService wires the logic layer. ttl <= 0 falls back to
 // DefaultSessionTTL.
@@ -154,6 +304,9 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	for _, p := range infos {
 		byID[p.ProductID] = p
 	}
+	// RFC-0021 P2-4: shadow-compare availability vs inventory-service (no-op
+	// unless source=shadow). Best-effort, async — never affects this create.
+	s.maybeShadowCompare(ctx, ids)
 
 	items := make([]domain.SessionItem, 0, len(lines))
 	var subtotal int64

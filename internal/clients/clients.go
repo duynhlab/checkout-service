@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	cartv1 "github.com/duynhlab/pkg/proto/cart/v1"
+	inventoryv1 "github.com/duynhlab/pkg/proto/inventory/v1"
 	orderv1 "github.com/duynhlab/pkg/proto/order/v1"
 	productv1 "github.com/duynhlab/pkg/proto/product/v1"
 	shippingv1 "github.com/duynhlab/pkg/proto/shipping/v1"
@@ -119,6 +120,44 @@ func (c *ProductClient) GetProducts(ctx context.Context, ids []string) ([]logicv
 		})
 	}
 	return infos, nil
+}
+
+// InventoryClient satisfies logicv1.InventoryAvailabilityFetcher over
+// inventory.v1/BatchGetAvailability — RFC-0021 P2-4 shadow reads only (Product
+// stays the checkout authority in phase 2).
+type InventoryClient struct {
+	c inventoryv1.InventoryServiceClient
+}
+
+// NewInventoryClient wraps an established gRPC connection.
+func NewInventoryClient(conn grpc.ClientConnInterface) *InventoryClient {
+	return &InventoryClient{c: inventoryv1.NewInventoryServiceClient(conn)}
+}
+
+// BatchGetAvailability fetches per-SKU availability for the phase-2 structural
+// shadow check. DestinationRegion is empty: single-warehouse today (P2-5 may
+// thread a region through). ATP stays int64 (no lossy narrowing); Known is true
+// only when inventory returned a DEFINITE status (in/low/out of stock) — an
+// UNKNOWN/UNSPECIFIED status means inventory has no data for the SKU (e.g.
+// backfill incomplete) and must not read as healthy.
+func (c *InventoryClient) BatchGetAvailability(ctx context.Context, skuIDs []string) ([]logicv1.SkuAvailability, error) {
+	resp, err := c.c.BatchGetAvailability(ctx, &inventoryv1.BatchGetAvailabilityRequest{SkuIds: skuIDs})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]logicv1.SkuAvailability, 0, len(resp.GetAvailabilities()))
+	for _, a := range resp.GetAvailabilities() {
+		st := a.GetStatus()
+		known := st == inventoryv1.AvailabilityStatus_AVAILABILITY_STATUS_IN_STOCK ||
+			st == inventoryv1.AvailabilityStatus_AVAILABILITY_STATUS_LOW_STOCK ||
+			st == inventoryv1.AvailabilityStatus_AVAILABILITY_STATUS_OUT_OF_STOCK
+		out = append(out, logicv1.SkuAvailability{
+			SKUID:        a.GetSkuId(),
+			AvailableQty: a.GetAvailableToPromise(),
+			Known:        known,
+		})
+	}
+	return out, nil
 }
 
 // ShippingClient satisfies logicv1.ShippingQuoter over shipping.v1/GetQuote —
