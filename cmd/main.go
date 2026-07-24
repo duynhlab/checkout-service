@@ -134,6 +134,9 @@ func main() {
 		clients.NewOrderClient(orderConn),
 	).WithQuoter(clients.NewShippingClient(shippingConn))
 
+	// RFC-0021 P2-4: attach inventory shadow reads (no-op in product mode).
+	defer wireInventoryShadow(svc, cfg, logger)()
+
 	// Abandonment notifier (ADR-019): best-effort signals to the durable
 	// timer. Temporal being unreachable is NOT fatal — signals no-op (and
 	// expiry stays lazy-only) until the background redial connects (BUGS-6:
@@ -181,8 +184,10 @@ func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) 
 	}
 }
 
-// dialEastWest opens the cart/product/order client connections (in that
-// order) and returns a single cleanup for all of them.
+// dialEastWest opens the cart/product/order/shipping client connections (in
+// that order) and returns a single cleanup for all of them. Inventory is dialed
+// separately and only in shadow/inventory mode (see main), so the default
+// product path stays inventory-independent.
 func dialEastWest(cfg *config.Config, logger *zap.Logger) ([4]*grpc.ClientConn, func(), bool) {
 	var conns [4]*grpc.ClientConn
 	targets := []struct {
@@ -211,6 +216,29 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([4]*grpc.ClientConn, 
 		}
 	}
 	return conns, cleanup, true
+}
+
+// wireInventoryShadow dials + attaches the inventory shadow client, but only
+// when the availability source is not product — so a bad INVENTORY_GRPC_ADDR can
+// never affect the default product path (RFC-0021 P2-4). Shadow is optional
+// telemetry: a dial failure disables it and logs, never blocks checkout startup.
+// Returns a cleanup that is a no-op unless a connection was opened.
+func wireInventoryShadow(svc *logicv1.CheckoutService, cfg *config.Config, logger *zap.Logger) func() {
+	if cfg.Checkout.AvailabilitySource == logicv1.AvailabilitySourceProduct {
+		return func() {}
+	}
+	conn, err := grpcx.Dial(cfg.Checkout.InventoryGRPCAddr)
+	if err != nil {
+		logger.Error("inventory shadow disabled: dial failed",
+			zap.String("addr", cfg.Checkout.InventoryGRPCAddr), zap.Error(err))
+		return func() {}
+	}
+	svc.WithAvailabilitySource(
+		cfg.Checkout.AvailabilitySource,
+		cfg.Checkout.AvailabilityShadowSamplePct,
+		clients.NewInventoryClient(conn),
+	)
+	return func() { closeConn(conn, logger, "inventory") }
 }
 
 // initObservability wires the RFC-0014 OTel pipeline (traces, OTLP metrics,

@@ -365,6 +365,9 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 	for _, p := range infos {
 		byID[p.ProductID] = p
 	}
+	// RFC-0021 P2-4: shadow-compare availability vs inventory-service (no-op
+	// unless source=shadow). Best-effort, async — never affects revalidation.
+	s.maybeShadowCompare(ctx, ids)
 
 	var priceDrift, stockShort bool
 	var subtotal int64
