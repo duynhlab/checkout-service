@@ -7,6 +7,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"sync"
@@ -72,6 +73,51 @@ type InventoryAvailabilityFetcher interface {
 	BatchGetAvailability(ctx context.Context, skuIDs []string) ([]SkuAvailability, error)
 }
 
+// PriceInfo is Product's price-only view (from product.v1/BatchGetCurrentPrices)
+// — the price authority half of the split read (RFC-0021 P2-5). It carries no
+// availability: stock comes from Inventory in inventory mode.
+type PriceInfo struct {
+	ProductID      string
+	Name           string
+	UnitPriceMinor int64
+	Currency       string
+	Sellable       bool
+}
+
+// PriceFetcher is the logic-layer port for Product's price authority in
+// inventory mode (RFC-0021 P2-5).
+type PriceFetcher interface {
+	BatchGetCurrentPrices(ctx context.Context, skuIDs []string) ([]PriceInfo, error)
+}
+
+// AvailabilityLine is one basket line (sku + requested qty) for a check.
+type AvailabilityLine struct {
+	SKUID    string
+	Quantity int
+}
+
+// Shortage names a SKU that cannot be fully fulfilled and by how much.
+type Shortage struct {
+	SKUID              string
+	Requested          int64
+	AvailableToPromise int64
+}
+
+// AvailabilityResult is Inventory's basket answer (from
+// inventory.v1/CheckAvailability): whether the whole basket is fulfillable and
+// the per-SKU shortages when it is not.
+type AvailabilityResult struct {
+	CanFulfill bool
+	Shortages  []Shortage
+}
+
+// AvailabilityChecker is the logic-layer port for Inventory's basket
+// availability gate in inventory mode (RFC-0021 P2-5). Distinct from the
+// shadow-only InventoryAvailabilityFetcher: this one drives a checkout decision.
+type AvailabilityChecker interface {
+	CheckAvailability(ctx context.Context, items []AvailabilityLine) (AvailabilityResult, error)
+}
+
 // Availability source modes for CHECKOUT_AVAILABILITY_SOURCE (RFC-0021 P2-4).
 // product: inventory is never called (default, current behavior). shadow:
 // inventory is called in parallel and compared, but Product decides. inventory:
@@ -120,6 +166,10 @@ type CheckoutService struct {
 	// shadowWG tracks in-flight async shadow-compares so tests can await them;
 	// the shadow path itself never blocks the request.
 	shadowWG sync.WaitGroup
+	// RFC-0021 P2-5 inventory-mode split reads, wired via WithInventoryMode
+	// (nil = disabled; resolveCatalog falls back to Product's GetProducts).
+	prices  PriceFetcher
+	checker AvailabilityChecker
 }
 
 // WithQuoter wires the shipping GetQuote port (nil keeps the P2 0-fee stub —
@@ -144,6 +194,121 @@ func (s *CheckoutService) WithAvailabilitySource(source string, samplePct int, i
 	s.shadowSamplePct = samplePct
 	s.availability = inv
 	return s
+}
+
+// WithInventoryMode wires the phase-2 inventory-mode split-read dependencies
+// (RFC-0021 P2-5): Product's price authority + Inventory's availability gate.
+// They are only exercised when the source is `inventory`; nil keeps the
+// Product-only path even if the flag is misconfigured.
+func (s *CheckoutService) WithInventoryMode(prices PriceFetcher, checker AvailabilityChecker) *CheckoutService {
+	s.prices = prices
+	s.checker = checker
+	return s
+}
+
+// resolveCatalog fetches per-line price + availability honoring the availability
+// source. product/shadow → one Product `GetProducts` (price+stock, today's
+// behavior; shadow-compare runs separately, async). inventory → Product
+// `BatchGetCurrentPrices` (price authority) + Inventory `CheckAvailability`
+// (availability gate), merged into `[]ProductInfo` so downstream stock checks
+// (AvailableQty >= requested) work unchanged. A CheckAvailability transport
+// error propagates as an error — the caller maps it to `ErrUpstream` (503),
+// NEVER to out-of-stock (fail-closed: a timeout is not a shortage).
+func (s *CheckoutService) resolveCatalog(ctx context.Context, lines []AvailabilityLine) ([]ProductInfo, error) {
+	ids := make([]string, len(lines))
+	for i, l := range lines {
+		ids[i] = l.SKUID
+	}
+	if s.availabilitySource != AvailabilitySourceInventory || s.prices == nil || s.checker == nil {
+		return s.products.GetProducts(ctx, ids)
+	}
+	// Inventory mode: Product prices + Inventory availability, fetched
+	// CONCURRENTLY (independent reads) so tail latency is the slower call, not
+	// the sum. Each goroutine recovers so a panic mapping a malformed reply
+	// becomes an error, never a process crash. Any transport error propagates →
+	// caller maps to ErrUpstream (fail-closed: a timeout is never a shortage).
+	type priceRes struct {
+		infos []PriceInfo
+		err   error
+	}
+	type availRes struct {
+		res AvailabilityResult
+		err error
+	}
+	pc := make(chan priceRes, 1)
+	ac := make(chan availRes, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				pc <- priceRes{err: fmt.Errorf("price fetch panicked: %v", r)}
+			}
+		}()
+		infos, err := s.prices.BatchGetCurrentPrices(ctx, ids)
+		pc <- priceRes{infos: infos, err: err}
+	}()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ac <- availRes{err: fmt.Errorf("availability check panicked: %v", r)}
+			}
+		}()
+		res, err := s.checker.CheckAvailability(ctx, lines)
+		ac <- availRes{res: res, err: err}
+	}()
+	pr, ar := <-pc, <-ac
+	if pr.err != nil {
+		return nil, pr.err
+	}
+	if ar.err != nil {
+		return nil, ar.err
+	}
+	return mergeCatalog(lines, pr.infos, ar.res), nil
+}
+
+// mergeCatalog reshapes split inventory-mode reads into the ProductInfo view the
+// snapshot/re-validation logic already understands, keyed to the requested
+// lines. `CanFulfill` is the AUTHORITATIVE basket verdict: when Inventory says
+// the basket cannot be fulfilled, every line is blocked (AvailableQty=0) rather
+// than trusting the per-SKU Shortages list — the contract makes no completeness
+// guarantee for Shortages when CanFulfill is false, and one order ships from one
+// warehouse (RFC-0021), so a basket that can't be fulfilled fails as a whole.
+// This also sidesteps duplicate-SKU lines and any int64 ATP arithmetic. When the
+// basket CAN be fulfilled, a stray shortage still blocks that line (defense
+// against a contradictory reply). Only requested, sellable, correctly-priced
+// SKUs become entries; anything else reads as delisted (omitted, like
+// GetProducts omitting a SKU). A cleared line gets AvailableQty = requested so
+// the existing `requested > AvailableQty` shortage test passes it.
+func mergeCatalog(lines []AvailabilityLine, prices []PriceInfo, avail AvailabilityResult) []ProductInfo {
+	reqByID := make(map[string]int, len(lines))
+	for _, l := range lines {
+		reqByID[l.SKUID] = l.Quantity
+	}
+	short := make(map[string]struct{}, len(avail.Shortages))
+	for _, sh := range avail.Shortages {
+		short[sh.SKUID] = struct{}{}
+	}
+	out := make([]ProductInfo, 0, len(prices))
+	for _, p := range prices {
+		req, requested := reqByID[p.ProductID]
+		if !requested || !p.Sellable || (p.Currency != "" && p.Currency != defaultCurrency) {
+			// Not asked for, unsellable, or a currency we can't charge as USD:
+			// omit ⇒ reads as delisted, exactly like GetProducts leaving it out.
+			continue
+		}
+		available := req // cleared ⇒ AvailableQty == requested (passes the gate)
+		if !avail.CanFulfill {
+			available = 0 // basket unfulfillable ⇒ block every line
+		} else if _, isShort := short[p.ProductID]; isShort {
+			available = 0 // contradictory shortage on a fulfillable basket ⇒ block it
+		}
+		out = append(out, ProductInfo{
+			ProductID:      p.ProductID,
+			Name:           p.Name,
+			UnitPriceMinor: p.UnitPriceMinor,
+			AvailableQty:   available,
+		})
+	}
+	return out
 }
 
 const (
@@ -291,11 +456,15 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 		return nil, false, ErrEmptyCart
 	}
 
+	availLines := make([]AvailabilityLine, 0, len(lines))
 	ids := make([]string, 0, len(lines))
 	for _, l := range lines {
+		availLines = append(availLines, AvailabilityLine{SKUID: l.ProductID, Quantity: l.Quantity})
 		ids = append(ids, l.ProductID)
 	}
-	infos, err := s.products.GetProducts(ctx, ids)
+	// Product mode: one GetProducts. Inventory mode (P2-5): Product prices +
+	// Inventory availability, merged. A CheckAvailability failure → ErrUpstream.
+	infos, err := s.resolveCatalog(ctx, availLines)
 	if err != nil {
 		span.RecordError(err)
 		return nil, false, ErrUpstream
