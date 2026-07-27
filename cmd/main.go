@@ -125,9 +125,12 @@ func main() {
 	}
 
 	repo := postgres.NewSessionRepository(pool)
+	// One ProductClient instance serves both GetProducts (product mode) and
+	// BatchGetCurrentPrices (inventory-mode price authority, P2-5).
+	productClient := clients.NewProductClient(productConn)
 	svc := logicv1.NewCheckoutService(repo,
 		clients.NewCartClient(cartConn),
-		clients.NewProductClient(productConn),
+		productClient,
 		cfg.Checkout.SessionTTL,
 	).WithConfirm(
 		idempotency.New(pool, cfg.Checkout.IdempotencyLockTakeover),
@@ -135,7 +138,7 @@ func main() {
 	).WithQuoter(clients.NewShippingClient(shippingConn))
 
 	// RFC-0021 P2-4: attach inventory shadow reads (no-op in product mode).
-	defer wireInventoryShadow(svc, cfg, logger)()
+	defer wireInventoryShadow(svc, cfg, logger, productClient)()
 
 	// Abandonment notifier (ADR-019): best-effort signals to the durable
 	// timer. Temporal being unreachable is NOT fatal — signals no-op (and
@@ -218,26 +221,36 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([4]*grpc.ClientConn, 
 	return conns, cleanup, true
 }
 
-// wireInventoryShadow dials + attaches the inventory shadow client, but only
-// when the availability source is not product — so a bad INVENTORY_GRPC_ADDR can
-// never affect the default product path (RFC-0021 P2-4). Shadow is optional
-// telemetry: a dial failure disables it and logs, never blocks checkout startup.
-// Returns a cleanup that is a no-op unless a connection was opened.
-func wireInventoryShadow(svc *logicv1.CheckoutService, cfg *config.Config, logger *zap.Logger) func() {
+// wireInventoryShadow dials + attaches the inventory client, but only when the
+// availability source is not product — so a bad INVENTORY_GRPC_ADDR can never
+// affect the default product path (RFC-0021 P2-4/P2-5). The inventory read path
+// is optional: a dial failure disables it and logs, never blocks checkout
+// startup. Wires both the shadow-compare fetcher (P2-4) and the inventory-mode
+// split-read deps (P2-5: Product prices via the shared productClient + Inventory
+// availability). Returns a cleanup that is a no-op unless a connection opened.
+func wireInventoryShadow(svc *logicv1.CheckoutService, cfg *config.Config, logger *zap.Logger, productClient *clients.ProductClient) func() {
 	if cfg.Checkout.AvailabilitySource == logicv1.AvailabilitySourceProduct {
 		return func() {}
 	}
 	conn, err := grpcx.Dial(cfg.Checkout.InventoryGRPCAddr)
 	if err != nil {
+		// inventory mode is a deliberate availability-authority choice: a dial
+		// failure must NOT silently degrade to product mode. Fail loud. shadow
+		// is optional telemetry, so there a dial failure just disables it.
+		if cfg.Checkout.AvailabilitySource == logicv1.AvailabilitySourceInventory {
+			logger.Fatal("inventory mode selected but inventory gRPC dial failed",
+				zap.String("addr", cfg.Checkout.InventoryGRPCAddr), zap.Error(err))
+		}
 		logger.Error("inventory shadow disabled: dial failed",
 			zap.String("addr", cfg.Checkout.InventoryGRPCAddr), zap.Error(err))
 		return func() {}
 	}
+	inv := clients.NewInventoryClient(conn)
 	svc.WithAvailabilitySource(
 		cfg.Checkout.AvailabilitySource,
 		cfg.Checkout.AvailabilityShadowSamplePct,
-		clients.NewInventoryClient(conn),
-	)
+		inv,
+	).WithInventoryMode(productClient, inv)
 	return func() { closeConn(conn, logger, "inventory") }
 }
 

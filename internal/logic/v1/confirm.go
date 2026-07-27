@@ -349,14 +349,19 @@ func (s *CheckoutService) completeConfirm(ctx context.Context, session *domain.S
 // NOT consumed. Returns (requotedSession, ErrPriceChanged|ErrStockUnavailable)
 // on drift, (nil, ErrUpstream) on transport trouble, (nil, nil) when clean.
 func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Session, keyID int64) (*domain.Session, error) {
+	availLines := make([]AvailabilityLine, 0, len(session.Items))
 	ids := make([]string, 0, len(session.Items))
 	for _, it := range session.Items {
+		availLines = append(availLines, AvailabilityLine{SKUID: it.ProductID, Quantity: it.Quantity})
 		ids = append(ids, it.ProductID)
 	}
-	infos, err := s.products.GetProducts(ctx, ids)
+	// Product mode: GetProducts. Inventory mode (P2-5): Product prices +
+	// Inventory availability. An Inventory timeout/error surfaces here as
+	// ErrUpstream (503, retryable) — fail-closed, NEVER read as out-of-stock.
+	infos, err := s.resolveCatalog(ctx, availLines)
 	if err != nil || (len(ids) > 0 && len(infos) == 0) {
 		// Transport error — or a suspicious empty answer for a non-empty ask
-		// (degraded product must not read as "everything delisted"). Release
+		// (degraded upstream must not read as "everything delisted"). Release
 		// failure only delays the same-key retry until the takeover window.
 		_ = s.idem.Release(ctx, keyID)
 		return nil, ErrUpstream

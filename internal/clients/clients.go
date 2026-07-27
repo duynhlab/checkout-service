@@ -122,6 +122,26 @@ func (c *ProductClient) GetProducts(ctx context.Context, ids []string) ([]logicv
 	return infos, nil
 }
 
+// BatchGetCurrentPrices fetches DB-truth prices — the price authority for
+// inventory mode (RFC-0021 P2-5). No availability: stock comes from Inventory.
+func (c *ProductClient) BatchGetCurrentPrices(ctx context.Context, skuIDs []string) ([]logicv1.PriceInfo, error) {
+	resp, err := c.c.BatchGetCurrentPrices(ctx, &productv1.BatchGetCurrentPricesRequest{SkuIds: skuIDs})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]logicv1.PriceInfo, 0, len(resp.GetPrices()))
+	for _, p := range resp.GetPrices() {
+		out = append(out, logicv1.PriceInfo{
+			ProductID:      p.GetSkuId(),
+			Name:           p.GetName(),
+			UnitPriceMinor: p.GetPriceMinor(),
+			Currency:       p.GetCurrency(),
+			Sellable:       p.GetSellable(),
+		})
+	}
+	return out, nil
+}
+
 // InventoryClient satisfies logicv1.InventoryAvailabilityFetcher over
 // inventory.v1/BatchGetAvailability — RFC-0021 P2-4 shadow reads only (Product
 // stays the checkout authority in phase 2).
@@ -158,6 +178,29 @@ func (c *InventoryClient) BatchGetAvailability(ctx context.Context, skuIDs []str
 		})
 	}
 	return out, nil
+}
+
+// CheckAvailability asks Inventory whether the whole basket can be fulfilled —
+// the availability gate for inventory mode (RFC-0021 P2-5). DestinationRegion is
+// empty: single-warehouse today.
+func (c *InventoryClient) CheckAvailability(ctx context.Context, items []logicv1.AvailabilityLine) (logicv1.AvailabilityResult, error) {
+	reqItems := make([]*inventoryv1.ReservationItem, 0, len(items))
+	for _, it := range items {
+		reqItems = append(reqItems, &inventoryv1.ReservationItem{SkuId: it.SKUID, Quantity: int64(it.Quantity)})
+	}
+	resp, err := c.c.CheckAvailability(ctx, &inventoryv1.CheckAvailabilityRequest{Items: reqItems})
+	if err != nil {
+		return logicv1.AvailabilityResult{}, err
+	}
+	shortages := make([]logicv1.Shortage, 0, len(resp.GetShortages()))
+	for _, s := range resp.GetShortages() {
+		shortages = append(shortages, logicv1.Shortage{
+			SKUID:              s.GetSkuId(),
+			Requested:          s.GetRequested(),
+			AvailableToPromise: s.GetAvailableToPromise(),
+		})
+	}
+	return logicv1.AvailabilityResult{CanFulfill: resp.GetCanFulfill(), Shortages: shortages}, nil
 }
 
 // ShippingClient satisfies logicv1.ShippingQuoter over shipping.v1/GetQuote —
