@@ -126,6 +126,11 @@ const (
 	AvailabilitySourceProduct   = "product"
 	AvailabilitySourceShadow    = "shadow"
 	AvailabilitySourceInventory = "inventory"
+
+	// fullCanaryPct is the canary dial fully open — every user reads from
+	// inventory. Also the default, so introducing the dial cannot change what the
+	// already-documented `inventory` source means.
+	fullCanaryPct = 100
 )
 
 // ShippingQuoter is the logic-layer port for shipping.v1/GetQuote (RFC-0015
@@ -170,6 +175,16 @@ type CheckoutService struct {
 	// (nil = disabled; resolveCatalog falls back to Product's GetProducts).
 	prices  PriceFetcher
 	checker AvailabilityChecker
+	// canaryPct (0..100) is the share of USERS whose availability reads go to
+	// inventory once the source is `inventory` (RFC-0021 P3). Defaulted to 100 by
+	// the constructor, so the zero value can never silently mean "0% — send
+	// nobody to inventory" for a service that never called
+	// WithAvailabilityCanary. See canary.go for why the split is per user.
+	canaryPct int
+	// canarySalt keeps the bucket unguessable so the dial bounds exposure against
+	// adversarial traffic too — see userBucketHash. Empty is allowed (buckets are
+	// then offline-computable), which is the default.
+	canarySalt string
 }
 
 // WithQuoter wires the shipping GetQuote port (nil keeps the P2 0-fee stub —
@@ -196,6 +211,28 @@ func (s *CheckoutService) WithAvailabilitySource(source string, samplePct int, i
 	return s
 }
 
+// WithAvailabilityCanary sets the share of users whose availability reads go to
+// inventory while the source is `inventory` (RFC-0021 P3). 100 (the default) is
+// the pre-canary behaviour; 0 keeps every read on Product, which is the state an
+// operator flips the source in with before opening the dial.
+//
+// salt keys the per-user bucket (see userBucketHash); empty leaves buckets
+// effectively public, which is fine until the dial is opened.
+//
+// WIRING-TIME ONLY — call it before serving traffic, never afterwards. The fields
+// are plain (no atomics) because the only production caller runs once at startup;
+// calling it while requests are in flight is an unsynchronized write to an int AND
+// a string, which is a torn read, not merely a stale one. A future live-reload path
+// must convert these to atomics first.
+//
+// A separate builder rather than a fourth WithAvailabilitySource parameter: the
+// default is safe, so an unconfigured service behaves exactly as before.
+func (s *CheckoutService) WithAvailabilityCanary(pct int, salt string) *CheckoutService {
+	s.canaryPct = pct
+	s.canarySalt = salt
+	return s
+}
+
 // WithInventoryMode wires the phase-2 inventory-mode split-read dependencies
 // (RFC-0021 P2-5): Product's price authority + Inventory's availability gate.
 // They are only exercised when the source is `inventory`; nil keeps the
@@ -214,14 +251,27 @@ func (s *CheckoutService) WithInventoryMode(prices PriceFetcher, checker Availab
 // (AvailableQty >= requested) work unchanged. A CheckAvailability transport
 // error propagates as an error — the caller maps it to `ErrUpstream` (503),
 // NEVER to out-of-stock (fail-closed: a timeout is not a shortage).
-func (s *CheckoutService) resolveCatalog(ctx context.Context, lines []AvailabilityLine) ([]ProductInfo, error) {
+func (s *CheckoutService) resolveCatalog(ctx context.Context, userID string, lines []AvailabilityLine) ([]ProductInfo, error) {
 	ids := make([]string, len(lines))
 	for i, l := range lines {
 		ids[i] = l.SKUID
 	}
-	if s.availabilitySource != AvailabilitySourceInventory || s.prices == nil || s.checker == nil {
+	if s.availabilitySource != AvailabilitySourceInventory || s.prices == nil || s.checker == nil ||
+		!inCanary(s.canarySalt, userID, s.canaryPct) {
+		// The canary check is LAST so it only ever narrows inventory mode; it must
+		// not accidentally send a `product`/`shadow` source down a different path.
+		//
+		// Note the nil-dependency terms it sits behind: with the source set to
+		// `inventory` but a dependency unwired, this falls back to Product no
+		// matter what the dial says (WithInventoryMode's documented choice — a
+		// misconfigured flag must not take the read path down). So "100% means
+		// every user" is a statement about the DIAL, not a promise that inventory
+		// is reachable; checkout_availability_path_total is what shows which
+		// actually happened.
+		recordAvailabilityPath(ctx, availabilityPathProduct)
 		return s.products.GetProducts(ctx, ids)
 	}
+	recordAvailabilityPath(ctx, availabilityPathInventory)
 	// Inventory mode: Product prices + Inventory availability, fetched
 	// CONCURRENTLY (independent reads) so tail latency is the slower call, not
 	// the sum. Each goroutine recovers so a panic mapping a malformed reply
@@ -417,7 +467,13 @@ func NewCheckoutService(repo domain.SessionRepository, cart CartFetcher, product
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
-	return &CheckoutService{repo: repo, cart: cart, products: products, ttl: ttl, now: time.Now}
+	return &CheckoutService{
+		repo: repo, cart: cart, products: products, ttl: ttl, now: time.Now,
+		// 100 = no canary. Must be set here, not left to the zero value: 0 is a
+		// legitimate dial position ("flip the source, expose nobody yet"), so it
+		// cannot double as "unset".
+		canaryPct: fullCanaryPct,
+	}
 }
 
 // CreateSession snapshots the user's cart into a new session — or returns the
@@ -464,7 +520,7 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	}
 	// Product mode: one GetProducts. Inventory mode (P2-5): Product prices +
 	// Inventory availability, merged. A CheckAvailability failure → ErrUpstream.
-	infos, err := s.resolveCatalog(ctx, availLines)
+	infos, err := s.resolveCatalog(ctx, userID, availLines)
 	if err != nil {
 		span.RecordError(err)
 		return nil, false, ErrUpstream

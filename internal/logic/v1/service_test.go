@@ -236,9 +236,13 @@ func (f *fakeCart) GetCart(_ context.Context, _ string) ([]CartLine, error) { re
 type fakeProducts struct {
 	infos []ProductInfo
 	err   error
+	// calls counts GetProducts invocations, which is how the canary tests tell
+	// which authority actually answered a read.
+	calls int
 }
 
 func (f *fakeProducts) GetProducts(_ context.Context, _ []string) ([]ProductInfo, error) {
+	f.calls++
 	return f.infos, f.err
 }
 

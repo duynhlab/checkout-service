@@ -71,6 +71,25 @@ type CheckoutConfig struct {
 	// AvailabilityShadowSamplePct (0..100) throttles shadow-mode inventory
 	// reads - from CHECKOUT_AVAILABILITY_SHADOW_PCT env (default 100).
 	AvailabilityShadowSamplePct int
+	// AvailabilityCanaryPct (0..100) is the share of USERS whose availability
+	// reads go to inventory while AvailabilitySource is `inventory` - from
+	// CHECKOUT_AVAILABILITY_CANARY_PCT env (default 100 = no canary, the
+	// pre-canary behaviour of the `inventory` source).
+	//
+	// Sticky per user, not per request: a user's funnel spans CreateSession and
+	// Confirm, and splitting those across two authorities would invent
+	// stock disagreements rather than find them (RFC-0021 P3).
+	AvailabilityCanaryPct int
+	// AvailabilityCanarySalt makes the per-user canary bucket unguessable, so the
+	// percentage bounds exposure against adversarial traffic and not only honest
+	// traffic - from CHECKOUT_AVAILABILITY_CANARY_SALT env.
+	//
+	// Empty (the default) leaves buckets computable offline from a public
+	// algorithm and the caller's own subject claim: registration is open, so a
+	// caller could register until they land on the arm they want. Harmless before
+	// the dial is opened; set it before ramping. Changing it re-shuffles every
+	// user, so treat it as fixed for the life of a rollout.
+	AvailabilityCanarySalt string
 	// IdempotencyLockTakeover: how long a crashed confirm holds its
 	// idempotency-key lock before a same-key retry may take it over
 	// (pkg/idempotency stale-lock window). From IDEMPOTENCY_LOCK_TAKEOVER env.
@@ -160,17 +179,19 @@ func Load() *Config {
 			Env:     getEnv("ENV", "development"),
 		},
 		Checkout: CheckoutConfig{
-			SessionTTL:              time.Duration(getEnvDurationSeconds("SESSION_TTL_SECONDS", 1800)) * time.Second,
-			CartGRPCAddr:            getEnv("CART_GRPC_ADDR", "dns:///cart-grpc.cart.svc.cluster.local:9090"),
-			ProductGRPCAddr:         getEnv("PRODUCT_GRPC_ADDR", "dns:///product-grpc.product.svc.cluster.local:9090"),
-			OrderGRPCAddr:           getEnv("ORDER_GRPC_ADDR", "dns:///order-grpc.order.svc.cluster.local:9090"),
-			ShippingGRPCAddr:        getEnv("SHIPPING_GRPC_ADDR", "dns:///shipping-grpc.shipping.svc.cluster.local:9090"),
-			InventoryGRPCAddr:       getEnv("INVENTORY_GRPC_ADDR", "dns:///inventory-grpc.inventory.svc.cluster.local:9090"),
+			SessionTTL:        time.Duration(getEnvDurationSeconds("SESSION_TTL_SECONDS", 1800)) * time.Second,
+			CartGRPCAddr:      getEnv("CART_GRPC_ADDR", "dns:///cart-grpc.cart.svc.cluster.local:9090"),
+			ProductGRPCAddr:   getEnv("PRODUCT_GRPC_ADDR", "dns:///product-grpc.product.svc.cluster.local:9090"),
+			OrderGRPCAddr:     getEnv("ORDER_GRPC_ADDR", "dns:///order-grpc.order.svc.cluster.local:9090"),
+			ShippingGRPCAddr:  getEnv("SHIPPING_GRPC_ADDR", "dns:///shipping-grpc.shipping.svc.cluster.local:9090"),
+			InventoryGRPCAddr: getEnv("INVENTORY_GRPC_ADDR", "dns:///inventory-grpc.inventory.svc.cluster.local:9090"),
 			// Startup-validated enum (RFC-0021 P2-4, ADR-029): an invalid value
 			// fails fast rather than silently defaulting.
 			AvailabilitySource:          flagx.MustEnum("CHECKOUT_AVAILABILITY_SOURCE", "product", "product", "shadow", "inventory"),
 			AvailabilityShadowSamplePct: flagx.MustPercent("CHECKOUT_AVAILABILITY_SHADOW_PCT", 100),
-			IdempotencyLockTakeover: time.Duration(getEnvDurationSecondsWithMax("IDEMPOTENCY_LOCK_TAKEOVER", 90, 600)) * time.Second,
+			AvailabilityCanaryPct:       flagx.MustPercent("CHECKOUT_AVAILABILITY_CANARY_PCT", 100),
+			AvailabilityCanarySalt:      getEnv("CHECKOUT_AVAILABILITY_CANARY_SALT", ""),
+			IdempotencyLockTakeover:     time.Duration(getEnvDurationSecondsWithMax("IDEMPOTENCY_LOCK_TAKEOVER", 90, 600)) * time.Second,
 		},
 		Temporal: TemporalConfig{
 			HostPort:  getEnv("TEMPORAL_HOSTPORT", "temporal-frontend.temporal.svc.cluster.local:7233"),

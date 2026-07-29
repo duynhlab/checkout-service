@@ -358,7 +358,10 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 	// Product mode: GetProducts. Inventory mode (P2-5): Product prices +
 	// Inventory availability. An Inventory timeout/error surfaces here as
 	// ErrUpstream (503, retryable) — fail-closed, NEVER read as out-of-stock.
-	infos, err := s.resolveCatalog(ctx, availLines)
+	// session.UserID, not a plumbed-through argument: it is the SAME id
+	// CreateSession bucketed on, which is what keeps a user's whole funnel on one
+	// availability authority (see canary.go).
+	infos, err := s.resolveCatalog(ctx, session.UserID, availLines)
 	if err != nil || (len(ids) > 0 && len(infos) == 0) {
 		// Transport error — or a suspicious empty answer for a non-empty ask
 		// (degraded upstream must not read as "everything delisted"). Release

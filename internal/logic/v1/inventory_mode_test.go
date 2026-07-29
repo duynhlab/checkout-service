@@ -110,7 +110,7 @@ func TestResolveCatalog_ProductMode_UsesGetProducts(t *testing.T) {
 	// Default (product) source + inventory deps wired: must still use GetProducts.
 	svc := newSvc(&fakeRepo{}, &fakeCart{}, prods).WithInventoryMode(prices, checker)
 
-	out, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}})
+	out, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}})
 	if err != nil {
 		t.Fatalf("resolveCatalog error = %v", err)
 	}
@@ -125,7 +125,7 @@ func TestResolveCatalog_InventoryMode_SplitReads(t *testing.T) {
 	checker := &fakeChecker{res: AvailabilityResult{CanFulfill: true}}
 	svc := inventorySvc(prods, prices, checker)
 
-	out, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 2}})
+	out, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 2}})
 	if err != nil {
 		t.Fatalf("resolveCatalog error = %v", err)
 	}
@@ -144,7 +144,7 @@ func TestResolveCatalog_InventoryMode_CheckAvailabilityError_FailsClosed(t *test
 	checker := &fakeChecker{err: errors.New("inventory timeout")}
 	svc := inventorySvc(&fakeProducts{}, prices, checker)
 
-	out, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}})
+	out, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}})
 	if err == nil {
 		t.Fatal("CheckAvailability error must propagate (fail-closed), got nil")
 	}
@@ -158,7 +158,7 @@ func TestResolveCatalog_InventoryMode_PriceError(t *testing.T) {
 	checker := &fakeChecker{}
 	svc := inventorySvc(&fakeProducts{}, prices, checker)
 
-	if _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
+	if _, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
 		t.Fatal("BatchGetCurrentPrices error must propagate, got nil")
 	}
 	// Concurrent fetch: checker may or may not have been invoked, but its result
@@ -179,7 +179,7 @@ func TestResolveCatalog_InventoryMode_PanicRecoveredAsError(t *testing.T) {
 		WithAvailabilitySource(AvailabilitySourceInventory, 0, nil).
 		WithInventoryMode(&fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}, panicChecker{})
 
-	if _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
+	if _, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
 		t.Fatal("a panicking checker must be recovered into an error, got nil")
 	}
 }
