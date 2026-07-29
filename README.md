@@ -138,6 +138,31 @@ way to run the whole thing is the platform's
 ready-made audit scripts (sections A9–A10) that exercise this service end to
 end, confirm and promo flows included.
 
+### Availability read path (RFC-0021 migration)
+
+Where checkout reads stock availability from, and how that moves from
+product-service to inventory-service. All four are startup-validated, so a typo
+fails the process rather than reading as a default.
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `CHECKOUT_AVAILABILITY_SOURCE` | `product` | `product` \| `shadow` \| `inventory`. `shadow` keeps Product authoritative and additionally compares Inventory's answer in the background; `inventory` makes Inventory the availability gate (Product stays the price authority). |
+| `CHECKOUT_AVAILABILITY_SHADOW_PCT` | `100` | Share of operations that emit a shadow comparison in `shadow` mode. Purely observational. |
+| `CHECKOUT_AVAILABILITY_CANARY_PCT` | `100` | Share of **users** whose reads go to Inventory while the source is `inventory`. `100` is the pre-canary behaviour; `0` keeps every read on Product, which is the state to flip the source in with. |
+| `CHECKOUT_AVAILABILITY_CANARY_SALT` | *(empty)* | Keys the per-user bucket. Empty leaves buckets computable by anyone, so the percentage bounds honest traffic only — set it (as a Secret) before ramping, and keep it **identical across replicas and fixed for the whole rollout**: changing it re-shuffles every user's arm. Startup logs a fingerprint, never the value. |
+
+The dial is **sticky per user**: a user's whole funnel (create + confirm) uses one
+authority, because splitting those two reads would let a session be accepted as
+in-stock and then refused at confirm. Two caveats worth knowing before ramping:
+
+- Moving the dial while sessions are open can still split those sessions, and a
+  rolling restart runs two values at once. The worst outcome is the existing
+  requote (checkout never reserves stock), so space ramp steps by at least
+  `SESSION_TTL_SECONDS` or accept a few requotes.
+- `checkout_availability_path_total{path}` is the only view of **real** exposure —
+  read it rather than trusting the flag, since a dependency that is not wired
+  falls back to Product no matter what the dial says.
+
 ## Observability
 
 OpenTelemetry everything (traces, RED metrics, logs) pushed via the shared

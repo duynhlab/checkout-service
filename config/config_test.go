@@ -178,3 +178,44 @@ func TestValidateErrorMentionsField(t *testing.T) {
 		t.Errorf("expected error mentioning SERVICE_NAME, got %v", err)
 	}
 }
+
+// The canary dial must default to 100 — "no canary". A default of 0 would mean
+// that flipping CHECKOUT_AVAILABILITY_SOURCE to `inventory` silently kept every
+// read on Product, so an operator would watch a cutover that never happened.
+func TestLoad_AvailabilityCanaryDefaultsToFullyOpen(t *testing.T) {
+	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_PCT", "")
+	if got := Load().Checkout.AvailabilityCanaryPct; got != 100 {
+		t.Errorf("default AvailabilityCanaryPct = %d, want 100 — the pre-canary behaviour of the inventory source", got)
+	}
+}
+
+// 0 must be loadable and distinct from unset: it is the position an operator
+// flips the source in with, before exposing anybody.
+func TestLoad_AvailabilityCanaryAcceptsZero(t *testing.T) {
+	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_PCT", "0")
+	if got := Load().Checkout.AvailabilityCanaryPct; got != 0 {
+		t.Errorf("AvailabilityCanaryPct = %d with the env set to 0, want 0", got)
+	}
+}
+
+func TestLoad_AvailabilityCanaryReadsIntermediateValues(t *testing.T) {
+	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_PCT", "25")
+	if got := Load().Checkout.AvailabilityCanaryPct; got != 25 {
+		t.Errorf("AvailabilityCanaryPct = %d, want 25", got)
+	}
+}
+
+// The salt defaults to empty, which is a deliberate, documented choice: buckets
+// stay computable offline until an operator sets one. The test exists so the
+// default cannot change silently — a non-empty default baked into the repo would
+// look like protection while being just as computable.
+func TestLoad_AvailabilityCanarySalt(t *testing.T) {
+	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_SALT", "")
+	if got := Load().Checkout.AvailabilityCanarySalt; got != "" {
+		t.Errorf("default AvailabilityCanarySalt = %q, want empty", got)
+	}
+	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_SALT", "s3cret")
+	if got := Load().Checkout.AvailabilityCanarySalt; got != "s3cret" {
+		t.Errorf("AvailabilityCanarySalt = %q, want s3cret", got)
+	}
+}

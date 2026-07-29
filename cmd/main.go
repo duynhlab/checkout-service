@@ -246,11 +246,31 @@ func wireInventoryShadow(svc *logicv1.CheckoutService, cfg *config.Config, logge
 		return func() {}
 	}
 	inv := clients.NewInventoryClient(conn)
+
+	// The canary's assignment is a pure function of (key, user id), so every pod
+	// serving the same users MUST hold the same key — a differing one re-shuffles
+	// every user's arm, which is the silent split the sticky design exists to
+	// prevent. The key itself never reaches a log; its fingerprint does, so two
+	// pods can be compared. Warned, not fatal: an unkeyed deployment still works,
+	// it just cannot bound exposure against a caller who grinds their own subject
+	// claim until it lands on the arm they want.
+	fp := logicv1.SaltFingerprint(cfg.Checkout.AvailabilityCanarySalt)
+	if cfg.Checkout.AvailabilityCanaryPct > 0 && cfg.Checkout.AvailabilityCanaryPct < 100 && fp == "" {
+		logger.Warn("availability canary is partly open with NO key; the percentage bounds honest traffic only",
+			zap.Int("canary_pct", cfg.Checkout.AvailabilityCanaryPct),
+			zap.String("hint", "set CHECKOUT_AVAILABILITY_CANARY_SALT (a Secret, not a ConfigMap key) before ramping"))
+	}
+	logger.Info("availability read path configured",
+		zap.String("source", cfg.Checkout.AvailabilitySource),
+		zap.Int("canary_pct", cfg.Checkout.AvailabilityCanaryPct),
+		// Fingerprint, never the key. Empty = unkeyed.
+		zap.String("canary_key_fingerprint", fp))
 	svc.WithAvailabilitySource(
 		cfg.Checkout.AvailabilitySource,
 		cfg.Checkout.AvailabilityShadowSamplePct,
 		inv,
-	).WithInventoryMode(productClient, inv)
+	).WithInventoryMode(productClient, inv).
+		WithAvailabilityCanary(cfg.Checkout.AvailabilityCanaryPct, cfg.Checkout.AvailabilityCanarySalt)
 	return func() { closeConn(conn, logger, "inventory") }
 }
 
