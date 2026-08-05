@@ -49,7 +49,9 @@ func (c *CartClient) GetCart(ctx context.Context, userID string) ([]logicv1.Cart
 	return lines, nil
 }
 
-// ProductClient satisfies logicv1.ProductFetcher over product.v1/GetProducts.
+// ProductClient satisfies logicv1.PriceFetcher over
+// product.v1/BatchGetCurrentPrices. It is the PRICE authority only — availability
+// comes from inventory-service (RFC-0021 phase 4).
 type ProductClient struct {
 	c productv1.ProductServiceClient
 }
@@ -104,26 +106,8 @@ func (c *OrderClient) CreateOrder(ctx context.Context, userID string, items []do
 	return resp.GetOrderId(), resp.GetStatus(), nil
 }
 
-// GetProducts fetches the authoritative price/availability batch.
-func (c *ProductClient) GetProducts(ctx context.Context, ids []string) ([]logicv1.ProductInfo, error) {
-	resp, err := c.c.GetProducts(ctx, &productv1.GetProductsRequest{ProductIds: ids})
-	if err != nil {
-		return nil, err
-	}
-	infos := make([]logicv1.ProductInfo, 0, len(resp.GetProducts()))
-	for _, p := range resp.GetProducts() {
-		infos = append(infos, logicv1.ProductInfo{
-			ProductID:      p.GetProductId(),
-			Name:           p.GetName(),
-			UnitPriceMinor: p.GetPriceMinor(),
-			AvailableQty:   int(p.GetAvailableQty()),
-		})
-	}
-	return infos, nil
-}
-
-// BatchGetCurrentPrices fetches DB-truth prices — the price authority for
-// inventory mode (RFC-0021 P2-5). No availability: stock comes from Inventory.
+// BatchGetCurrentPrices fetches DB-truth prices — checkout's price authority.
+// No availability: stock comes from Inventory.
 func (c *ProductClient) BatchGetCurrentPrices(ctx context.Context, skuIDs []string) ([]logicv1.PriceInfo, error) {
 	resp, err := c.c.BatchGetCurrentPrices(ctx, &productv1.BatchGetCurrentPricesRequest{SkuIds: skuIDs})
 	if err != nil {
@@ -142,9 +126,10 @@ func (c *ProductClient) BatchGetCurrentPrices(ctx context.Context, skuIDs []stri
 	return out, nil
 }
 
-// InventoryClient satisfies logicv1.InventoryAvailabilityFetcher over
-// inventory.v1/BatchGetAvailability — RFC-0021 P2-4 shadow reads only (Product
-// stays the checkout authority in phase 2).
+// InventoryClient satisfies logicv1.AvailabilityChecker over
+// inventory.v1/CheckAvailability. Inventory is THE availability authority since
+// RFC-0021 phase 4 — there is no product-stock path to compare against or fall
+// back to any more.
 type InventoryClient struct {
 	c inventoryv1.InventoryServiceClient
 }
@@ -154,35 +139,9 @@ func NewInventoryClient(conn grpc.ClientConnInterface) *InventoryClient {
 	return &InventoryClient{c: inventoryv1.NewInventoryServiceClient(conn)}
 }
 
-// BatchGetAvailability fetches per-SKU availability for the phase-2 structural
-// shadow check. DestinationRegion is empty: single-warehouse today (P2-5 may
-// thread a region through). ATP stays int64 (no lossy narrowing); Known is true
-// only when inventory returned a DEFINITE status (in/low/out of stock) — an
-// UNKNOWN/UNSPECIFIED status means inventory has no data for the SKU (e.g.
-// backfill incomplete) and must not read as healthy.
-func (c *InventoryClient) BatchGetAvailability(ctx context.Context, skuIDs []string) ([]logicv1.SkuAvailability, error) {
-	resp, err := c.c.BatchGetAvailability(ctx, &inventoryv1.BatchGetAvailabilityRequest{SkuIds: skuIDs})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]logicv1.SkuAvailability, 0, len(resp.GetAvailabilities()))
-	for _, a := range resp.GetAvailabilities() {
-		st := a.GetStatus()
-		known := st == inventoryv1.AvailabilityStatus_AVAILABILITY_STATUS_IN_STOCK ||
-			st == inventoryv1.AvailabilityStatus_AVAILABILITY_STATUS_LOW_STOCK ||
-			st == inventoryv1.AvailabilityStatus_AVAILABILITY_STATUS_OUT_OF_STOCK
-		out = append(out, logicv1.SkuAvailability{
-			SKUID:        a.GetSkuId(),
-			AvailableQty: a.GetAvailableToPromise(),
-			Known:        known,
-		})
-	}
-	return out, nil
-}
-
 // CheckAvailability asks Inventory whether the whole basket can be fulfilled —
-// the availability gate for inventory mode (RFC-0021 P2-5). DestinationRegion is
-// empty: single-warehouse today.
+// checkout's availability gate. DestinationRegion is empty: single-warehouse
+// today.
 func (c *InventoryClient) CheckAvailability(ctx context.Context, items []logicv1.AvailabilityLine) (logicv1.AvailabilityResult, error) {
 	reqItems := make([]*inventoryv1.ReservationItem, 0, len(items))
 	for _, it := range items {

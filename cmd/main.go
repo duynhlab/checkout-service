@@ -112,7 +112,7 @@ func main() {
 		return
 	}
 	defer cleanup()
-	cartConn, productConn, orderConn, shippingConn := conns[0], conns[1], conns[2], conns[3]
+	cartConn, productConn, orderConn, shippingConn, inventoryConn := conns[0], conns[1], conns[2], conns[3], conns[4]
 
 	// Deadline-fencing invariant (RFC-0015 P2 confirm): a lock takeover must
 	// PROVE the previous owner is dead, which holds only when the takeover
@@ -125,20 +125,18 @@ func main() {
 	}
 
 	repo := postgres.NewSessionRepository(pool)
-	// One ProductClient instance serves both GetProducts (product mode) and
-	// BatchGetCurrentPrices (inventory-mode price authority, P2-5).
-	productClient := clients.NewProductClient(productConn)
+	// The catalog read is split by authority: product answers price,
+	// inventory answers availability (RFC-0021). Both are constructor
+	// arguments because neither is optional.
 	svc := logicv1.NewCheckoutService(repo,
 		clients.NewCartClient(cartConn),
-		productClient,
+		clients.NewProductClient(productConn),
+		clients.NewInventoryClient(inventoryConn),
 		cfg.Checkout.SessionTTL,
 	).WithConfirm(
 		idempotency.New(pool, cfg.Checkout.IdempotencyLockTakeover),
 		clients.NewOrderClient(orderConn),
 	).WithQuoter(clients.NewShippingClient(shippingConn))
-
-	// RFC-0021 P2-4: attach inventory shadow reads (no-op in product mode).
-	defer wireInventoryShadow(svc, cfg, logger, productClient)()
 
 	// Abandonment notifier (ADR-019): best-effort signals to the durable
 	// timer. Temporal being unreachable is NOT fatal — signals no-op (and
@@ -191,8 +189,8 @@ func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) 
 // that order) and returns a single cleanup for all of them. Inventory is dialed
 // separately and only in shadow/inventory mode (see main), so the default
 // product path stays inventory-independent.
-func dialEastWest(cfg *config.Config, logger *zap.Logger) ([4]*grpc.ClientConn, func(), bool) {
-	var conns [4]*grpc.ClientConn
+func dialEastWest(cfg *config.Config, logger *zap.Logger) ([5]*grpc.ClientConn, func(), bool) {
+	var conns [5]*grpc.ClientConn
 	targets := []struct {
 		name string
 		addr string
@@ -201,6 +199,11 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([4]*grpc.ClientConn, 
 		{"product", cfg.Checkout.ProductGRPCAddr},
 		{"order", cfg.Checkout.OrderGRPCAddr},
 		{"shipping", cfg.Checkout.ShippingGRPCAddr},
+		// The availability authority since RFC-0021 phase 4. Required, like the
+		// others: there is no product-stock path to fall back to, so a checkout
+		// that cannot reach inventory must fail its reads loudly rather than
+		// answer from somewhere else.
+		{"inventory", cfg.Checkout.InventoryGRPCAddr},
 	}
 	for i, tgt := range targets {
 		conn, err := grpcx.Dial(tgt.addr)
@@ -219,59 +222,6 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([4]*grpc.ClientConn, 
 		}
 	}
 	return conns, cleanup, true
-}
-
-// wireInventoryShadow dials + attaches the inventory client, but only when the
-// availability source is not product — so a bad INVENTORY_GRPC_ADDR can never
-// affect the default product path (RFC-0021 P2-4/P2-5). The inventory read path
-// is optional: a dial failure disables it and logs, never blocks checkout
-// startup. Wires both the shadow-compare fetcher (P2-4) and the inventory-mode
-// split-read deps (P2-5: Product prices via the shared productClient + Inventory
-// availability). Returns a cleanup that is a no-op unless a connection opened.
-func wireInventoryShadow(svc *logicv1.CheckoutService, cfg *config.Config, logger *zap.Logger, productClient *clients.ProductClient) func() {
-	if cfg.Checkout.AvailabilitySource == logicv1.AvailabilitySourceProduct {
-		return func() {}
-	}
-	conn, err := grpcx.Dial(cfg.Checkout.InventoryGRPCAddr)
-	if err != nil {
-		// inventory mode is a deliberate availability-authority choice: a dial
-		// failure must NOT silently degrade to product mode. Fail loud. shadow
-		// is optional telemetry, so there a dial failure just disables it.
-		if cfg.Checkout.AvailabilitySource == logicv1.AvailabilitySourceInventory {
-			logger.Fatal("inventory mode selected but inventory gRPC dial failed",
-				zap.String("addr", cfg.Checkout.InventoryGRPCAddr), zap.Error(err))
-		}
-		logger.Error("inventory shadow disabled: dial failed",
-			zap.String("addr", cfg.Checkout.InventoryGRPCAddr), zap.Error(err))
-		return func() {}
-	}
-	inv := clients.NewInventoryClient(conn)
-
-	// The canary's assignment is a pure function of (key, user id), so every pod
-	// serving the same users MUST hold the same key — a differing one re-shuffles
-	// every user's arm, which is the silent split the sticky design exists to
-	// prevent. The key itself never reaches a log; its fingerprint does, so two
-	// pods can be compared. Warned, not fatal: an unkeyed deployment still works,
-	// it just cannot bound exposure against a caller who grinds their own subject
-	// claim until it lands on the arm they want.
-	fp := logicv1.SaltFingerprint(cfg.Checkout.AvailabilityCanarySalt)
-	if cfg.Checkout.AvailabilityCanaryPct > 0 && cfg.Checkout.AvailabilityCanaryPct < 100 && fp == "" {
-		logger.Warn("availability canary is partly open with NO key; the percentage bounds honest traffic only",
-			zap.Int("canary_pct", cfg.Checkout.AvailabilityCanaryPct),
-			zap.String("hint", "set CHECKOUT_AVAILABILITY_CANARY_SALT (a Secret, not a ConfigMap key) before ramping"))
-	}
-	logger.Info("availability read path configured",
-		zap.String("source", cfg.Checkout.AvailabilitySource),
-		zap.Int("canary_pct", cfg.Checkout.AvailabilityCanaryPct),
-		// Fingerprint, never the key. Empty = unkeyed.
-		zap.String("canary_key_fingerprint", fp))
-	svc.WithAvailabilitySource(
-		cfg.Checkout.AvailabilitySource,
-		cfg.Checkout.AvailabilityShadowSamplePct,
-		inv,
-	).WithInventoryMode(productClient, inv).
-		WithAvailabilityCanary(cfg.Checkout.AvailabilityCanaryPct, cfg.Checkout.AvailabilityCanarySalt)
-	return func() { closeConn(conn, logger, "inventory") }
 }
 
 // initObservability wires the RFC-0014 OTel pipeline (traces, OTLP metrics,

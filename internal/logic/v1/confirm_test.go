@@ -184,10 +184,22 @@ func TestConfirm_StockShortageRequotes(t *testing.T) {
 	}
 }
 
+// A line the catalog no longer answers for is out-of-stock, not a transient.
+//
+// The session carries TWO lines on purpose. With one line, "delisted" and "the
+// upstream answered about nothing we asked for" are the same observation, and
+// revalidate deliberately resolves that ambiguity the retryable way (ErrUpstream —
+// a degraded upstream must not read as "everything delisted"). Two lines make the
+// answer non-empty, so the missing one is unambiguously delisted.
 func TestConfirm_DelistedLineIsStockUnavailable(t *testing.T) {
-	repo := &fakeRepo{byID: readySession()}
+	session := readySession()
+	session.Items = append(session.Items, domain.SessionItem{
+		ProductID: "2", ProductName: "Pad", Quantity: 1, UnitPriceMinor: 500, CartPriceMinor: 500,
+	})
+	repo := &fakeRepo{byID: session}
 	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
-	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "999", UnitPriceMinor: 1, AvailableQty: 1}}}
+	// Only line 2 is still in the catalog; line 1 is gone.
+	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "2", UnitPriceMinor: 500, AvailableQty: 1}}}
 
 	s, err := confirmSvc(repo, prods, idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
 	if !errors.Is(err, ErrStockUnavailable) {
@@ -195,6 +207,20 @@ func TestConfirm_DelistedLineIsStockUnavailable(t *testing.T) {
 	}
 	if !s.Items[0].PriceChanged || s.Items[0].UnitPriceMinor != 2999 {
 		t.Errorf("delisted line = %+v, want flagged with snapshot price kept", s.Items[0])
+	}
+}
+
+// The one-line case the test above avoids, asserted on purpose rather than left
+// implicit: an answer that covers nothing we asked for is treated as a degraded
+// upstream (retryable), NOT as a delisted basket.
+func TestConfirm_EmptyCatalogAnswerIsRetryable(t *testing.T) {
+	repo := &fakeRepo{byID: readySession()}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "999", UnitPriceMinor: 1, AvailableQty: 1}}}
+
+	_, err := confirmSvc(repo, prods, idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("err = %v, want ErrUpstream — an empty answer must not read as delisted", err)
 	}
 }
 

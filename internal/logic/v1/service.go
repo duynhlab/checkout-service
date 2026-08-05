@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand/v2"
-	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -48,29 +46,6 @@ type AbandonmentNotifier interface {
 // CartFetcher is the logic-layer port for the cart snapshot.
 type CartFetcher interface {
 	GetCart(ctx context.Context, userID string) ([]CartLine, error)
-}
-
-// ProductFetcher is the logic-layer port for price/stock re-validation.
-type ProductFetcher interface {
-	GetProducts(ctx context.Context, ids []string) ([]ProductInfo, error)
-}
-
-// SkuAvailability is inventory-service's availability view (from
-// inventory.v1/BatchGetAvailability). AvailableQty is the derived
-// available-to-promise (int64, no lossy narrowing); Known is true only when
-// inventory returned a definite status for the SKU (RFC-0021 P2-4 shadow reads).
-type SkuAvailability struct {
-	SKUID        string
-	AvailableQty int64
-	Known        bool
-}
-
-// InventoryAvailabilityFetcher is the logic-layer port for inventory-service's
-// availability, used ONLY for phase-2 shadow comparison — never for a checkout
-// decision in this phase (Product stays authoritative). Best-effort: a nil
-// fetcher or a non-shadow source disables it.
-type InventoryAvailabilityFetcher interface {
-	BatchGetAvailability(ctx context.Context, skuIDs []string) ([]SkuAvailability, error)
 }
 
 // PriceInfo is Product's price-only view (from product.v1/BatchGetCurrentPrices)
@@ -118,20 +93,6 @@ type AvailabilityChecker interface {
 	CheckAvailability(ctx context.Context, items []AvailabilityLine) (AvailabilityResult, error)
 }
 
-// Availability source modes for CHECKOUT_AVAILABILITY_SOURCE (RFC-0021 P2-4).
-// product: inventory is never called (default, current behavior). shadow:
-// inventory is called in parallel and compared, but Product decides. inventory:
-// reserved for P2-5 (inventory decides) — treated as product here.
-const (
-	AvailabilitySourceProduct   = "product"
-	AvailabilitySourceShadow    = "shadow"
-	AvailabilitySourceInventory = "inventory"
-
-	// fullCanaryPct is the canary dial fully open — every user reads from
-	// inventory. Also the default, so introducing the dial cannot change what the
-	// already-documented `inventory` source means.
-	fullCanaryPct = 100
-)
 
 // ShippingQuoter is the logic-layer port for shipping.v1/GetQuote (RFC-0015
 // P3): the fee authority for PUT …/shipping. ErrInvalidQuote marks an unknown
@@ -149,10 +110,9 @@ const defaultCurrency = "USD"
 
 // CheckoutService orchestrates checkout sessions.
 type CheckoutService struct {
-	repo     domain.SessionRepository
-	cart     CartFetcher
-	products ProductFetcher
-	ttl      time.Duration
+	repo domain.SessionRepository
+	cart CartFetcher
+	ttl  time.Duration
 	// now is injectable for lazy-expiry tests.
 	now func() time.Time
 	// P2 confirm dependencies, wired via WithConfirm (nil pre-P2).
@@ -162,29 +122,12 @@ type CheckoutService struct {
 	quoter ShippingQuoter
 	// P2 abandonment notifier, wired via WithAbandonment (nil = disabled).
 	notifier AbandonmentNotifier
-	// RFC-0021 P2-4 availability shadow reads, wired via WithAvailabilitySource
-	// (nil fetcher or non-"shadow" source = disabled — Product-only path).
-	availabilitySource string
-	availability       InventoryAvailabilityFetcher
-	// shadowSamplePct (0..100) throttles how many ops are shadowed; 100 = every op.
-	shadowSamplePct int
-	// shadowWG tracks in-flight async shadow-compares so tests can await them;
-	// the shadow path itself never blocks the request.
-	shadowWG sync.WaitGroup
-	// RFC-0021 P2-5 inventory-mode split reads, wired via WithInventoryMode
-	// (nil = disabled; resolveCatalog falls back to Product's GetProducts).
+	// The catalog read, split by authority since RFC-0021 phase 4 removed the
+	// product-stock path: prices from product (the price authority), availability
+	// from inventory (the stock authority). Both are REQUIRED — see
+	// NewCheckoutService for why they are not optional builders.
 	prices  PriceFetcher
 	checker AvailabilityChecker
-	// canaryPct (0..100) is the share of USERS whose availability reads go to
-	// inventory once the source is `inventory` (RFC-0021 P3). Defaulted to 100 by
-	// the constructor, so the zero value can never silently mean "0% — send
-	// nobody to inventory" for a service that never called
-	// WithAvailabilityCanary. See canary.go for why the split is per user.
-	canaryPct int
-	// canarySalt keeps the bucket unguessable so the dial bounds exposure against
-	// adversarial traffic too — see userBucketHash. Empty is allowed (buckets are
-	// then offline-computable), which is the default.
-	canarySalt string
 }
 
 // WithQuoter wires the shipping GetQuote port (nil keeps the P2 0-fee stub —
@@ -200,83 +143,27 @@ func (s *CheckoutService) WithAbandonment(n AbandonmentNotifier) *CheckoutServic
 	return s
 }
 
-// WithAvailabilitySource wires phase-2 inventory shadow reads (RFC-0021 P2-4).
-// source is the validated CHECKOUT_AVAILABILITY_SOURCE flag; samplePct (0..100)
-// throttles the shadow volume. A nil fetcher or a non-"shadow" source disables
-// the inventory call entirely (Product-only path).
-func (s *CheckoutService) WithAvailabilitySource(source string, samplePct int, inv InventoryAvailabilityFetcher) *CheckoutService {
-	s.availabilitySource = source
-	s.shadowSamplePct = samplePct
-	s.availability = inv
-	return s
-}
-
-// WithAvailabilityCanary sets the share of users whose availability reads go to
-// inventory while the source is `inventory` (RFC-0021 P3). 100 (the default) is
-// the pre-canary behaviour; 0 keeps every read on Product, which is the state an
-// operator flips the source in with before opening the dial.
+// resolveCatalog fetches per-line price + availability from the two authorities
+// CONCURRENTLY: product answers price (BatchGetCurrentPrices), inventory answers
+// availability (CheckAvailability). They are independent reads, so tail latency is
+// the slower call rather than the sum, and the result is merged into
+// `[]ProductInfo` so the snapshot/re-validation logic downstream is unchanged.
 //
-// salt keys the per-user bucket (see userBucketHash); empty leaves buckets
-// effectively public, which is fine until the dial is opened.
+// There is no product-availability path any more. RFC-0021 phase 4 deleted it,
+// and with it the source flag, the canary dial and the shadow compare: product's
+// stock column was frozen at the write cutover, so the fallback could only ever
+// have answered with a stale number. A read that CANNOT be right is worse than a
+// read that fails.
 //
-// WIRING-TIME ONLY — call it before serving traffic, never afterwards. The fields
-// are plain (no atomics) because the only production caller runs once at startup;
-// calling it while requests are in flight is an unsynchronized write to an int AND
-// a string, which is a torn read, not merely a stale one. A future live-reload path
-// must convert these to atomics first.
-//
-// A separate builder rather than a fourth WithAvailabilitySource parameter: the
-// default is safe, so an unconfigured service behaves exactly as before.
-func (s *CheckoutService) WithAvailabilityCanary(pct int, salt string) *CheckoutService {
-	s.canaryPct = pct
-	s.canarySalt = salt
-	return s
-}
-
-// WithInventoryMode wires the phase-2 inventory-mode split-read dependencies
-// (RFC-0021 P2-5): Product's price authority + Inventory's availability gate.
-// They are only exercised when the source is `inventory`; nil keeps the
-// Product-only path even if the flag is misconfigured.
-func (s *CheckoutService) WithInventoryMode(prices PriceFetcher, checker AvailabilityChecker) *CheckoutService {
-	s.prices = prices
-	s.checker = checker
-	return s
-}
-
-// resolveCatalog fetches per-line price + availability honoring the availability
-// source. product/shadow → one Product `GetProducts` (price+stock, today's
-// behavior; shadow-compare runs separately, async). inventory → Product
-// `BatchGetCurrentPrices` (price authority) + Inventory `CheckAvailability`
-// (availability gate), merged into `[]ProductInfo` so downstream stock checks
-// (AvailableQty >= requested) work unchanged. A CheckAvailability transport
-// error propagates as an error — the caller maps it to `ErrUpstream` (503),
-// NEVER to out-of-stock (fail-closed: a timeout is not a shortage).
-func (s *CheckoutService) resolveCatalog(ctx context.Context, userID string, lines []AvailabilityLine) ([]ProductInfo, error) {
+// Both goroutines recover, so a panic mapping a malformed reply becomes an error
+// rather than a process crash. Any transport error propagates — the caller maps it
+// to ErrUpstream (503), NEVER to out-of-stock: fail-closed, because a timeout is
+// not a shortage.
+func (s *CheckoutService) resolveCatalog(ctx context.Context, _ string, lines []AvailabilityLine) ([]ProductInfo, error) {
 	ids := make([]string, len(lines))
 	for i, l := range lines {
 		ids[i] = l.SKUID
 	}
-	if s.availabilitySource != AvailabilitySourceInventory || s.prices == nil || s.checker == nil ||
-		!inCanary(s.canarySalt, userID, s.canaryPct) {
-		// The canary check is LAST so it only ever narrows inventory mode; it must
-		// not accidentally send a `product`/`shadow` source down a different path.
-		//
-		// Note the nil-dependency terms it sits behind: with the source set to
-		// `inventory` but a dependency unwired, this falls back to Product no
-		// matter what the dial says (WithInventoryMode's documented choice — a
-		// misconfigured flag must not take the read path down). So "100% means
-		// every user" is a statement about the DIAL, not a promise that inventory
-		// is reachable; checkout_availability_path_total is what shows which
-		// actually happened.
-		recordAvailabilityPath(ctx, availabilityPathProduct)
-		return s.products.GetProducts(ctx, ids)
-	}
-	recordAvailabilityPath(ctx, availabilityPathInventory)
-	// Inventory mode: Product prices + Inventory availability, fetched
-	// CONCURRENTLY (independent reads) so tail latency is the slower call, not
-	// the sum. Each goroutine recovers so a panic mapping a malformed reply
-	// becomes an error, never a process crash. Any transport error propagates →
-	// caller maps to ErrUpstream (fail-closed: a timeout is never a shortage).
 	type priceRes struct {
 		infos []PriceInfo
 		err   error
@@ -361,118 +248,22 @@ func mergeCatalog(lines []AvailabilityLine, prices []PriceInfo, avail Availabili
 	return out
 }
 
-const (
-	// shadowCompareTimeout bounds the whole detached inventory read (created at
-	// admission, so scheduling delay counts against it too).
-	shadowCompareTimeout = 2 * time.Second
-	// shadowMaxInflight caps concurrent shadow compares so a slow inventory can
-	// never let goroutines/streams grow with request rate — excess is shed.
-	shadowMaxInflight = 32
-)
-
-// shadowSem is the process-wide admission bound for shadow compares. Buffered to
-// shadowMaxInflight; a full channel means "shed this one" (recorded "skipped").
-var shadowSem = make(chan struct{}, shadowMaxInflight)
-
-// maybeShadowCompare fires an availability shadow-compare against
-// inventory-service when the source is "shadow" (RFC-0021 P2-4). Fire-and-forget
-// on a detached, timeout-bounded, concurrency-capped, panic-safe goroutine: it
-// NEVER adds latency to, fails, crashes, or otherwise affects the caller's
-// request — it only emits inventory_shadow_compare_total{result}. Product stays
-// authoritative. ids is the SKU set just fetched.
-func (s *CheckoutService) maybeShadowCompare(ctx context.Context, ids []string) {
-	if s.availabilitySource != AvailabilitySourceShadow || s.availability == nil || len(ids) == 0 {
-		return
-	}
-	// Sample down the shadow volume (operator dial; 100 = every op).
-	//nolint:gosec // sampling decision for telemetry, not security-sensitive
-	if s.shadowSamplePct < 100 && rand.IntN(100) >= s.shadowSamplePct {
-		return
-	}
-	// Hard concurrency bound: shed load rather than pile up goroutines/streams
-	// when inventory is slow.
-	select {
-	case shadowSem <- struct{}{}:
-	default:
-		recordShadowCompare(ctx, "skipped")
-		return
-	}
-	skus := append([]string(nil), ids...)
-	// Detach from the request context (cancelled on handler return) but bound
-	// the whole thing — created HERE so time waiting to be scheduled also counts.
-	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), shadowCompareTimeout)
-
-	s.shadowWG.Add(1)
-	go func() {
-		defer s.shadowWG.Done()
-		defer cancel()
-		defer func() { <-shadowSem }()
-		// Best-effort contract: an unrecovered panic in ANY goroutine crashes
-		// the whole process, so a panic here (e.g. a nil deref mapping a
-		// malformed inventory reply) must be swallowed as a shadow "error".
-		defer func() {
-			if r := recover(); r != nil {
-				recordShadowCompare(context.Background(), "error")
-			}
-		}()
-
-		avails, err := s.availability.BatchGetAvailability(bg, skus)
-		if err != nil {
-			recordShadowCompare(bg, "error")
-			return
-		}
-		recordShadowCompare(bg, compareStructural(skus, avails))
-	}()
-}
-
-// compareStructural is the phase-2 shadow signal (RFC-0021 P2-4). It is
-// STRUCTURAL, not an exact-quantity compare: in phase 2 inventory is not yet
-// written (order writes land in phase 3), so its balances are the frozen
-// backfill snapshot and would legitimately drift from Product's live stock —
-// exact equality would be misleading. Instead it asks "does inventory KNOW every
-// requested SKU and answer sanely?", surfacing backfill/SKU-namespace gaps:
-//   - "missing"  — a requested SKU is absent from the inventory response
-//   - "unknown"  — a SKU is present but has no definite status, or negative ATP
-//   - "ok"       — every SKU present, definite status, non-negative ATP
-//
-// "missing" outranks "unknown" (a gap is the harder signal). Pure, no side effects.
-func compareStructural(ids []string, inventory []SkuAvailability) string {
-	inv := make(map[string]SkuAvailability, len(inventory))
-	for _, a := range inventory {
-		inv[a.SKUID] = a
-	}
-	unknown := false
-	for _, id := range ids {
-		a, ok := inv[id]
-		if !ok {
-			return "missing"
-		}
-		if !a.Known || a.AvailableQty < 0 {
-			unknown = true
-		}
-	}
-	if unknown {
-		return "unknown"
-	}
-	return "ok"
-}
-
-// awaitShadow blocks until all in-flight shadow-compares finish. Test-only
-// determinism helper; production never waits on best-effort telemetry.
-func (s *CheckoutService) awaitShadow() { s.shadowWG.Wait() }
-
 // NewCheckoutService wires the logic layer. ttl <= 0 falls back to
 // DefaultSessionTTL.
-func NewCheckoutService(repo domain.SessionRepository, cart CartFetcher, products ProductFetcher, ttl time.Duration) *CheckoutService {
+//
+// prices and checker are CONSTRUCTOR arguments, not builders, and that is the
+// point: the catalog read cannot happen without both, so a caller must not be
+// able to forget one. They used to be optional (WithInventoryMode), and a nil
+// dependency silently fell back to product's stock column — which RFC-0021
+// phase 4 froze and then removed. A required dependency that is missing should
+// fail at wiring time, loudly, not degrade into a read that cannot be right.
+func NewCheckoutService(repo domain.SessionRepository, cart CartFetcher,
+	prices PriceFetcher, checker AvailabilityChecker, ttl time.Duration) *CheckoutService {
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
 	return &CheckoutService{
-		repo: repo, cart: cart, products: products, ttl: ttl, now: time.Now,
-		// 100 = no canary. Must be set here, not left to the zero value: 0 is a
-		// legitimate dial position ("flip the source, expose nobody yet"), so it
-		// cannot double as "unset".
-		canaryPct: fullCanaryPct,
+		repo: repo, cart: cart, prices: prices, checker: checker, ttl: ttl, now: time.Now,
 	}
 }
 
@@ -513,13 +304,11 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	}
 
 	availLines := make([]AvailabilityLine, 0, len(lines))
-	ids := make([]string, 0, len(lines))
 	for _, l := range lines {
 		availLines = append(availLines, AvailabilityLine{SKUID: l.ProductID, Quantity: l.Quantity})
-		ids = append(ids, l.ProductID)
 	}
-	// Product mode: one GetProducts. Inventory mode (P2-5): Product prices +
-	// Inventory availability, merged. A CheckAvailability failure → ErrUpstream.
+	// Product prices + Inventory availability, merged. Either failing →
+	// ErrUpstream, never out-of-stock.
 	infos, err := s.resolveCatalog(ctx, userID, availLines)
 	if err != nil {
 		span.RecordError(err)
@@ -529,10 +318,6 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	for _, p := range infos {
 		byID[p.ProductID] = p
 	}
-	// RFC-0021 P2-4: shadow-compare availability vs inventory-service (no-op
-	// unless source=shadow). Best-effort, async — never affects this create.
-	s.maybeShadowCompare(ctx, ids)
-
 	items := make([]domain.SessionItem, 0, len(lines))
 	var subtotal int64
 	priceChanged := 0
