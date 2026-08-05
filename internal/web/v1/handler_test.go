@@ -233,11 +233,26 @@ func TestCreateSession_EmptyCartIs409(t *testing.T) {
 	}
 }
 
-func TestCreateSession_UpstreamDownIsOpaque500(t *testing.T) {
+// A dependency being down is 503 + Retry-After, not 500, and the body stays opaque.
+//
+// This test used to assert 500 (it was named ...IsOpaque500) and it was two
+// properties in one name: the opacity, which was the point, and the status, which
+// was incidental. 500 tells the client not to retry and tells on-call that checkout
+// is broken, when the truth is that cart, product or inventory is unreachable. The
+// confirm path always answered 503 here; create was inconsistent with it.
+//
+// RFC-0021 phase 4 is what made this worth fixing rather than noting: session create
+// now consults inventory as the availability authority, so an inventory outage
+// reaches this arm on the happy-path route. It was found by the local-stack e2e
+// audit, not here — a unit test can assert the logic error and still miss the status.
+func TestCreateSession_UpstreamDownIsRetryableAndOpaque(t *testing.T) {
 	r := newRouter(&fakeRepo{}, &fakeCart{err: errors.New("dial tcp 10.1.2.3: refused")}, &fakeProducts{}, "7")
 	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/checkout/sessions", "")
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 — a dependency outage is retryable, not a checkout bug", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got == "" {
+		t.Error("503 without Retry-After: the client is told to retry but not when")
 	}
 	if strings.Contains(rec.Body.String(), "10.1.2.3") {
 		t.Errorf("body leaks upstream internals: %s", rec.Body.String())

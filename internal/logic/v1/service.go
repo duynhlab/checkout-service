@@ -293,7 +293,7 @@ func aggregateBySKU(lines []AvailabilityLine) []AvailabilityLine {
 // basket CAN be fulfilled, a stray shortage still blocks that line (defense
 // against a contradictory reply). Only requested, sellable, correctly-priced
 // SKUs become entries; anything else reads as delisted (omitted, like
-// GetProducts omitting a SKU). A cleared line gets AvailableQty = requested so
+// a priced row simply being absent). A cleared line gets AvailableQty = requested so
 // the existing `requested > AvailableQty` shortage test passes it.
 func mergeCatalog(lines []AvailabilityLine, prices []PriceInfo, avail AvailabilityResult) []ProductInfo {
 	reqByID := make(map[string]int, len(lines))
@@ -309,7 +309,7 @@ func mergeCatalog(lines []AvailabilityLine, prices []PriceInfo, avail Availabili
 		req, requested := reqByID[p.ProductID]
 		if !requested || !p.Sellable || (p.Currency != "" && p.Currency != defaultCurrency) {
 			// Not asked for, unsellable, or a currency we can't charge as USD:
-			// omit ⇒ reads as delisted, exactly like GetProducts leaving it out.
+			// omit ⇒ reads as delisted, the same as an absent priced row.
 			continue
 		}
 		available := req // cleared ⇒ AvailableQty == requested (passes the gate)

@@ -92,8 +92,18 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		case errors.Is(err, logicv1.ErrEmptyCart):
 			httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "Cart is empty")
 		case errors.Is(err, logicv1.ErrUpstream):
+			// 503, not 500. A dependency being down is not a bug in checkout, and
+			// the difference is not cosmetic: 500 tells the client "do not retry"
+			// and tells on-call "checkout is broken", when the truth is "cart,
+			// product or inventory is unreachable". Mirrors the confirm path.
+			//
+			// This became materially more reachable in RFC-0021 phase 4: session
+			// create now consults inventory (the availability authority), so an
+			// inventory outage reaches this arm. Found by e2e, not by unit tests —
+			// they assert the logic-layer error, not the status code.
+			c.Header("Retry-After", "2")
 			logger.Error("Session create upstream failure", zap.Error(err))
-			httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
+			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
 		default:
 			logger.Error("Session create failed", zap.Error(err))
 			httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
