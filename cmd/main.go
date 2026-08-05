@@ -1,6 +1,7 @@
 // checkout-service — RFC-0015: the session/UX orchestrator between the SPA
 // and order-service. Client-only on gRPC (no server): it dials cart
-// (item-list authority), product (price authority), and order (the P2
+// (item-list authority), product (price authority), inventory (availability
+// authority, RFC-0021 phase 4), shipping (fee authority) and order (the P2
 // confirm handoff). Subcommands: `migrate` applies the embedded schema
 // migrations; `worker` runs the Temporal worker for the
 // AbandonedCheckoutWorkflow (ADR-019). No `seed` — checkout has no demo data.
@@ -185,10 +186,12 @@ func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) 
 	}
 }
 
-// dialEastWest opens the cart/product/order/shipping client connections (in
-// that order) and returns a single cleanup for all of them. Inventory is dialed
-// separately and only in shadow/inventory mode (see main), so the default
-// product path stays inventory-independent.
+// dialEastWest opens the cart/product/order/shipping/inventory client connections
+// (in that order) and returns a single cleanup for all of them.
+//
+// Inventory is in the list, not dialled separately as it was during the RFC-0021
+// migration: it is the availability authority now, so a checkout that cannot reach
+// it has no second answer to fall back to.
 func dialEastWest(cfg *config.Config, logger *zap.Logger) ([5]*grpc.ClientConn, func(), bool) {
 	var conns [5]*grpc.ClientConn
 	targets := []struct {

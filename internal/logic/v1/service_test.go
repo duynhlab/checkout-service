@@ -243,13 +243,10 @@ func (f *fakeCart) GetCart(_ context.Context, _ string) ([]CartLine, error) { re
 // disagreeing — use fakePrices/fakeChecker directly (inventory_mode_test.go).
 type fakeProducts struct {
 	infos []ProductInfo
-	err   error
-	// calls counts price-fetch invocations, one per catalog read.
-	calls int
+	err error
 }
 
 func (f *fakeProducts) BatchGetCurrentPrices(_ context.Context, _ []string) ([]PriceInfo, error) {
-	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}

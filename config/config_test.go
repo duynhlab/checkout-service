@@ -67,7 +67,37 @@ func validConfig() *Config {
 	c.Profiling = ProfilingConfig{Enabled: true, Endpoint: "pyro:4040", ServiceName: "shipping"}
 	c.Logging = LoggingConfig{Level: "info", Format: "json"}
 	c.Database = DatabaseConfig{} // Host empty → database validation skipped
+	// The two authorities checkout cannot work without: product answers price,
+	// inventory answers availability. Empty is a startup error, not a lazy
+	// per-call failure that reads as an outage (RFC-0021 phase 4).
+	c.Checkout = CheckoutConfig{
+		ProductGRPCAddr:   "dns:///product:9090",
+		InventoryGRPCAddr: "dns:///inventory:9090",
+	}
 	return c
+}
+
+// The availability authority has no fallback since RFC-0021 phase 4, and
+// grpcx.Dial is lazy — so an empty address would surface as a permanent 503 that
+// looks exactly like inventory being down. It must fail at startup instead.
+func TestValidate_RequiresBothCatalogAuthorities(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"no inventory", func(c *Config) { c.Checkout.InventoryGRPCAddr = "" }, "INVENTORY_GRPC_ADDR"},
+		{"no product", func(c *Config) { c.Checkout.ProductGRPCAddr = "" }, "PRODUCT_GRPC_ADDR"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validConfig()
+			tc.mut(c)
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Validate() = %v, want an error naming %s", err, tc.want)
+			}
+		})
+	}
 }
 
 func TestValidate(t *testing.T) {

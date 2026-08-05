@@ -26,12 +26,20 @@ type CartLine struct {
 	CartPriceMinor int64
 }
 
-// ProductInfo is the price/stock authority view (from product.v1/GetProducts).
+// ProductInfo is the MERGED per-line catalog view the snapshot and re-validation
+// logic consumes: price from product, availability from inventory.
 type ProductInfo struct {
 	ProductID      string
 	Name           string
 	UnitPriceMinor int64
-	AvailableQty   int
+	// AvailableQty is a GATE, not a quantity, and the name is kept only because
+	// the re-validation comparison reads naturally: mergeCatalog sets it to the
+	// requested amount when inventory cleared the line and 0 when it did not, so
+	// the only values are 0 and requested. Inventory's real available-to-promise
+	// is deliberately NOT carried here — a "only 3 left" badge built on this field
+	// would be silently wrong. If a caller ever needs the real figure, take it
+	// from AvailabilityResult.Shortages rather than widening this.
+	AvailableQty int
 }
 
 // AbandonmentNotifier is the logic-layer port for the abandonment-workflow
@@ -92,7 +100,6 @@ type AvailabilityResult struct {
 type AvailabilityChecker interface {
 	CheckAvailability(ctx context.Context, items []AvailabilityLine) (AvailabilityResult, error)
 }
-
 
 // ShippingQuoter is the logic-layer port for shipping.v1/GetQuote (RFC-0015
 // P3): the fee authority for PUT …/shipping. ErrInvalidQuote marks an unknown
@@ -159,11 +166,38 @@ func (s *CheckoutService) WithAbandonment(n AbandonmentNotifier) *CheckoutServic
 // rather than a process crash. Any transport error propagates — the caller maps it
 // to ErrUpstream (503), NEVER to out-of-stock: fail-closed, because a timeout is
 // not a shortage.
-func (s *CheckoutService) resolveCatalog(ctx context.Context, _ string, lines []AvailabilityLine) ([]ProductInfo, error) {
+// answered reports whether product returned a priced row for at least one
+// REQUESTED sku. It is separate from len(infos) on purpose, and the exact wording
+// matters twice over:
+//
+//   - not len(infos), because mergeCatalog filters unsellable and wrong-currency
+//     lines. An empty merged result can mean "the upstream told us nothing"
+//     (degraded → retryable) or "the upstream told us, and every line is
+//     unsellable" (definite → requote). Collapsing those is how a deterministic
+//     answer became a 503 asking the shopper to retry something that cannot
+//     succeed.
+//   - not len(prices), because a reply that carries only rows we did not ask about
+//     has told us nothing about this basket. That is a malformed upstream, not a
+//     delisted basket.
+func (s *CheckoutService) resolveCatalog(ctx context.Context, lines []AvailabilityLine) (infos []ProductInfo, answered bool, err error) {
 	ids := make([]string, len(lines))
 	for i, l := range lines {
 		ids[i] = l.SKUID
 	}
+	// One SKU may appear on several lines. The availability ask is AGGREGATED per
+	// SKU, because inventory answers per requested item: two lines of 3 against 4
+	// in stock would otherwise each pass on its own and the basket would clear for
+	// 6 units of a 4-unit SKU. The merge back onto lines is unchanged — a blocked
+	// SKU blocks every line carrying it.
+	asked := aggregateBySKU(lines)
+
+	// The two reads share a cancellable context so the FIRST error stops its
+	// sibling. Without it a hung upstream holds the whole confirm deadline (15 s)
+	// even though the answer is already known to be an error — and burning that
+	// deadline is what later makes the detached idempotency release necessary.
+	readCtx, cancelReads := context.WithCancel(ctx)
+	defer cancelReads()
+
 	type priceRes struct {
 		infos []PriceInfo
 		err   error
@@ -180,7 +214,10 @@ func (s *CheckoutService) resolveCatalog(ctx context.Context, _ string, lines []
 				pc <- priceRes{err: fmt.Errorf("price fetch panicked: %v", r)}
 			}
 		}()
-		infos, err := s.prices.BatchGetCurrentPrices(ctx, ids)
+		infos, err := s.prices.BatchGetCurrentPrices(readCtx, ids)
+		if err != nil {
+			cancelReads()
+		}
 		pc <- priceRes{infos: infos, err: err}
 	}()
 	go func() {
@@ -189,17 +226,60 @@ func (s *CheckoutService) resolveCatalog(ctx context.Context, _ string, lines []
 				ac <- availRes{err: fmt.Errorf("availability check panicked: %v", r)}
 			}
 		}()
-		res, err := s.checker.CheckAvailability(ctx, lines)
+		res, err := s.checker.CheckAvailability(readCtx, asked)
+		if err != nil {
+			cancelReads()
+		}
 		ac <- availRes{res: res, err: err}
 	}()
 	pr, ar := <-pc, <-ac
+	switch {
+	case ar.err != nil:
+		recordAvailabilityCheck(ctx, availabilityError)
+	case ar.res.CanFulfill:
+		recordAvailabilityCheck(ctx, availabilityOK)
+	default:
+		recordAvailabilityCheck(ctx, availabilityShortage)
+	}
 	if pr.err != nil {
-		return nil, pr.err
+		return nil, false, pr.err
 	}
 	if ar.err != nil {
-		return nil, ar.err
+		return nil, false, ar.err
 	}
-	return mergeCatalog(lines, pr.infos, ar.res), nil
+	return mergeCatalog(lines, pr.infos, ar.res), pricedAnyRequested(asked, pr.infos), nil
+}
+
+// pricedAnyRequested reports whether the price reply covers at least one sku that
+// was actually asked for.
+func pricedAnyRequested(asked []AvailabilityLine, prices []PriceInfo) bool {
+	want := make(map[string]struct{}, len(asked))
+	for _, a := range asked {
+		want[a.SKUID] = struct{}{}
+	}
+	for _, p := range prices {
+		if _, ok := want[p.ProductID]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// aggregateBySKU collapses repeated lines into one requested quantity per SKU,
+// preserving first-seen order so the ask is deterministic (a map iteration would
+// make the request payload vary run to run for no reason).
+func aggregateBySKU(lines []AvailabilityLine) []AvailabilityLine {
+	idx := make(map[string]int, len(lines))
+	out := make([]AvailabilityLine, 0, len(lines))
+	for _, l := range lines {
+		if i, seen := idx[l.SKUID]; seen {
+			out[i].Quantity += l.Quantity
+			continue
+		}
+		idx[l.SKUID] = len(out)
+		out = append(out, l)
+	}
+	return out
 }
 
 // mergeCatalog reshapes split inventory-mode reads into the ProductInfo view the
@@ -259,6 +339,14 @@ func mergeCatalog(lines []AvailabilityLine, prices []PriceInfo, avail Availabili
 // fail at wiring time, loudly, not degrade into a read that cannot be right.
 func NewCheckoutService(repo domain.SessionRepository, cart CartFetcher,
 	prices PriceFetcher, checker AvailabilityChecker, ttl time.Duration) *CheckoutService {
+	// Panic, not a returned error: this runs once at wiring time, and the commit
+	// that made these required promised loudly-at-startup rather than degraded.
+	// Without the check a nil dependency compiles, the service looks healthy, and
+	// the first request nil-derefs inside a recovered goroutine — arriving at the
+	// caller as a generic ErrUpstream, indistinguishable from an inventory outage.
+	if prices == nil || checker == nil {
+		panic("checkout: NewCheckoutService requires both a price fetcher and an availability checker")
+	}
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
@@ -309,7 +397,13 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	}
 	// Product prices + Inventory availability, merged. Either failing →
 	// ErrUpstream, never out-of-stock.
-	infos, err := s.resolveCatalog(ctx, userID, availLines)
+	//
+	// `answered` is ignored here on purpose, unlike in revalidate: creating a
+	// session off an empty catalog answer produces a snapshot whose every line is
+	// flagged, which the SPA renders as "these are gone" — annoying but honest, and
+	// the shopper can still edit the cart. At CONFIRM the same input must not be
+	// treated as definite, because that path takes money.
+	infos, _, err := s.resolveCatalog(ctx, availLines)
 	if err != nil {
 		span.RecordError(err)
 		return nil, false, ErrUpstream

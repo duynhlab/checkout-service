@@ -211,12 +211,31 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateProfiling()...)
 	errs = append(errs, c.validateLogging()...)
 	errs = append(errs, c.validateDatabase()...)
+	errs = append(errs, c.validateCheckout()...)
 
 	if len(errs) > 0 {
 		return fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errs, "\n  - "))
 	}
 
 	return nil
+}
+
+// validateCheckout guards the east-west targets checkout cannot work without.
+//
+// INVENTORY_GRPC_ADDR is here because grpcx.Dial is LAZY: an empty or wrong target
+// does not fail at startup, it fails per call — and an availability call that fails
+// is answered as ErrUpstream, which looks exactly like inventory being down. Since
+// RFC-0021 phase 4 there is no second authority to fall back to, so a missing
+// address must be a startup error rather than a permanent 503 nobody can diagnose.
+func (c *Config) validateCheckout() []string {
+	var errs []string
+	if c.Checkout.InventoryGRPCAddr == "" {
+		errs = append(errs, "INVENTORY_GRPC_ADDR is required: inventory is the availability authority and there is no fallback")
+	}
+	if c.Checkout.ProductGRPCAddr == "" {
+		errs = append(errs, "PRODUCT_GRPC_ADDR is required: product is the price authority")
+	}
+	return errs
 }
 
 func (c *Config) validateService() []string {

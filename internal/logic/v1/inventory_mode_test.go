@@ -110,7 +110,7 @@ func TestResolveCatalog_SplitReads(t *testing.T) {
 	checker := &fakeChecker{res: AvailabilityResult{CanFulfill: true}}
 	svc := splitSvc(prices, checker)
 
-	out, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 2}})
+	out, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 2}})
 	if err != nil {
 		t.Fatalf("resolveCatalog error = %v", err)
 	}
@@ -129,7 +129,7 @@ func TestResolveCatalog_CheckAvailabilityError_FailsClosed(t *testing.T) {
 	checker := &fakeChecker{err: errors.New("inventory timeout")}
 	svc := splitSvc(prices, checker)
 
-	out, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}})
+	out, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}})
 	if err == nil {
 		t.Fatal("CheckAvailability error must propagate (fail-closed), got nil")
 	}
@@ -143,7 +143,7 @@ func TestResolveCatalog_PriceError(t *testing.T) {
 	checker := &fakeChecker{}
 	svc := splitSvc(prices, checker)
 
-	if _, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
+	if _, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
 		t.Fatal("BatchGetCurrentPrices error must propagate, got nil")
 	}
 	// Concurrent fetch: checker may or may not have been invoked, but its result
@@ -163,7 +163,7 @@ func TestResolveCatalog_PanicRecoveredAsError(t *testing.T) {
 	svc := NewCheckoutService(&fakeRepo{}, &fakeCart{},
 		&fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}, panicChecker{}, time.Minute)
 
-	if _, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
+	if _, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
 		t.Fatal("a panicking checker must be recovered into an error, got nil")
 	}
 }

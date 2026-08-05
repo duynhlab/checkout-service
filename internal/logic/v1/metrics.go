@@ -43,13 +43,38 @@ var (
 		metric.WithDescription("Promo redemptions counted at confirm (P4)"))
 	promoRejectedCounter, _ = meter.Int64Counter("checkout.promo.rejected",
 		metric.WithDescription("Promo rejections at the authoritative confirm gate, by reason"))
+	// The availability authority's own signal. It replaces two migration-era
+	// counters (checkout_availability_path_total, inventory_shadow_compare_total)
+	// that phase 4 made meaningless — but it is NOT their replacement in kind:
+	// those measured WHICH authority answered and whether two agreed. With one
+	// authority the only questions left are "is inventory answering" and "is it
+	// blocking baskets", and nothing else could answer them:
+	// checkout_price_changed_total lumps PRICE_CHANGED with STOCK_UNAVAILABLE, and
+	// an availability error is laundered into a generic ErrUpstream 503 that looks
+	// like any other dependency failure.
+	//
+	// result is bounded: ok (basket fulfillable), shortage (inventory said no —
+	// a business answer), error (transport/timeout — fail-closed to 503, NEVER
+	// read as a shortage). No sku or user labels.
+	availabilityCheckCounter, _ = meter.Int64Counter("checkout.availability.check",
+		metric.WithDescription("Inventory availability checks by outcome (RFC-0021 phase 4: inventory is the only authority)"))
 )
 
-// No availability-path or shadow-compare metrics: RFC-0021 phase 4 left ONE
-// authority for availability, so a "which path" counter could only ever report a
-// constant, and there is no second answer left to shadow-compare against. A
-// counter with one possible value is not a signal — it is a series someone will
-// eventually build an alert on.
+// Availability check outcomes — bounded metric labels.
+const (
+	availabilityOK       = "ok"
+	availabilityShortage = "shortage"
+	availabilityError    = "error"
+)
+
+// recordAvailabilityCheck counts one inventory availability answer.
+//
+// Counted where the ANSWER is known, not where the read is routed: with a single
+// authority "who did we ask" is a constant, and what on-call needs instead is
+// whether that authority is answering and whether it is refusing baskets.
+func recordAvailabilityCheck(ctx context.Context, result string) {
+	availabilityCheckCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+}
 
 // recordPromoRejected counts a confirm-gate rejection with its bounded reason.
 func recordPromoRejected(ctx context.Context, err error) {

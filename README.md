@@ -95,6 +95,7 @@ the service and between services money is integer cents.
 |---------|-----|-----|
 | cart | gRPC `GetCart` (read-only) | What's in your cart — items and quantities |
 | product | gRPC `GetProducts` | The real, current price and stock (skips the browse cache on purpose) |
+| inventory | gRPC `CheckAvailability` | The availability authority — required; no fallback exists |
 | shipping | gRPC `GetQuote` | The authoritative shipping fee for your address + method |
 | order | gRPC `CreateOrder` | Places the order once you confirm (with subtotal, fee, tax and discount all carried across) — order-service stays the only place orders are created |
 | Temporal | SDK (`checkout` task queue) | The abandonment timer; the `worker` subcommand of this same binary runs the workflow |
@@ -163,6 +164,18 @@ and no exposure to ramp.
 timeout maps to `ErrUpstream` (503, retryable) and *never* to out-of-stock — a
 timeout is not a shortage. Same at confirm: an answer that covers nothing we asked
 for reads as a degraded upstream, not as a delisted basket.
+
+But a **definite** answer must requote, not retry. An unsellable or wrong-currency
+line is filtered out of the merged view, and treating that empty result as a degraded
+upstream answers 503 "retry with the same key" to a condition that can never change —
+on a session with no way out of `confirming`. So the retryable/definite decision is
+made on whether product priced any *requested* sku, not on how many lines survived
+filtering.
+
+**Signal:** `checkout_availability_check_total{result="ok|shortage|error"}`. It is the
+only thing that can distinguish "inventory is refusing baskets" from "inventory is
+down": `checkout_price_changed_total` lumps `PRICE_CHANGED` with `STOCK_UNAVAILABLE`,
+and an availability failure is otherwise laundered into a generic 503.
 
 ## Observability
 
