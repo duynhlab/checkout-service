@@ -233,21 +233,60 @@ type fakeCart struct {
 
 func (f *fakeCart) GetCart(_ context.Context, _ string) ([]CartLine, error) { return f.lines, f.err }
 
+// fakeProducts stands in for BOTH halves of the split catalog read: it satisfies
+// PriceFetcher and AvailabilityChecker from one `infos []ProductInfo` fixture.
+//
+// That shape is deliberate rather than lazy. ProductInfo is still exactly what the
+// logic layer consumes after the merge, so a test that only cares about the
+// downstream behaviour should not have to spell out two upstream payloads and keep
+// them consistent. Tests that care about the SPLIT — one authority failing, the two
+// disagreeing — use fakePrices/fakeChecker directly (inventory_mode_test.go).
 type fakeProducts struct {
 	infos []ProductInfo
-	err   error
-	// calls counts GetProducts invocations, which is how the canary tests tell
-	// which authority actually answered a read.
-	calls int
+	err error
 }
 
-func (f *fakeProducts) GetProducts(_ context.Context, _ []string) ([]ProductInfo, error) {
-	f.calls++
-	return f.infos, f.err
+func (f *fakeProducts) BatchGetCurrentPrices(_ context.Context, _ []string) ([]PriceInfo, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]PriceInfo, 0, len(f.infos))
+	for _, i := range f.infos {
+		out = append(out, PriceInfo{
+			ProductID: i.ProductID, Name: i.Name,
+			UnitPriceMinor: i.UnitPriceMinor, Sellable: true, Currency: "USD",
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeProducts) CheckAvailability(_ context.Context, lines []AvailabilityLine) (AvailabilityResult, error) {
+	if f.err != nil {
+		return AvailabilityResult{}, f.err
+	}
+	qty := make(map[string]int, len(f.infos))
+	for _, i := range f.infos {
+		qty[i.ProductID] = i.AvailableQty
+	}
+	// Mirror the real gate: a basket is fulfillable only if every requested line
+	// is covered, and a covered basket reports no shortages. mergeCatalog blocks
+	// EVERY line when CanFulfill is false, so the fixture must not fake a
+	// per-line pass on an unfulfillable basket.
+	res := AvailabilityResult{CanFulfill: true}
+	for _, l := range lines {
+		have := qty[l.SKUID]
+		if have < l.Quantity {
+			res.CanFulfill = false
+			res.Shortages = append(res.Shortages, Shortage{
+				SKUID: l.SKUID, Requested: int64(l.Quantity), AvailableToPromise: int64(have),
+			})
+		}
+	}
+	return res, nil
 }
 
 func newSvc(repo *fakeRepo, cart *fakeCart, prods *fakeProducts) *CheckoutService {
-	return NewCheckoutService(repo, cart, prods, time.Minute)
+	return NewCheckoutService(repo, cart, prods, prods, time.Minute)
 }
 
 func liveSession(status domain.SessionStatus) *domain.Session {

@@ -43,53 +43,37 @@ var (
 		metric.WithDescription("Promo redemptions counted at confirm (P4)"))
 	promoRejectedCounter, _ = meter.Int64Counter("checkout.promo.rejected",
 		metric.WithDescription("Promo rejections at the authoritative confirm gate, by reason"))
-	// RFC-0021 P2-4: one increment per availability shadow-compare (create or
-	// confirm). result ∈ {ok,missing,unknown,error,skipped} — a STRUCTURAL check
-	// (does inventory know every SKU & answer sanely), not an exact-qty compare,
-	// since inventory is unwritten until phase 3. Bounded label only — no
-	// sku/user/order ids. Renders as inventory_shadow_compare_total{result}.
-	shadowCompareCounter, _ = meter.Int64Counter("inventory.shadow.compare",
-		metric.WithDescription("Checkout availability shadow-compares vs inventory-service (RFC-0021 P2-4), by result"))
-	// RFC-0021 P3: which authority an availability read was ROUTED to. One
-	// increment per resolveCatalog call, so the canary's REAL exposure is
-	// measurable instead of inferred from the flag — a dial set to 50 that is
-	// bucketing badly, or a source flip that silently kept every read on Product,
-	// both show up here and nowhere else. Bounded to two values.
+	// The availability authority's own signal. It replaces two migration-era
+	// counters (checkout_availability_path_total, inventory_shadow_compare_total)
+	// that phase 4 made meaningless — but it is NOT their replacement in kind:
+	// those measured WHICH authority answered and whether two agreed. With one
+	// authority the only questions left are "is inventory answering" and "is it
+	// blocking baskets", and nothing else could answer them:
+	// checkout_price_changed_total lumps PRICE_CHANGED with STOCK_UNAVAILABLE, and
+	// an availability error is laundered into a generic ErrUpstream 503 that looks
+	// like any other dependency failure.
 	//
-	// READ-weighted, while the dial is USER-weighted: a funnel emits two reads
-	// (create + the confirm revalidate) and the confirm read is skipped on
-	// idempotent re-entry, so the ratio here approximates the dial only when both
-	// cohorts have similar reads-per-user. Good enough to spot "the flip did
-	// nothing" or "exposure is far off the dial"; not a measurement of the share of
-	// USERS.
-	//
-	// Counted at the ROUTING decision, before the upstream answers, and that is
-	// deliberate: the question this metric exists for is "how much traffic is
-	// exposed to inventory", which is true whether or not inventory then succeeded.
-	// A read routed to inventory that times out still counts here — its failure is
-	// the RED alerts' and ErrUpstream's business, not this counter's. Hence
-	// "routed", not "answered".
-	availabilityPathCounter, _ = meter.Int64Counter("checkout.availability.path",
-		metric.WithDescription("Availability reads by the authority they were routed to (RFC-0021 P3 canary), by path"))
+	// result is bounded: ok (basket fulfillable), shortage (inventory said no —
+	// a business answer), error (transport/timeout — fail-closed to 503, NEVER
+	// read as a shortage). No sku or user labels.
+	availabilityCheckCounter, _ = meter.Int64Counter("checkout.availability.check",
+		metric.WithDescription("Inventory availability checks by outcome (RFC-0021 phase 4: inventory is the only authority)"))
 )
 
-// Availability read authorities — bounded metric labels.
+// Availability check outcomes — bounded metric labels.
 const (
-	availabilityPathProduct   = "product"
-	availabilityPathInventory = "inventory"
+	availabilityOK       = "ok"
+	availabilityShortage = "shortage"
+	availabilityError    = "error"
 )
 
-// recordAvailabilityPath counts one availability read against the authority it was
-// ROUTED to. Not "served": the increment happens at the routing decision, before
-// the upstream answers, so this counter measures EXPOSURE and cannot be divided by
-// a success count to get an answer rate.
-func recordAvailabilityPath(ctx context.Context, path string) {
-	availabilityPathCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("path", path)))
-}
-
-// recordShadowCompare counts one shadow-compare outcome with its bounded result.
-func recordShadowCompare(ctx context.Context, result string) {
-	shadowCompareCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+// recordAvailabilityCheck counts one inventory availability answer.
+//
+// Counted where the ANSWER is known, not where the read is routed: with a single
+// authority "who did we ask" is a constant, and what on-call needs instead is
+// whether that authority is answering and whether it is refusing baskets.
+func recordAvailabilityCheck(ctx context.Context, result string) {
+	availabilityCheckCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 }
 
 // recordPromoRejected counts a confirm-gate rejection with its bounded reason.

@@ -95,6 +95,7 @@ the service and between services money is integer cents.
 |---------|-----|-----|
 | cart | gRPC `GetCart` (read-only) | What's in your cart — items and quantities |
 | product | gRPC `GetProducts` | The real, current price and stock (skips the browse cache on purpose) |
+| inventory | gRPC `CheckAvailability` | The availability authority — required; no fallback exists |
 | shipping | gRPC `GetQuote` | The authoritative shipping fee for your address + method |
 | order | gRPC `CreateOrder` | Places the order once you confirm (with subtotal, fee, tax and discount all carried across) — order-service stays the only place orders are created |
 | Temporal | SDK (`checkout` task queue) | The abandonment timer; the `worker` subcommand of this same binary runs the workflow |
@@ -138,30 +139,43 @@ way to run the whole thing is the platform's
 ready-made audit scripts (sections A9–A10) that exercise this service end to
 end, confirm and promo flows included.
 
-### Availability read path (RFC-0021 migration)
+### Availability read path
 
-Where checkout reads stock availability from, and how that moves from
-product-service to inventory-service. All four are startup-validated, so a typo
-fails the process rather than reading as a default.
+Checkout reads a basket from **two authorities**, concurrently:
 
-| Env | Default | Meaning |
-|-----|---------|---------|
-| `CHECKOUT_AVAILABILITY_SOURCE` | `product` | `product` \| `shadow` \| `inventory`. `shadow` keeps Product authoritative and additionally compares Inventory's answer in the background; `inventory` makes Inventory the availability gate (Product stays the price authority). |
-| `CHECKOUT_AVAILABILITY_SHADOW_PCT` | `100` | Share of operations that emit a shadow comparison in `shadow` mode. Purely observational. |
-| `CHECKOUT_AVAILABILITY_CANARY_PCT` | `100` | Share of **users** whose reads go to Inventory while the source is `inventory`. `100` is the pre-canary behaviour; `0` keeps every read on Product, which is the state to flip the source in with. |
-| `CHECKOUT_AVAILABILITY_CANARY_SALT` | *(empty)* | Keys the per-user bucket. Empty leaves buckets computable by anyone, so the percentage bounds honest traffic only — set it (as a Secret) before ramping, and keep it **identical across replicas and fixed for the whole rollout**: changing it re-shuffles every user's arm. Startup logs a fingerprint, never the value. |
+| Answer | Authority | RPC |
+|---|---|---|
+| price | product-service | `product.v1/BatchGetCurrentPrices` |
+| availability | inventory-service | `inventory.v1/CheckAvailability` |
 
-The dial is **sticky per user**: a user's whole funnel (create + confirm) uses one
-authority, because splitting those two reads would let a session be accepted as
-in-stock and then refused at confirm. Two caveats worth knowing before ramping:
+Both are **required constructor dependencies**, not optional wiring, and
+`INVENTORY_GRPC_ADDR` is dialled like every other east-west target. There is no
+product-availability fallback: RFC-0021 phase 4 removed product's stock branch, and
+the column it used to read was frozen at the write cutover — so a fallback could only
+ever have answered with a number that was stale by construction. A read that cannot
+be right is worse than a read that fails.
 
-- Moving the dial while sessions are open can still split those sessions, and a
-  rolling restart runs two values at once. The worst outcome is the existing
-  requote (checkout never reserves stock), so space ramp steps by at least
-  `SESSION_TTL_SECONDS` or accept a few requotes.
-- `checkout_availability_path_total{path}` is the only view of **real** exposure —
-  read it rather than trusting the flag, since a dependency that is not wired
-  falls back to Product no matter what the dial says.
+The migration machinery that got us here is **gone**: the source flag
+(`CHECKOUT_AVAILABILITY_SOURCE`), the shadow compare, the per-user canary dial and
+its salt. With one authority there is no path to select, nothing to compare against,
+and no exposure to ramp.
+
+**Fail-closed is the rule that survived.** A `CheckAvailability` transport error or
+timeout maps to `ErrUpstream` (503, retryable) and *never* to out-of-stock — a
+timeout is not a shortage. Same at confirm: an answer that covers nothing we asked
+for reads as a degraded upstream, not as a delisted basket.
+
+But a **definite** answer must requote, not retry. An unsellable or wrong-currency
+line is filtered out of the merged view, and treating that empty result as a degraded
+upstream answers 503 "retry with the same key" to a condition that can never change —
+on a session with no way out of `confirming`. So the retryable/definite decision is
+made on whether product priced any *requested* sku, not on how many lines survived
+filtering.
+
+**Signal:** `checkout_availability_check_total{result="ok|shortage|error"}`. It is the
+only thing that can distinguish "inventory is refusing baskets" from "inventory is
+down": `checkout_price_changed_total` lumps `PRICE_CHANGED` with `STOCK_UNAVAILABLE`,
+and an availability failure is otherwise laundered into a generic 503.
 
 ## Observability
 

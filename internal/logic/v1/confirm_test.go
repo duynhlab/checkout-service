@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -184,10 +185,22 @@ func TestConfirm_StockShortageRequotes(t *testing.T) {
 	}
 }
 
+// A line the catalog no longer answers for is out-of-stock, not a transient.
+//
+// The session carries TWO lines on purpose. With one line, "delisted" and "the
+// upstream answered about nothing we asked for" are the same observation, and
+// revalidate deliberately resolves that ambiguity the retryable way (ErrUpstream —
+// a degraded upstream must not read as "everything delisted"). Two lines make the
+// answer non-empty, so the missing one is unambiguously delisted.
 func TestConfirm_DelistedLineIsStockUnavailable(t *testing.T) {
-	repo := &fakeRepo{byID: readySession()}
+	session := readySession()
+	session.Items = append(session.Items, domain.SessionItem{
+		ProductID: "2", ProductName: "Pad", Quantity: 1, UnitPriceMinor: 500, CartPriceMinor: 500,
+	})
+	repo := &fakeRepo{byID: session}
 	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
-	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "999", UnitPriceMinor: 1, AvailableQty: 1}}}
+	// Only line 2 is still in the catalog; line 1 is gone.
+	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "2", UnitPriceMinor: 500, AvailableQty: 1}}}
 
 	s, err := confirmSvc(repo, prods, idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
 	if !errors.Is(err, ErrStockUnavailable) {
@@ -195,6 +208,63 @@ func TestConfirm_DelistedLineIsStockUnavailable(t *testing.T) {
 	}
 	if !s.Items[0].PriceChanged || s.Items[0].UnitPriceMinor != 2999 {
 		t.Errorf("delisted line = %+v, want flagged with snapshot price kept", s.Items[0])
+	}
+}
+
+// The one-line case the test above avoids, asserted on purpose rather than left
+// implicit: an answer that covers nothing we asked for is treated as a degraded
+// upstream (retryable), NOT as a delisted basket.
+func TestConfirm_EmptyCatalogAnswerIsRetryable(t *testing.T) {
+	repo := &fakeRepo{byID: readySession()}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "999", UnitPriceMinor: 1, AvailableQty: 1}}}
+
+	_, err := confirmSvc(repo, prods, idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("err = %v, want ErrUpstream — an empty answer must not read as delisted", err)
+	}
+}
+
+// An UNSELLABLE line is a definite answer: requote, never a retryable 503.
+//
+// This is the case the availability rework got wrong at first, and the cost was not
+// a bad error code — it was a dead end. mergeCatalog filters unsellable lines, so a
+// one-line basket produced an empty MERGED result; the guard read that as a degraded
+// upstream and answered 503 "retry with the same Idempotency-Key". The condition is
+// deterministic, so the retry could never succeed, and the session was left at
+// `confirming`, which lazyExpire skips and the FSM cannot leave — so the shopper
+// could not buy anything at all until the TTL elapsed.
+//
+// A single line is used on purpose: that is the shape that broke.
+func TestConfirm_UnsellableLineRequotesRatherThanRetrying(t *testing.T) {
+	repo := &fakeRepo{byID: readySession()}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	// Product ANSWERS about the requested sku — it just is not sellable any more.
+	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, Sellable: false}}}
+	checker := &fakeChecker{res: AvailabilityResult{CanFulfill: true}}
+	svc := NewCheckoutService(repo, &fakeCart{}, prices, checker, time.Minute).
+		WithConfirm(idem, &fakeOrders{})
+
+	_, err := svc.Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrStockUnavailable) {
+		t.Fatalf("err = %v, want ErrStockUnavailable — an unsellable line is definite, not retryable", err)
+	}
+	if errors.Is(err, ErrUpstream) {
+		t.Error("an unsellable line must not be reported as a degraded upstream")
+	}
+}
+
+// The same shape with a WRONG CURRENCY, which mergeCatalog also filters.
+func TestConfirm_WrongCurrencyLineRequotesRatherThanRetrying(t *testing.T) {
+	repo := &fakeRepo{byID: readySession()}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", UnitPriceMinor: 2999, Sellable: true, Currency: "EUR"}}}
+	checker := &fakeChecker{res: AvailabilityResult{CanFulfill: true}}
+	svc := NewCheckoutService(repo, &fakeCart{}, prices, checker, time.Minute).
+		WithConfirm(idem, &fakeOrders{})
+
+	if _, err := svc.Confirm(context.Background(), "7", "sess-1", "key-1"); !errors.Is(err, ErrStockUnavailable) {
+		t.Fatalf("err = %v, want ErrStockUnavailable", err)
 	}
 }
 

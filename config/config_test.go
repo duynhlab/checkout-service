@@ -67,7 +67,37 @@ func validConfig() *Config {
 	c.Profiling = ProfilingConfig{Enabled: true, Endpoint: "pyro:4040", ServiceName: "shipping"}
 	c.Logging = LoggingConfig{Level: "info", Format: "json"}
 	c.Database = DatabaseConfig{} // Host empty → database validation skipped
+	// The two authorities checkout cannot work without: product answers price,
+	// inventory answers availability. Empty is a startup error, not a lazy
+	// per-call failure that reads as an outage (RFC-0021 phase 4).
+	c.Checkout = CheckoutConfig{
+		ProductGRPCAddr:   "dns:///product:9090",
+		InventoryGRPCAddr: "dns:///inventory:9090",
+	}
 	return c
+}
+
+// The availability authority has no fallback since RFC-0021 phase 4, and
+// grpcx.Dial is lazy — so an empty address would surface as a permanent 503 that
+// looks exactly like inventory being down. It must fail at startup instead.
+func TestValidate_RequiresBothCatalogAuthorities(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"no inventory", func(c *Config) { c.Checkout.InventoryGRPCAddr = "" }, "INVENTORY_GRPC_ADDR"},
+		{"no product", func(c *Config) { c.Checkout.ProductGRPCAddr = "" }, "PRODUCT_GRPC_ADDR"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validConfig()
+			tc.mut(c)
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Validate() = %v, want an error naming %s", err, tc.want)
+			}
+		})
+	}
 }
 
 func TestValidate(t *testing.T) {
@@ -182,40 +212,3 @@ func TestValidateErrorMentionsField(t *testing.T) {
 // The canary dial must default to 100 — "no canary". A default of 0 would mean
 // that flipping CHECKOUT_AVAILABILITY_SOURCE to `inventory` silently kept every
 // read on Product, so an operator would watch a cutover that never happened.
-func TestLoad_AvailabilityCanaryDefaultsToFullyOpen(t *testing.T) {
-	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_PCT", "")
-	if got := Load().Checkout.AvailabilityCanaryPct; got != 100 {
-		t.Errorf("default AvailabilityCanaryPct = %d, want 100 — the pre-canary behaviour of the inventory source", got)
-	}
-}
-
-// 0 must be loadable and distinct from unset: it is the position an operator
-// flips the source in with, before exposing anybody.
-func TestLoad_AvailabilityCanaryAcceptsZero(t *testing.T) {
-	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_PCT", "0")
-	if got := Load().Checkout.AvailabilityCanaryPct; got != 0 {
-		t.Errorf("AvailabilityCanaryPct = %d with the env set to 0, want 0", got)
-	}
-}
-
-func TestLoad_AvailabilityCanaryReadsIntermediateValues(t *testing.T) {
-	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_PCT", "25")
-	if got := Load().Checkout.AvailabilityCanaryPct; got != 25 {
-		t.Errorf("AvailabilityCanaryPct = %d, want 25", got)
-	}
-}
-
-// The salt defaults to empty, which is a deliberate, documented choice: buckets
-// stay computable offline until an operator sets one. The test exists so the
-// default cannot change silently — a non-empty default baked into the repo would
-// look like protection while being just as computable.
-func TestLoad_AvailabilityCanarySalt(t *testing.T) {
-	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_SALT", "")
-	if got := Load().Checkout.AvailabilityCanarySalt; got != "" {
-		t.Errorf("default AvailabilityCanarySalt = %q, want empty", got)
-	}
-	t.Setenv("CHECKOUT_AVAILABILITY_CANARY_SALT", "s3cret")
-	if got := Load().Checkout.AvailabilityCanarySalt; got != "s3cret" {
-		t.Errorf("AvailabilityCanarySalt = %q, want s3cret", got)
-	}
-}

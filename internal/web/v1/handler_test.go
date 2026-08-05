@@ -125,17 +125,45 @@ func (f *fakeCart) GetCart(_ context.Context, _ string) ([]logicv1.CartLine, err
 	return f.lines, f.err
 }
 
+// fakeProducts satisfies BOTH halves of the split catalog read from one
+// ProductInfo fixture (prices from product, availability from inventory since
+// RFC-0021 phase 4). The handler tests care about HTTP behaviour, not which
+// authority answered, so one fixture is the right level of detail here.
 type fakeProducts struct{ infos []logicv1.ProductInfo }
 
-func (f *fakeProducts) GetProducts(_ context.Context, _ []string) ([]logicv1.ProductInfo, error) {
-	return f.infos, nil
+func (f *fakeProducts) BatchGetCurrentPrices(_ context.Context, _ []string) ([]logicv1.PriceInfo, error) {
+	out := make([]logicv1.PriceInfo, 0, len(f.infos))
+	for _, i := range f.infos {
+		out = append(out, logicv1.PriceInfo{
+			ProductID: i.ProductID, Name: i.Name,
+			UnitPriceMinor: i.UnitPriceMinor, Sellable: true, Currency: "USD",
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeProducts) CheckAvailability(_ context.Context, lines []logicv1.AvailabilityLine) (logicv1.AvailabilityResult, error) {
+	qty := make(map[string]int, len(f.infos))
+	for _, i := range f.infos {
+		qty[i.ProductID] = i.AvailableQty
+	}
+	res := logicv1.AvailabilityResult{CanFulfill: true}
+	for _, l := range lines {
+		if have := qty[l.SKUID]; have < l.Quantity {
+			res.CanFulfill = false
+			res.Shortages = append(res.Shortages, logicv1.Shortage{
+				SKUID: l.SKUID, Requested: int64(l.Quantity), AvailableToPromise: int64(have),
+			})
+		}
+	}
+	return res, nil
 }
 
 // newRouter mounts the real routes with a fake JWT middleware injecting userID
 // (empty = unauthenticated 401, mirroring authmw's fail-closed behavior).
 func newRouter(repo *fakeRepo, cart *fakeCart, prods *fakeProducts, userID string) *gin.Engine {
 	r := gin.New()
-	svc := logicv1.NewCheckoutService(repo, cart, prods, time.Minute)
+	svc := logicv1.NewCheckoutService(repo, cart, prods, prods, time.Minute)
 	RegisterRoutes(r, NewHandler(svc), func(c *gin.Context) {
 		if userID == "" {
 			c.AbortWithStatus(http.StatusUnauthorized)
@@ -386,7 +414,7 @@ func TestSetPayment_PANLikeIs400AndNeverPersisted(t *testing.T) {
 func confirmRouter(repo *fakeRepo, idem logicv1.IdemStore, orders logicv1.OrderCreator, userID string) *gin.Engine {
 	r := gin.New()
 	prods := &fakeProducts{infos: []logicv1.ProductInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5}}}
-	svc := logicv1.NewCheckoutService(repo, &fakeCart{}, prods, time.Minute).WithConfirm(idem, orders)
+	svc := logicv1.NewCheckoutService(repo, &fakeCart{}, prods, prods, time.Minute).WithConfirm(idem, orders)
 	RegisterRoutes(r, NewHandler(svc), func(c *gin.Context) {
 		c.Set(authmw.CtxUserID, userID)
 		c.Next()

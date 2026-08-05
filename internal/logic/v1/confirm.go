@@ -46,6 +46,10 @@ var (
 // PROVES the previous owner is dead. Two live same-key executions cannot
 // exist.
 // Exported so cmd can validate lockTakeover > 4×ConfirmDeadline at startup.
+// releaseTimeout bounds the detached idempotency release on the fail-closed paths.
+// Short: it is a single UPDATE, and the request is already answered.
+const releaseTimeout = 3 * time.Second
+
 const ConfirmDeadline = 15 * time.Second
 
 // confirmPath is the Claim scope (same key on another endpoint = conflict).
@@ -355,28 +359,36 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 		availLines = append(availLines, AvailabilityLine{SKUID: it.ProductID, Quantity: it.Quantity})
 		ids = append(ids, it.ProductID)
 	}
-	// Product mode: GetProducts. Inventory mode (P2-5): Product prices +
-	// Inventory availability. An Inventory timeout/error surfaces here as
-	// ErrUpstream (503, retryable) — fail-closed, NEVER read as out-of-stock.
-	// session.UserID, not a plumbed-through argument: it is the SAME id
-	// CreateSession bucketed on, which is what keeps a user's whole funnel on one
-	// availability authority (see canary.go).
-	infos, err := s.resolveCatalog(ctx, session.UserID, availLines)
-	if err != nil || (len(ids) > 0 && len(infos) == 0) {
-		// Transport error — or a suspicious empty answer for a non-empty ask
-		// (degraded upstream must not read as "everything delisted"). Release
-		// failure only delays the same-key retry until the takeover window.
-		_ = s.idem.Release(ctx, keyID)
+	// Product prices + Inventory availability. Either upstream failing surfaces
+	// here as ErrUpstream (503, retryable) — fail-closed, NEVER read as
+	// out-of-stock.
+	infos, answered, err := s.resolveCatalog(ctx, availLines)
+	if err != nil || (len(ids) > 0 && !answered) {
+		// Transport error — or a genuinely empty answer for a non-empty ask, which
+		// means the upstream is degraded and must not read as "everything
+		// delisted".
+		//
+		// The condition asks `answered`, NOT len(infos), and that distinction is
+		// the bug it replaces: mergeCatalog filters unsellable and wrong-currency
+		// lines, so a one-line basket whose only SKU went unsellable produced an
+		// empty merged result and was reported as a retryable 503 — an instruction
+		// the shopper could never satisfy, on a session with no way out of
+		// `confirming` (lazyExpire skips that state and the FSM has no
+		// confirming → cancelled edge). A definite answer must requote, not retry.
+		//
+		// Release on a context that CANNOT already be cancelled: this path is
+		// reached after a hung upstream, and releasing on the expired confirm
+		// context silently fails, leaving the key locked for the whole takeover
+		// window (409 to the shopper's retry).
+		relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+		_ = s.idem.Release(relCtx, keyID)
+		cancel()
 		return nil, ErrUpstream
 	}
 	byID := make(map[string]ProductInfo, len(infos))
 	for _, p := range infos {
 		byID[p.ProductID] = p
 	}
-	// RFC-0021 P2-4: shadow-compare availability vs inventory-service (no-op
-	// unless source=shadow). Best-effort, async — never affects revalidation.
-	s.maybeShadowCompare(ctx, ids)
-
 	var priceDrift, stockShort bool
 	var subtotal int64
 	fresh := make([]domain.SessionItem, len(session.Items))

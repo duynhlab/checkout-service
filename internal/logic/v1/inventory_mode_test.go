@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
 )
@@ -34,9 +35,9 @@ func TestMergeCatalog_CanFulfill_ClearsAndFiltersLines(t *testing.T) {
 	lines := []AvailabilityLine{{SKUID: "1", Quantity: 2}, {SKUID: "2", Quantity: 1}, {SKUID: "3", Quantity: 1}, {SKUID: "4", Quantity: 1}}
 	prices := []PriceInfo{
 		{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, Sellable: true, Currency: "USD"},
-		{ProductID: "2", Name: "Gone", UnitPriceMinor: 999, Sellable: false},            // unsellable → omit
+		{ProductID: "2", Name: "Gone", UnitPriceMinor: 999, Sellable: false},                // unsellable → omit
 		{ProductID: "3", Name: "EUR", UnitPriceMinor: 500, Sellable: true, Currency: "EUR"}, // wrong currency → omit
-		{ProductID: "9", Name: "Extra", UnitPriceMinor: 100, Sellable: true},             // not requested → omit
+		{ProductID: "9", Name: "Extra", UnitPriceMinor: 100, Sellable: true},                // not requested → omit
 	}
 	out := mergeCatalog(lines, prices, AvailabilityResult{CanFulfill: true})
 
@@ -97,40 +98,24 @@ func TestMergeCatalog_CanFulfillTrue_StrayShortage_BlocksThatLine(t *testing.T) 
 	}
 }
 
-func inventorySvc(prods *fakeProducts, prices *fakePrices, checker *fakeChecker) *CheckoutService {
-	return newSvc(&fakeRepo{}, &fakeCart{}, prods).
-		WithAvailabilitySource(AvailabilitySourceInventory, 0, nil).
-		WithInventoryMode(prices, checker)
+// splitSvc builds a service on the two real authorities. There is no other path to
+// contrast it with since RFC-0021 phase 4 — the product-availability fallback, the
+// source flag and the canary dial are gone.
+func splitSvc(prices *fakePrices, checker *fakeChecker) *CheckoutService {
+	return NewCheckoutService(&fakeRepo{}, &fakeCart{}, prices, checker, time.Minute)
 }
 
-func TestResolveCatalog_ProductMode_UsesGetProducts(t *testing.T) {
-	prods := &fakeProducts{infos: []ProductInfo{{ProductID: "1", UnitPriceMinor: 2999, AvailableQty: 5}}}
-	prices := &fakePrices{}
-	checker := &fakeChecker{}
-	// Default (product) source + inventory deps wired: must still use GetProducts.
-	svc := newSvc(&fakeRepo{}, &fakeCart{}, prods).WithInventoryMode(prices, checker)
-
-	out, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}})
-	if err != nil {
-		t.Fatalf("resolveCatalog error = %v", err)
-	}
-	if len(out) != 1 || prices.calls != 0 || checker.calls != 0 {
-		t.Errorf("product mode must use GetProducts only: prices=%d checker=%d out=%+v", prices.calls, checker.calls, out)
-	}
-}
-
-func TestResolveCatalog_InventoryMode_SplitReads(t *testing.T) {
-	prods := &fakeProducts{err: errors.New("GetProducts must not be called")}
+func TestResolveCatalog_SplitReads(t *testing.T) {
 	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, Sellable: true}}}
 	checker := &fakeChecker{res: AvailabilityResult{CanFulfill: true}}
-	svc := inventorySvc(prods, prices, checker)
+	svc := splitSvc(prices, checker)
 
-	out, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 2}})
+	out, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 2}})
 	if err != nil {
 		t.Fatalf("resolveCatalog error = %v", err)
 	}
 	if prices.calls != 1 || checker.calls != 1 {
-		t.Errorf("inventory mode must call prices+checker once each: prices=%d checker=%d", prices.calls, checker.calls)
+		t.Errorf("the catalog read must call prices+checker once each: prices=%d checker=%d", prices.calls, checker.calls)
 	}
 	if len(out) != 1 || out[0].UnitPriceMinor != 2999 || out[0].AvailableQty != 2 {
 		t.Errorf("merged = %+v, want price 2999 qty 2", out)
@@ -139,12 +124,12 @@ func TestResolveCatalog_InventoryMode_SplitReads(t *testing.T) {
 
 // Fail-closed: an Inventory CheckAvailability error must surface as an error
 // (→ caller maps to ErrUpstream/503), NEVER as an empty/out-of-stock result.
-func TestResolveCatalog_InventoryMode_CheckAvailabilityError_FailsClosed(t *testing.T) {
+func TestResolveCatalog_CheckAvailabilityError_FailsClosed(t *testing.T) {
 	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}
 	checker := &fakeChecker{err: errors.New("inventory timeout")}
-	svc := inventorySvc(&fakeProducts{}, prices, checker)
+	svc := splitSvc(prices, checker)
 
-	out, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}})
+	out, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}})
 	if err == nil {
 		t.Fatal("CheckAvailability error must propagate (fail-closed), got nil")
 	}
@@ -153,12 +138,12 @@ func TestResolveCatalog_InventoryMode_CheckAvailabilityError_FailsClosed(t *test
 	}
 }
 
-func TestResolveCatalog_InventoryMode_PriceError(t *testing.T) {
+func TestResolveCatalog_PriceError(t *testing.T) {
 	prices := &fakePrices{err: errors.New("price down")}
 	checker := &fakeChecker{}
-	svc := inventorySvc(&fakeProducts{}, prices, checker)
+	svc := splitSvc(prices, checker)
 
-	if _, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
+	if _, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
 		t.Fatal("BatchGetCurrentPrices error must propagate, got nil")
 	}
 	// Concurrent fetch: checker may or may not have been invoked, but its result
@@ -174,25 +159,22 @@ func (panicChecker) CheckAvailability(context.Context, []AvailabilityLine) (Avai
 	panic("checker boom")
 }
 
-func TestResolveCatalog_InventoryMode_PanicRecoveredAsError(t *testing.T) {
-	svc := newSvc(&fakeRepo{}, &fakeCart{}, &fakeProducts{}).
-		WithAvailabilitySource(AvailabilitySourceInventory, 0, nil).
-		WithInventoryMode(&fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}, panicChecker{})
+func TestResolveCatalog_PanicRecoveredAsError(t *testing.T) {
+	svc := NewCheckoutService(&fakeRepo{}, &fakeCart{},
+		&fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}, panicChecker{}, time.Minute)
 
-	if _, err := svc.resolveCatalog(context.Background(), "user-1", []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
+	if _, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}}); err == nil {
 		t.Fatal("a panicking checker must be recovered into an error, got nil")
 	}
 }
 
 // End-to-end fail-closed at CREATE: an Inventory timeout must surface as
 // ErrUpstream (retryable), never a snapshot that silently drops availability.
-func TestCreateSession_InventoryMode_CheckAvailabilityError_FailsClosed(t *testing.T) {
+func TestCreateSession_CheckAvailabilityError_FailsClosed(t *testing.T) {
 	cart := &fakeCart{lines: []CartLine{{ProductID: "1", ProductName: "Mouse", Quantity: 1, CartPriceMinor: 2999}}}
 	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true, UnitPriceMinor: 2999}}}
 	checker := &fakeChecker{err: errors.New("inventory timeout")}
-	svc := newSvc(&fakeRepo{}, cart, &fakeProducts{}).
-		WithAvailabilitySource(AvailabilitySourceInventory, 0, nil).
-		WithInventoryMode(prices, checker)
+	svc := NewCheckoutService(&fakeRepo{}, cart, prices, checker, time.Minute)
 
 	if _, _, err := svc.CreateSession(context.Background(), "7"); !errors.Is(err, ErrUpstream) {
 		t.Fatalf("inventory timeout at create must fail closed to ErrUpstream, got %v", err)
@@ -202,14 +184,12 @@ func TestCreateSession_InventoryMode_CheckAvailabilityError_FailsClosed(t *testi
 // End-to-end fail-closed at CONFIRM (revalidate): an Inventory timeout maps to
 // ErrUpstream (503, retryable) — specifically NOT ErrStockUnavailable. This is
 // the headline contract: a timeout is never read as out-of-stock.
-func TestRevalidate_InventoryMode_CheckAvailabilityError_FailsClosed(t *testing.T) {
+func TestRevalidate_CheckAvailabilityError_FailsClosed(t *testing.T) {
 	idem := &fakeIdem{}
 	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}
 	checker := &fakeChecker{err: errors.New("inventory timeout")}
-	svc := newSvc(&fakeRepo{}, &fakeCart{}, &fakeProducts{}).
-		WithConfirm(idem, &fakeOrders{}).
-		WithAvailabilitySource(AvailabilitySourceInventory, 0, nil).
-		WithInventoryMode(prices, checker)
+	svc := NewCheckoutService(&fakeRepo{}, &fakeCart{}, prices, checker, time.Minute).
+		WithConfirm(idem, &fakeOrders{})
 	session := &domain.Session{ID: "s1", Items: []domain.SessionItem{{ProductID: "1", Quantity: 1, UnitPriceMinor: 2999}}}
 
 	_, err := svc.revalidate(context.Background(), session, 42)
