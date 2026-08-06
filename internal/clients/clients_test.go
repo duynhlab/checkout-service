@@ -49,6 +49,11 @@ func TestInventoryClient_CheckAvailability_MapsResult(t *testing.T) {
 		Shortages: []*inventoryv1.Shortage{
 			{SkuId: "2", Requested: 5, AvailableToPromise: 1},
 		},
+		// A tracked shortage and an untracked SKU in one reply: the transport must
+		// keep them apart, because the logic layer answers them differently (a
+		// requote vs a fail-closed 503). Dropping this mapping silently reverts the
+		// whole cross-repo feature, so it is asserted here and not only upstream.
+		UnknownSkuIds: []string{"3"},
 	}
 	c := &InventoryClient{c: &fakeInvSvc{checkResp: resp}}
 
@@ -64,6 +69,9 @@ func TestInventoryClient_CheckAvailability_MapsResult(t *testing.T) {
 	if len(got.Shortages) != 1 || got.Shortages[0].SKUID != "2" ||
 		got.Shortages[0].Requested != 5 || got.Shortages[0].AvailableToPromise != 1 {
 		t.Errorf("shortages = %+v, want one {2,5,1}", got.Shortages)
+	}
+	if len(got.UnknownSKUIDs) != 1 || got.UnknownSKUIDs[0] != "3" {
+		t.Errorf("unknown = %+v, want [3]", got.UnknownSKUIDs)
 	}
 }
 

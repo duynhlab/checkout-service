@@ -92,6 +92,15 @@ type Shortage struct {
 type AvailabilityResult struct {
 	CanFulfill bool
 	Shortages  []Shortage
+	// UnknownSKUIDs are SKUs inventory does not track at all.
+	//
+	// NOT a shortage, and checkout must not present it as one. A shortage is a
+	// business answer the shopper can act on by requoting; an unknown SKU means
+	// the authority has no data, which is an operator problem. Telling a customer
+	// "no longer available" for a SKU that may well be in stock is a lost sale
+	// caused by a missing row, so this path fails CLOSED (ErrUpstream, 503,
+	// retryable) exactly like an unreachable inventory.
+	UnknownSKUIDs []string
 }
 
 // AvailabilityChecker is the logic-layer port for Inventory's basket
@@ -236,6 +245,11 @@ func (s *CheckoutService) resolveCatalog(ctx context.Context, lines []Availabili
 	switch {
 	case ar.err != nil:
 		recordAvailabilityCheck(ctx, availabilityError)
+	case len(ar.res.UnknownSKUIDs) > 0:
+		// Ranked ABOVE CanFulfill on purpose: an unknown SKU forces can_fulfill
+		// false, so classifying by CanFulfill first would file every data gap as
+		// a shortage — the exact confusion this outcome exists to end.
+		recordAvailabilityCheck(ctx, availabilityUnknownSKU)
 	case ar.res.CanFulfill:
 		recordAvailabilityCheck(ctx, availabilityOK)
 	default:
@@ -247,7 +261,46 @@ func (s *CheckoutService) resolveCatalog(ctx context.Context, lines []Availabili
 	if ar.err != nil {
 		return nil, false, ar.err
 	}
+	// Fail CLOSED on a data gap. Inventory cannot say whether these SKUs are
+	// buyable, so neither can checkout: a 503 the shopper can retry beats telling
+	// them an item is gone when a missing balance row is the only evidence.
+	// Deliberately after the price error check, so a genuine transport failure
+	// still reports as itself.
+	//
+	// Only ids we actually ASKED about count. Same rule as pricedAnyRequested
+	// below: a reply that names SKUs outside this basket has told us nothing about
+	// it, and acting on one would let an upstream bug (or a SKU-namespace drift)
+	// 503 every checkout on the platform. It also keeps upstream-controlled
+	// strings out of an error that ends up in a log line.
+	if unknown := intersectAsked(asked, ar.res.UnknownSKUIDs); len(unknown) > 0 {
+		// Recorded HERE because both callers replace this error with a bare
+		// sentinel: without the span attribute an operator gets a 503 with no way
+		// to learn which SKU is missing its balance row.
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.StringSlice("checkout.unknown_sku_ids", unknown))
+		return nil, false, fmt.Errorf("%w: %v", ErrAvailabilityUnknown, unknown)
+	}
 	return mergeCatalog(lines, pr.infos, ar.res), pricedAnyRequested(asked, pr.infos), nil
+}
+
+// intersectAsked keeps only the ids that appear in the basket we asked about,
+// preserving the upstream's order. An empty result means the reply said nothing
+// about THIS basket, which is a malformed upstream rather than a data gap.
+func intersectAsked(asked []AvailabilityLine, ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(asked))
+	for _, a := range asked {
+		want[a.SKUID] = struct{}{}
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := want[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // pricedAnyRequested reports whether the price reply covers at least one sku that
@@ -406,6 +459,12 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	infos, _, err := s.resolveCatalog(ctx, availLines)
 	if err != nil {
 		span.RecordError(err)
+		// A data gap keeps its own sentinel through to the handler: same 503, but
+		// the log line says which SKUs inventory could not answer for instead of a
+		// generic upstream failure.
+		if errors.Is(err, ErrAvailabilityUnknown) {
+			return nil, false, err
+		}
 		return nil, false, ErrUpstream
 	}
 	byID := make(map[string]ProductInfo, len(infos))

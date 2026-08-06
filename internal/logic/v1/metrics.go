@@ -64,7 +64,13 @@ var (
 const (
 	availabilityOK       = "ok"
 	availabilityShortage = "shortage"
-	availabilityError    = "error"
+	// unknown_sku: inventory answered, but does not track one of the requested
+	// SKUs. Split from both `shortage` and `error` because the cause and the fix
+	// differ from either — it is neither an outage nor demand exceeding supply,
+	// it is a missing balance row, and it is fixed by seeding or an explicit
+	// RECEIVE movement rather than by restoring a service or waiting.
+	availabilityUnknownSKU = "unknown_sku"
+	availabilityError      = "error"
 )
 
 // recordAvailabilityCheck counts one inventory availability answer.

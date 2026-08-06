@@ -91,6 +91,15 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		switch {
 		case errors.Is(err, logicv1.ErrEmptyCart):
 			httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "Cart is empty")
+		case errors.Is(err, logicv1.ErrAvailabilityUnknown):
+			// Same 503 as an unreachable dependency -- from the shopper's side it
+			// is the same "not now, try again". The difference is the log line:
+			// this one names the SKUs inventory has no balance row for, which is
+			// the only breadcrumb an operator gets, since the response body stays
+			// opaque.
+			c.Header("Retry-After", "2")
+			logger.Error("Session create blocked: inventory does not track a SKU", zap.Error(err))
+			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
 		case errors.Is(err, logicv1.ErrUpstream):
 			// 503, not 500. A dependency being down is not a bug in checkout, and
 			// the difference is not cosmetic: 500 tells the client "do not retry"
@@ -265,6 +274,18 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 			httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "A confirm is already in flight for this session")
 		case errors.Is(err, logicv1.ErrKeyConflict):
 			httpx.RespondError(c, http.StatusConflict, httpx.CodeIdempotencyConflict, "Idempotency-Key was used for a different request")
+		case errors.Is(err, logicv1.ErrAvailabilityUnknown):
+			// The session was already requoted back to shipping_set, so it is
+			// returned alongside the error like the other requote outcomes -- the
+			// SPA must not leave the shopper on a dead confirm screen. 503 rather
+			// than 409 because nothing about the basket is wrong: inventory simply
+			// cannot answer for it yet.
+			c.Header("Retry-After", "2")
+			logger.Error("Confirm blocked: inventory does not track a SKU", zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   gin.H{"code": httpx.CodeInternal, "message": "Availability is temporarily unknown for one or more items — try again shortly"},
+				"session": toSessionResponse(session),
+			})
 		case errors.Is(err, logicv1.ErrUpstream):
 			c.Header("Retry-After", "2")
 			logger.Error("Confirm upstream failure", zap.Error(err))

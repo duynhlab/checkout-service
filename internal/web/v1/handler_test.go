@@ -129,7 +129,12 @@ func (f *fakeCart) GetCart(_ context.Context, _ string) ([]logicv1.CartLine, err
 // ProductInfo fixture (prices from product, availability from inventory since
 // RFC-0021 phase 4). The handler tests care about HTTP behaviour, not which
 // authority answered, so one fixture is the right level of detail here.
-type fakeProducts struct{ infos []logicv1.ProductInfo }
+type fakeProducts struct {
+	infos []logicv1.ProductInfo
+	// unknown makes CheckAvailability report SKUs inventory does not track: the
+	// data-gap answer, which must never reach the shopper as "unavailable".
+	unknown []string
+}
 
 func (f *fakeProducts) BatchGetCurrentPrices(_ context.Context, _ []string) ([]logicv1.PriceInfo, error) {
 	out := make([]logicv1.PriceInfo, 0, len(f.infos))
@@ -147,7 +152,10 @@ func (f *fakeProducts) CheckAvailability(_ context.Context, lines []logicv1.Avai
 	for _, i := range f.infos {
 		qty[i.ProductID] = i.AvailableQty
 	}
-	res := logicv1.AvailabilityResult{CanFulfill: true}
+	res := logicv1.AvailabilityResult{CanFulfill: true, UnknownSKUIDs: f.unknown}
+	if len(f.unknown) > 0 {
+		res.CanFulfill = false // an unknown SKU can never be promised
+	}
 	for _, l := range lines {
 		if have := qty[l.SKUID]; have < l.Quantity {
 			res.CanFulfill = false
@@ -423,6 +431,22 @@ func TestSetPayment_PANLikeIs400AndNeverPersisted(t *testing.T) {
 
 // --- POST confirm (P2) ---
 
+// confirmRouterUnknownSKU is confirmRouter with inventory reporting the basket's
+// SKU as untracked.
+func confirmRouterUnknownSKU(repo *fakeRepo, idem logicv1.IdemStore, orders logicv1.OrderCreator, userID string) *gin.Engine {
+	r := gin.New()
+	prods := &fakeProducts{
+		infos:   []logicv1.ProductInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5}},
+		unknown: []string{"1"},
+	}
+	svc := logicv1.NewCheckoutService(repo, &fakeCart{}, prods, prods, time.Minute).WithConfirm(idem, orders)
+	RegisterRoutes(r, NewHandler(svc), func(c *gin.Context) {
+		c.Set(authmw.CtxUserID, userID)
+		c.Next()
+	})
+	return r
+}
+
 // confirmRouter wires the real logic layer with confirm deps faked at the
 // port level (idempotency + order), mirroring how newRouter drives everything
 // through the genuine service.
@@ -524,6 +548,45 @@ func TestConfirm_UpstreamDownIs503WithRetryAfter(t *testing.T) {
 	rec := doConfirm(r, "key-1")
 	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
 		t.Fatalf("resp = %d retry-after=%q, want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+}
+
+// An untracked SKU is 503, not 409 STOCK_UNAVAILABLE: nothing about the basket is
+// wrong, inventory simply cannot answer for it. The response carries the REQUOTED
+// session, because the alternative is a shopper stranded on a dead confirm screen
+// -- `confirming` has no FSM exit.
+func TestConfirm_UnknownSKUIs503WithRequotedSession(t *testing.T) {
+	repo := &fakeRepo{byID: readyWebSession("7")}
+	r := confirmRouterUnknownSKU(repo, &webIdem{rec: &idempotency.Record{ID: 11}}, &webOrders{}, "7")
+
+	rec := doConfirm(r, "key-1")
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("resp = %d retry-after=%q, want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "shipping_set") {
+		t.Errorf("body = %s, want the requoted session so the SPA can recover", body)
+	}
+	if strings.Contains(body, "no longer available") || strings.Contains(body, "STOCK_UNAVAILABLE") {
+		t.Errorf("body claims the item is gone on a data gap: %s", body)
+	}
+}
+
+func TestCreateSession_UnknownSKUIs503AndOpaque(t *testing.T) {
+	prods := &fakeProducts{
+		infos:   []logicv1.ProductInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5}},
+		unknown: []string{"1"},
+	}
+	cart := &fakeCart{lines: []logicv1.CartLine{{ProductID: "1", Quantity: 1}}}
+	r := newRouter(&fakeRepo{}, cart, prods, "7")
+
+	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/checkout/sessions", "")
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("resp = %d retry-after=%q, want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	// The SKU ids belong in the log and the span, never in the body.
+	if strings.Contains(rec.Body.String(), "does not track") {
+		t.Errorf("body leaks the internal reason: %s", rec.Body.String())
 	}
 }
 
