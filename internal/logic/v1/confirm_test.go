@@ -212,6 +212,25 @@ func TestConfirm_UnknownSKURequotesInsteadOfStranding(t *testing.T) {
 	}
 }
 
+// The escape itself can lose a race: another confirm may have taken the session
+// while this one was resolving the catalog. The CAS-guarded requote write is what
+// detects that, and it must surface as ErrConfirmInFlight (409) rather than as the
+// data-gap error -- otherwise the caller retries a session it no longer owns.
+func TestConfirm_UnknownSKUEscapeLosesTheCASRace(t *testing.T) {
+	repo := &fakeRepo{byID: readySession(), requoteErr: errors.New("0 rows updated")}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	prods := inStock()
+	prods.unknown = []string{"1"}
+
+	s, err := confirmSvc(repo, prods, idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrConfirmInFlight) {
+		t.Fatalf("err = %v, want ErrConfirmInFlight when the requote CAS finds no row", err)
+	}
+	if s != nil {
+		t.Errorf("session = %+v, want nil: we no longer know its state", s)
+	}
+}
+
 func TestConfirm_StockShortageRequotes(t *testing.T) {
 	repo := &fakeRepo{byID: readySession()}
 	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}

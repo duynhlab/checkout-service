@@ -291,6 +291,25 @@ func (f *fakeProducts) CheckAvailability(_ context.Context, lines []Availability
 	return res, nil
 }
 
+// CreateSession keeps the data-gap sentinel instead of flattening it to
+// ErrUpstream, so the handler can log which SKUs inventory could not answer for.
+// Same 503 either way -- the difference is the only breadcrumb an operator gets.
+func TestCreateSession_UnknownSKUKeepsItsOwnSentinel(t *testing.T) {
+	prods := &fakeProducts{infos: []ProductInfo{
+		{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5},
+	}}
+	prods.unknown = []string{"1"}
+	cart := &fakeCart{lines: []CartLine{{ProductID: "1", Quantity: 1}}}
+
+	_, _, err := newSvc(&fakeRepo{}, cart, prods).CreateSession(context.Background(), "7")
+	if !errors.Is(err, ErrAvailabilityUnknown) {
+		t.Fatalf("err = %v, want ErrAvailabilityUnknown (not flattened to ErrUpstream)", err)
+	}
+	if !strings.Contains(err.Error(), "1") {
+		t.Errorf("err = %q, want the sku named so the handler can log it", err)
+	}
+}
+
 func newSvc(repo *fakeRepo, cart *fakeCart, prods *fakeProducts) *CheckoutService {
 	return NewCheckoutService(repo, cart, prods, prods, time.Minute)
 }
