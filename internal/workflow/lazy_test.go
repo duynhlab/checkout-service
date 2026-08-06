@@ -127,6 +127,14 @@ func TestLazyCloseBeforeReadyStopsLoop(t *testing.T) {
 	l := NewLazy(dialScript(1000, &fakeTemporal{}, &calls), 5*time.Millisecond, zap.NewNop())
 	time.Sleep(20 * time.Millisecond)
 	l.Close()
+
+	// Baseline AFTER letting any in-flight dial finish. Sampling it the instant
+	// Close returns made this test racy: an attempt already inside the dial
+	// function legitimately increments the counter afterwards, which is not a
+	// leaked loop but read as one -- and a loaded CI runner widens that window
+	// enough to fail. What the test means is "no NEW attempts are STARTED after
+	// Close", so the baseline has to be taken once the loop is quiet.
+	time.Sleep(30 * time.Millisecond)
 	n := calls.Load()
 	time.Sleep(30 * time.Millisecond)
 	if calls.Load() != n {
