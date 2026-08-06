@@ -37,6 +37,13 @@ var (
 	// ErrOrderRejected — order-service rejected a request checkout validated
 	// locally; a bug, surfaced loudly as 500.
 	ErrOrderRejected = errors.New("order rejected the confirm handoff")
+	// ErrAvailabilityUnknown — inventory answered but does not track one of the
+	// SKUs, so nobody can say whether the basket is buyable. Distinct from
+	// ErrUpstream on purpose: both become a retryable 503, but this condition is
+	// PERSISTENT (it lasts until an operator seeds the missing balance row), and
+	// the confirm path must not treat a persistent condition as transport
+	// trouble. See revalidate for what that difference costs.
+	ErrAvailabilityUnknown = errors.New("inventory does not track one of these SKUs")
 )
 
 // ConfirmDeadline bounds the WHOLE confirm execution. This is the fencing
@@ -363,6 +370,12 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 	// here as ErrUpstream (503, retryable) — fail-closed, NEVER read as
 	// out-of-stock.
 	infos, answered, err := s.resolveCatalog(ctx, availLines)
+
+	// A data gap is PERSISTENT and must not take the transport branch below.
+	if errors.Is(err, ErrAvailabilityUnknown) {
+		return s.escapeOnUnknownAvailability(ctx, session, keyID)
+	}
+
 	if err != nil || (len(ids) > 0 && !answered) {
 		// Transport error — or a genuinely empty answer for a non-empty ask, which
 		// means the upstream is degraded and must not read as "everything
@@ -438,6 +451,35 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 		return session, ErrStockUnavailable
 	}
 	return session, ErrPriceChanged
+}
+
+// escapeOnUnknownAvailability gets a session OUT of `confirming` when inventory
+// cannot say whether its items are buyable.
+//
+// The transport branch in revalidate is wrong for this: it holds the session in
+// `confirming` and asks for a same-key retry, which is right for a hung upstream
+// and catastrophic for a condition that lasts until an operator seeds a missing
+// balance row. `lazyExpire` skips `confirming`, the FSM has no
+// confirming → cancelled edge, and `FindActiveByUserID` keeps handing the session
+// back — so the shopper would be left unable to confirm, unable to cancel, and
+// unable to start a new checkout.
+//
+// The escape requotes on the SNAPSHOT values: nothing about the basket changed,
+// we simply cannot price its availability, so no line is re-flagged and the
+// shopper is never told an item is gone. The key is released rather than
+// consumed, and the claim is cleared so a FRESH key can retry instead of hitting
+// ErrConfirmInFlight forever.
+func (s *CheckoutService) escapeOnUnknownAvailability(
+	ctx context.Context, session *domain.Session, keyID int64,
+) (*domain.Session, error) {
+	if err := s.repo.RequoteItems(ctx, session.ID, keyID,
+		session.Items, session.SubtotalMinor, session.TaxMinor, session.DiscountMinor); err != nil {
+		return nil, ErrConfirmInFlight
+	}
+	_ = s.idem.Release(ctx, keyID)
+	session.Status = domain.StatusShippingSet
+	session.ConfirmKeyID = nil
+	return session, ErrAvailabilityUnknown
 }
 
 // requoteComponents re-derives the tax and the promo discount from a fresh

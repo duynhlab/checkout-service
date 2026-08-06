@@ -174,6 +174,44 @@ func TestConfirm_PriceDriftRequotesWithoutBurningKey(t *testing.T) {
 	}
 }
 
+// An unknown SKU is PERSISTENT: it lasts until an operator seeds the missing
+// balance row. Sending it down the transport-trouble branch would leave the
+// session in `confirming` forever -- lazyExpire skips that state, the FSM has no
+// confirming → cancelled edge, and FindActiveByUserID keeps handing the dead
+// session back instead of letting the shopper open a new checkout. So it must
+// REQUOTE out of confirming, exactly like a definite answer, while still refusing
+// to claim the item is unavailable.
+func TestConfirm_UnknownSKURequotesInsteadOfStranding(t *testing.T) {
+	repo := &fakeRepo{byID: readySession()}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	orders := &fakeOrders{}
+	prods := inStock()
+	prods.unknown = []string{"1"}
+
+	s, err := confirmSvc(repo, prods, idem, orders).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrAvailabilityUnknown) {
+		t.Fatalf("err = %v, want ErrAvailabilityUnknown", err)
+	}
+	if errors.Is(err, ErrStockUnavailable) {
+		t.Error("a data gap must never be reported as out-of-stock")
+	}
+	if s == nil || s.Status != domain.StatusShippingSet {
+		t.Fatalf("session = %+v, want a requoted shipping_set session (not stranded in confirming)", s)
+	}
+	if s.ConfirmKeyID != nil {
+		t.Error("the confirm claim must be cleared so a FRESH key can retry (else 409 forever)")
+	}
+	if repo.requoted == nil || repo.requoted.keyID != 11 {
+		t.Error("the escape must go through the CAS-guarded requote write")
+	}
+	if idem.released != 1 || idem.finished != 0 {
+		t.Errorf("released=%d finished=%d, want the key released and NOT consumed", idem.released, idem.finished)
+	}
+	if orders.calls != 0 {
+		t.Error("no order may be created when availability is unknown")
+	}
+}
+
 func TestConfirm_StockShortageRequotes(t *testing.T) {
 	repo := &fakeRepo{byID: readySession()}
 	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}

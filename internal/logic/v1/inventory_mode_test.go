@@ -149,8 +149,8 @@ func TestResolveCatalog_UnknownSKU_FailsClosed(t *testing.T) {
 	svc := splitSvc(prices, checker)
 
 	out, answered, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}})
-	if !errors.Is(err, ErrUpstream) {
-		t.Fatalf("err = %v, want ErrUpstream (fail closed on a data gap)", err)
+	if !errors.Is(err, ErrAvailabilityUnknown) {
+		t.Fatalf("err = %v, want ErrAvailabilityUnknown (fail closed on a data gap)", err)
 	}
 	if out != nil || answered {
 		t.Errorf("no partial answer on a data gap: out=%+v answered=%v", out, answered)
@@ -190,10 +190,42 @@ func TestResolveCatalog_UnknownSKU_OutranksShortage(t *testing.T) {
 	}}
 	svc := splitSvc(prices, checker)
 
+	beforeUnknown := availabilityResultCount(t, availabilityUnknownSKU)
+	beforeShortage := availabilityResultCount(t, availabilityShortage)
+
 	_, _, err := svc.resolveCatalog(context.Background(),
 		[]AvailabilityLine{{SKUID: "1", Quantity: 5}, {SKUID: "2", Quantity: 1}})
-	if !errors.Is(err, ErrUpstream) {
-		t.Fatalf("err = %v, want ErrUpstream: an unknown SKU outranks a shortage", err)
+	if !errors.Is(err, ErrAvailabilityUnknown) {
+		t.Fatalf("err = %v, want ErrAvailabilityUnknown: a data gap outranks a shortage", err)
+	}
+	// The label is the point, not just the error: CheckoutAvailabilityUnknownSKU
+	// and CheckoutAvailabilityErrors both select on `result`, so filing this as a
+	// shortage would leave a revenue-losing data gap with no alert at all.
+	if got := availabilityResultCount(t, availabilityUnknownSKU) - beforeUnknown; got != 1 {
+		t.Errorf("result=unknown_sku delta = %d, want 1", got)
+	}
+	if got := availabilityResultCount(t, availabilityShortage) - beforeShortage; got != 0 {
+		t.Errorf("result=shortage delta = %d, want 0 (the data gap must not be filed as a shortage)", got)
+	}
+}
+
+// An id the basket never asked about tells us nothing about this basket. Acting
+// on one would let a single upstream bug 503 every checkout on the platform --
+// the same rule pricedAnyRequested already applies to the price reply.
+func TestResolveCatalog_UnknownSKU_OutsideBasket_IsIgnored(t *testing.T) {
+	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}
+	checker := &fakeChecker{res: AvailabilityResult{
+		CanFulfill:    true,
+		UnknownSKUIDs: []string{"sku-from-another-namespace"},
+	}}
+	svc := splitSvc(prices, checker)
+
+	out, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}})
+	if err != nil {
+		t.Fatalf("an unrelated unknown id must not fail the basket: %v", err)
+	}
+	if len(out) != 1 || out[0].AvailableQty != 1 {
+		t.Errorf("merged = %+v, want the asked line cleared", out)
 	}
 }
 

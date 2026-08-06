@@ -92,7 +92,7 @@ type Shortage struct {
 type AvailabilityResult struct {
 	CanFulfill bool
 	Shortages  []Shortage
-	// UnknownSKUIDs are SKUs inventory does not track at all (pkg v0.35.0).
+	// UnknownSKUIDs are SKUs inventory does not track at all.
 	//
 	// NOT a shortage, and checkout must not present it as one. A shortage is a
 	// business answer the shopper can act on by requoting; an unknown SKU means
@@ -266,11 +266,41 @@ func (s *CheckoutService) resolveCatalog(ctx context.Context, lines []Availabili
 	// them an item is gone when a missing balance row is the only evidence.
 	// Deliberately after the price error check, so a genuine transport failure
 	// still reports as itself.
-	if len(ar.res.UnknownSKUIDs) > 0 {
-		return nil, false, fmt.Errorf("%w: inventory does not track sku(s) %v",
-			ErrUpstream, ar.res.UnknownSKUIDs)
+	//
+	// Only ids we actually ASKED about count. Same rule as pricedAnyRequested
+	// below: a reply that names SKUs outside this basket has told us nothing about
+	// it, and acting on one would let an upstream bug (or a SKU-namespace drift)
+	// 503 every checkout on the platform. It also keeps upstream-controlled
+	// strings out of an error that ends up in a log line.
+	if unknown := intersectAsked(asked, ar.res.UnknownSKUIDs); len(unknown) > 0 {
+		// Recorded HERE because both callers replace this error with a bare
+		// sentinel: without the span attribute an operator gets a 503 with no way
+		// to learn which SKU is missing its balance row.
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.StringSlice("checkout.unknown_sku_ids", unknown))
+		return nil, false, fmt.Errorf("%w: %v", ErrAvailabilityUnknown, unknown)
 	}
 	return mergeCatalog(lines, pr.infos, ar.res), pricedAnyRequested(asked, pr.infos), nil
+}
+
+// intersectAsked keeps only the ids that appear in the basket we asked about,
+// preserving the upstream's order. An empty result means the reply said nothing
+// about THIS basket, which is a malformed upstream rather than a data gap.
+func intersectAsked(asked []AvailabilityLine, ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(asked))
+	for _, a := range asked {
+		want[a.SKUID] = struct{}{}
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := want[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // pricedAnyRequested reports whether the price reply covers at least one sku that
@@ -429,6 +459,12 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 	infos, _, err := s.resolveCatalog(ctx, availLines)
 	if err != nil {
 		span.RecordError(err)
+		// A data gap keeps its own sentinel through to the handler: same 503, but
+		// the log line says which SKUs inventory could not answer for instead of a
+		// generic upstream failure.
+		if errors.Is(err, ErrAvailabilityUnknown) {
+			return nil, false, err
+		}
 		return nil, false, ErrUpstream
 	}
 	byID := make(map[string]ProductInfo, len(infos))

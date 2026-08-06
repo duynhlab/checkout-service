@@ -243,7 +243,10 @@ func (f *fakeCart) GetCart(_ context.Context, _ string) ([]CartLine, error) { re
 // disagreeing — use fakePrices/fakeChecker directly (inventory_mode_test.go).
 type fakeProducts struct {
 	infos []ProductInfo
-	err error
+	err   error
+	// unknown makes CheckAvailability report SKUs inventory does not track, the
+	// data-gap answer that must never read as out-of-stock.
+	unknown []string
 }
 
 func (f *fakeProducts) BatchGetCurrentPrices(_ context.Context, _ []string) ([]PriceInfo, error) {
@@ -272,7 +275,10 @@ func (f *fakeProducts) CheckAvailability(_ context.Context, lines []Availability
 	// is covered, and a covered basket reports no shortages. mergeCatalog blocks
 	// EVERY line when CanFulfill is false, so the fixture must not fake a
 	// per-line pass on an unfulfillable basket.
-	res := AvailabilityResult{CanFulfill: true}
+	res := AvailabilityResult{CanFulfill: true, UnknownSKUIDs: f.unknown}
+	if len(f.unknown) > 0 {
+		res.CanFulfill = false // an unknown SKU can never be promised
+	}
 	for _, l := range lines {
 		have := qty[l.SKUID]
 		if have < l.Quantity {
@@ -794,9 +800,15 @@ type fakeNotifier struct {
 	started, activity, finalized []string
 }
 
-func (f *fakeNotifier) SessionStarted(_ context.Context, id string)   { f.started = append(f.started, id) }
-func (f *fakeNotifier) SessionActivity(_ context.Context, id string)  { f.activity = append(f.activity, id) }
-func (f *fakeNotifier) SessionFinalized(_ context.Context, id string) { f.finalized = append(f.finalized, id) }
+func (f *fakeNotifier) SessionStarted(_ context.Context, id string) {
+	f.started = append(f.started, id)
+}
+func (f *fakeNotifier) SessionActivity(_ context.Context, id string) {
+	f.activity = append(f.activity, id)
+}
+func (f *fakeNotifier) SessionFinalized(_ context.Context, id string) {
+	f.finalized = append(f.finalized, id)
+}
 
 func TestCreateSession_FiresSessionStartedOnNotifier(t *testing.T) {
 	repo := &fakeRepo{}
