@@ -92,6 +92,15 @@ type Shortage struct {
 type AvailabilityResult struct {
 	CanFulfill bool
 	Shortages  []Shortage
+	// UnknownSKUIDs are SKUs inventory does not track at all (pkg v0.35.0).
+	//
+	// NOT a shortage, and checkout must not present it as one. A shortage is a
+	// business answer the shopper can act on by requoting; an unknown SKU means
+	// the authority has no data, which is an operator problem. Telling a customer
+	// "no longer available" for a SKU that may well be in stock is a lost sale
+	// caused by a missing row, so this path fails CLOSED (ErrUpstream, 503,
+	// retryable) exactly like an unreachable inventory.
+	UnknownSKUIDs []string
 }
 
 // AvailabilityChecker is the logic-layer port for Inventory's basket
@@ -236,6 +245,11 @@ func (s *CheckoutService) resolveCatalog(ctx context.Context, lines []Availabili
 	switch {
 	case ar.err != nil:
 		recordAvailabilityCheck(ctx, availabilityError)
+	case len(ar.res.UnknownSKUIDs) > 0:
+		// Ranked ABOVE CanFulfill on purpose: an unknown SKU forces can_fulfill
+		// false, so classifying by CanFulfill first would file every data gap as
+		// a shortage — the exact confusion this outcome exists to end.
+		recordAvailabilityCheck(ctx, availabilityUnknownSKU)
 	case ar.res.CanFulfill:
 		recordAvailabilityCheck(ctx, availabilityOK)
 	default:
@@ -246,6 +260,15 @@ func (s *CheckoutService) resolveCatalog(ctx context.Context, lines []Availabili
 	}
 	if ar.err != nil {
 		return nil, false, ar.err
+	}
+	// Fail CLOSED on a data gap. Inventory cannot say whether these SKUs are
+	// buyable, so neither can checkout: a 503 the shopper can retry beats telling
+	// them an item is gone when a missing balance row is the only evidence.
+	// Deliberately after the price error check, so a genuine transport failure
+	// still reports as itself.
+	if len(ar.res.UnknownSKUIDs) > 0 {
+		return nil, false, fmt.Errorf("%w: inventory does not track sku(s) %v",
+			ErrUpstream, ar.res.UnknownSKUIDs)
 	}
 	return mergeCatalog(lines, pr.infos, ar.res), pricedAnyRequested(asked, pr.infos), nil
 }

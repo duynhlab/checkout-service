@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,6 +136,64 @@ func TestResolveCatalog_CheckAvailabilityError_FailsClosed(t *testing.T) {
 	}
 	if out != nil {
 		t.Errorf("no partial result on failure, got %+v", out)
+	}
+}
+
+// An unknown SKU is a DATA problem, not a business answer. Inventory cannot say
+// whether the SKU is buyable, so checkout must not either: fail closed with
+// ErrUpstream (→ 503, retryable) rather than reporting it blocked, which would
+// tell the shopper an item is gone on the evidence of a missing balance row.
+func TestResolveCatalog_UnknownSKU_FailsClosed(t *testing.T) {
+	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}
+	checker := &fakeChecker{res: AvailabilityResult{UnknownSKUIDs: []string{"1"}}}
+	svc := splitSvc(prices, checker)
+
+	out, answered, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 1}})
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("err = %v, want ErrUpstream (fail closed on a data gap)", err)
+	}
+	if out != nil || answered {
+		t.Errorf("no partial answer on a data gap: out=%+v answered=%v", out, answered)
+	}
+	if !strings.Contains(err.Error(), "1") {
+		t.Errorf("err = %q, want the offending sku named for the operator", err)
+	}
+}
+
+// The customer-facing difference the field exists for: a tracked shortage is a
+// requote, an untracked SKU is a 503. Same can_fulfill=false on the wire.
+func TestResolveCatalog_TrackedShortage_IsNotAnError(t *testing.T) {
+	prices := &fakePrices{infos: []PriceInfo{{ProductID: "1", Sellable: true}}}
+	checker := &fakeChecker{res: AvailabilityResult{
+		Shortages: []Shortage{{SKUID: "1", Requested: 5, AvailableToPromise: 2}},
+	}}
+	svc := splitSvc(prices, checker)
+
+	out, _, err := svc.resolveCatalog(context.Background(), []AvailabilityLine{{SKUID: "1", Quantity: 5}})
+	if err != nil {
+		t.Fatalf("a shortage is a business answer, not an error: %v", err)
+	}
+	if len(out) != 1 || out[0].AvailableQty != 0 {
+		t.Errorf("merged = %+v, want the line blocked so the shopper requotes", out)
+	}
+}
+
+// An unknown SKU forces can_fulfill=false, so a mixed reply must not be filed as
+// a shortage: the data gap is the blocking reason an operator has to act on.
+func TestResolveCatalog_UnknownSKU_OutranksShortage(t *testing.T) {
+	prices := &fakePrices{infos: []PriceInfo{
+		{ProductID: "1", Sellable: true}, {ProductID: "2", Sellable: true},
+	}}
+	checker := &fakeChecker{res: AvailabilityResult{
+		Shortages:     []Shortage{{SKUID: "1", Requested: 5, AvailableToPromise: 2}},
+		UnknownSKUIDs: []string{"2"},
+	}}
+	svc := splitSvc(prices, checker)
+
+	_, _, err := svc.resolveCatalog(context.Background(),
+		[]AvailabilityLine{{SKUID: "1", Quantity: 5}, {SKUID: "2", Quantity: 1}})
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("err = %v, want ErrUpstream: an unknown SKU outranks a shortage", err)
 	}
 }
 

@@ -159,7 +159,11 @@ func (c *InventoryClient) CheckAvailability(ctx context.Context, items []logicv1
 			AvailableToPromise: s.GetAvailableToPromise(),
 		})
 	}
-	return logicv1.AvailabilityResult{CanFulfill: resp.GetCanFulfill(), Shortages: shortages}, nil
+	return logicv1.AvailabilityResult{
+		CanFulfill:    resp.GetCanFulfill(),
+		Shortages:     shortages,
+		UnknownSKUIDs: resp.GetUnknownSkuIds(),
+	}, nil
 }
 
 // ShippingClient satisfies logicv1.ShippingQuoter over shipping.v1/GetQuote —
