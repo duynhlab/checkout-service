@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/duynhlab/pkg/idempotency"
 
@@ -117,5 +118,89 @@ func TestWrapIdemIsTransparentOnARealStore(t *testing.T) {
 	}
 	if _, proceed, err := s.Claim(ctx, 7, "wrap-key-2", "POST", "/confirm", "h2"); err != nil || !proceed {
 		t.Fatalf("reclaim after release: proceed=%v err=%v", proceed, err)
+	}
+}
+
+// The promo lock convoy must surface as CONTENTION (55P03, a 500-class error),
+// never as fake unavailability. Before the SET LOCAL lock_timeout, a waiter
+// queued behind a held FOR UPDATE died at the 3s query deadline, which the
+// classifier reads as ErrUnavailable — a hot promo code could manufacture
+// fake-failover 503s and on-call breadcrumbs during a flash sale.
+func TestRedeemPromoLockConvoyIsContentionNotUnavailability(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	// tx1 parks on the code row, simulating a slow concurrent redemption.
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("holder begin: %v", err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx,
+		`SELECT 1 FROM promo_codes WHERE code = 'SAVE5' FOR UPDATE`); err != nil {
+		t.Fatalf("holder lock: %v", err)
+	}
+
+	start := time.Now()
+	err = repo.RedeemPromo(ctx, "SAVE5", "7", "33333333-3333-3333-3333-333333333333")
+	waited := time.Since(start)
+
+	if err == nil {
+		t.Fatal("a redemption queued behind a held lock must fail, not hang past the deadline")
+	}
+	if errors.Is(err, domain.ErrUnavailable) {
+		t.Fatalf("lock contention was classified as datastore unavailability: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("want SQLSTATE 55P03 (lock_not_available), got %v", err)
+	}
+	// The whole point of the 2s lock_timeout: fail BEFORE the 3s query deadline.
+	if waited >= 3*time.Second {
+		t.Fatalf("waited %v — the lock_timeout did not fire before the query deadline", waited)
+	}
+}
+
+// An infrastructure failure inside ExpireDue must propagate, never read as
+// "session gone" (OutcomeGone permanently stops the abandonment workflow).
+// Honest scope note: dropping the table breaks the flow at the FIRST statement
+// that touches it — the parked-confirm UPDATE — because every statement in the
+// method reads the same objects, so the binding-read branch itself cannot be
+// failure-injected from the schema. That branch's verdict table is pinned by
+// the unit test TestConfirmingBindingOutcome; this test guards the method-wide
+// property against a real Postgres.
+func TestExpireDueBindingReadFailurePropagatesInsteadOfGone(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	s := newSession("expire-victim")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := repo.UpdateStatus(ctx, s.ID, domain.StatusOpen, domain.StatusReady); err != nil {
+		t.Fatalf("to ready: %v", err)
+	}
+	if err := repo.BeginConfirm(ctx, s.ID, 42); err != nil {
+		t.Fatalf("begin confirm: %v", err)
+	}
+
+	// Break the binding read deterministically: this test owns its database.
+	if _, err := pool.Exec(ctx, `DROP TABLE idempotency_keys CASCADE`); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+
+	outcome, _, err := repo.ExpireDue(ctx, s.ID, time.Minute)
+	if err == nil {
+		t.Fatalf("want the binding-read failure to propagate, got outcome %q with nil error", outcome)
+	}
+	if outcome == domain.OutcomeGone {
+		t.Fatal("an infrastructure failure was converted into OutcomeGone — the workflow would abandon the session forever")
+	}
+	// 42P01 (undefined_table) is OUR bug class, so it must stay unclassified;
+	// the point here is propagation, not the verdict.
+	if errors.Is(err, domain.ErrUnavailable) {
+		t.Fatalf("undefined_table misclassified as unavailability: %v", err)
 	}
 }
