@@ -16,6 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/duynhlab/pkg/idempotency"
+
 	"github.com/duynhlab/checkout-service/internal/core/domain"
 )
 
@@ -75,5 +77,45 @@ func TestBusinessErrorsAreNotClassifiedAsUnavailable(t *testing.T) {
 	}
 	if errors.Is(err, domain.ErrUnavailable) {
 		t.Error("a missing row was classified as datastore unavailability")
+	}
+}
+
+// WrapIdem over the real pkg store against the real schema: the adapter must
+// be transparent on the happy path (this also exercises the constructor the
+// unit tests bypass by building the struct directly).
+func TestWrapIdemIsTransparentOnARealStore(t *testing.T) {
+	pool := newTestDB(t)
+	s := WrapIdem(idempotency.New(pool, time.Minute))
+	ctx := context.Background()
+
+	rec, proceed, err := s.Claim(ctx, 7, "wrap-key", "POST", "/confirm", "h1")
+	if err != nil || !proceed || rec == nil {
+		t.Fatalf("claim: rec=%v proceed=%v err=%v", rec, proceed, err)
+	}
+	subject := int64(42)
+	if err := s.Checkpoint(ctx, rec.ID, &subject); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := s.Finish(ctx, rec.ID, 201, []byte(`{}`)); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	// A finished key replays instead of proceeding.
+	rec2, proceed2, err := s.Claim(ctx, 7, "wrap-key", "POST", "/confirm", "h1")
+	if err != nil || proceed2 {
+		t.Fatalf("replay claim: proceed=%v err=%v — want cached replay", proceed2, err)
+	}
+	if rec2.ResponseCode == nil || *rec2.ResponseCode != 201 {
+		t.Fatalf("replayed code = %v, want 201", rec2.ResponseCode)
+	}
+	// Release on a fresh claim leaves the key reclaimable.
+	rec3, _, err := s.Claim(ctx, 7, "wrap-key-2", "POST", "/confirm", "h2")
+	if err != nil {
+		t.Fatalf("claim 2: %v", err)
+	}
+	if err := s.Release(ctx, rec3.ID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, proceed, err := s.Claim(ctx, 7, "wrap-key-2", "POST", "/confirm", "h2"); err != nil || !proceed {
+		t.Fatalf("reclaim after release: proceed=%v err=%v", proceed, err)
 	}
 }

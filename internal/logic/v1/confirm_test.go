@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -624,5 +625,94 @@ func TestConfirm_RedeemTransientIsRetryable(t *testing.T) {
 	_, err := confirmSvc(repo, inStock(), idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
 	if !errors.Is(err, ErrUpstream) || idem.released != 1 || repo.promoStripped {
 		t.Fatalf("err=%v released=%d stripped=%v, want retryable with session intact", err, idem.released, repo.promoStripped)
+	}
+}
+
+// --- datastore unavailability keeps its own name through the confirm flow ---
+
+func unavailableErr() error {
+	return fmt.Errorf("%w: %w", domain.ErrUnavailable, context.DeadlineExceeded)
+}
+
+// Each subtest injects unavailability at one depth of the flow. Before the
+// fix these all surfaced as ErrConfirmInFlight — a 409 at the edge, which
+// burns no error budget, so a failover mid-confirm was invisible to
+// availability alerting.
+func TestConfirm_UnavailabilityKeepsItsNameMidFlow(t *testing.T) {
+	tests := []struct {
+		name string
+		repo *fakeRepo
+	}{
+		{"entry-gate CAS (BeginConfirm)",
+			&fakeRepo{byID: readySession(), beginConfirmErr: unavailableErr()}},
+		{"post-gate re-read",
+			&fakeRepo{byID: readySession(), byIDErrOnCall: 2, byIDErrValue: unavailableErr()}},
+		{"completeConfirm recovery read",
+			&fakeRepo{byID: readySession(), completeErr: domain.ErrStaleTransition,
+				byIDErrOnCall: 3, byIDErrValue: unavailableErr()}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			idem := &fakeIdem{record: &idempotency.Record{ID: 7}, proceed: true}
+			svc := confirmSvc(tc.repo, inStock(), idem, &fakeOrders{orderID: "42", status: "created"})
+
+			_, err := svc.Confirm(context.Background(), "7", "sess-1", "key-1")
+			if !errors.Is(err, domain.ErrUnavailable) {
+				t.Fatalf("want ErrUnavailable to survive, got %v", err)
+			}
+			if errors.Is(err, ErrConfirmInFlight) {
+				t.Fatal("unavailability was laundered into ErrConfirmInFlight")
+			}
+		})
+	}
+}
+
+// The controls: every non-unavailability failure at the same three sites must
+// KEEP answering ErrConfirmInFlight, or the fix widened the contract.
+func TestConfirm_OrdinaryFailuresAtTheSameSitesStay409(t *testing.T) {
+	generic := errors.New("row vanished")
+	tests := []struct {
+		name string
+		repo *fakeRepo
+	}{
+		{"entry-gate CAS lost",
+			&fakeRepo{byID: readySession(), beginConfirmErr: generic}},
+		{"post-gate re-read misses",
+			&fakeRepo{byID: readySession(), byIDErrOnCall: 2, byIDErrValue: generic}},
+		{"completeConfirm recovery read misses",
+			&fakeRepo{byID: readySession(), completeErr: domain.ErrStaleTransition,
+				byIDErrOnCall: 3, byIDErrValue: generic}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			idem := &fakeIdem{record: &idempotency.Record{ID: 7}, proceed: true}
+			svc := confirmSvc(tc.repo, inStock(), idem, &fakeOrders{orderID: "42", status: "created"})
+
+			_, err := svc.Confirm(context.Background(), "7", "sess-1", "key-1")
+			if !errors.Is(err, ErrConfirmInFlight) {
+				t.Fatalf("want ErrConfirmInFlight, got %v", err)
+			}
+		})
+	}
+}
+
+// A binding mismatch on the re-read (no error, wrong state) is the original
+// TOCTOU arm of rereadConfirming and must stay a 409.
+func TestConfirm_RereadBindingMismatchIs409(t *testing.T) {
+	repo := &fakeRepo{byID: readySession()}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 7}, proceed: true}
+	svc := confirmSvc(repo, inStock(), idem, &fakeOrders{orderID: "42", status: "created"})
+
+	// BeginConfirm succeeds against the ready session, but the RE-READ sees a
+	// foreign binding: a concurrent same-session confirm won a race in between.
+	foreign := readySession()
+	other := int64(99)
+	foreign.Status = domain.StatusConfirming
+	foreign.ConfirmKeyID = &other
+	repo.byIDSecond = foreign
+
+	_, err := svc.Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrConfirmInFlight) {
+		t.Fatalf("want ErrConfirmInFlight on a foreign binding, got %v", err)
 	}
 }
