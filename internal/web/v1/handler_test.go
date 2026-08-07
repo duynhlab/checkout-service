@@ -25,10 +25,17 @@ func init() { gin.SetMode(gin.TestMode) }
 // --- logic doubles (repo/cart/product level, driving the real logic layer) ---
 
 type fakeRepo struct {
-	active         *domain.Session
-	byID           *domain.Session
-	createErr      error
-	findErr        error
+	active      *domain.Session
+	byID        *domain.Session
+	createErr   error
+	findErr     error
+	beginErr    error
+	completeErr error
+	// findErrOnCall fails only the Nth FindByID call (1-based): the confirm
+	// flow re-reads the session AFTER winning the gate, and that second read
+	// hitting a failover must not masquerade as "confirm in flight".
+	findErrOnCall  int
+	findCalls      int
 	persistedToken string
 }
 
@@ -44,8 +51,12 @@ func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
 // session-scoped endpoint loads the session before doing anything else, so one
 // hook here exercises the whole respondSessionError surface.
 func (f *fakeRepo) FindByID(_ context.Context, _ string) (*domain.Session, error) {
-	if f.findErr != nil {
-		return nil, f.findErr
+	f.findCalls++
+	if f.findErr != nil || f.findCalls == f.findErrOnCall {
+		if f.findErr != nil {
+			return nil, f.findErr
+		}
+		return nil, errUnavailableForTest()
 	}
 	if f.byID == nil {
 		return nil, domain.ErrSessionNotFound
@@ -86,6 +97,9 @@ func (f *fakeRepo) SetPaymentToken(_ context.Context, _ string, _ domain.Session
 func (f *fakeRepo) Touch(_ context.Context, _ string, _ time.Time) error { return nil }
 
 func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error {
+	if f.beginErr != nil {
+		return f.beginErr
+	}
 	if f.byID != nil {
 		f.byID.Status = domain.StatusConfirming
 		k := keyID
@@ -98,7 +112,9 @@ func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain
 	return nil
 }
 
-func (f *fakeRepo) CompleteSession(_ context.Context, _ string, _ int64, _ string) error { return nil }
+func (f *fakeRepo) CompleteSession(_ context.Context, _ string, _ int64, _ string) error {
+	return f.completeErr
+}
 
 func (f *fakeRepo) GetPromo(_ context.Context, code string) (*domain.Promo, error) {
 	if code != "WELCOME10" {
@@ -469,9 +485,15 @@ func confirmRouter(repo *fakeRepo, idem logicv1.IdemStore, orders logicv1.OrderC
 	return r
 }
 
-type webIdem struct{ rec *idempotency.Record }
+type webIdem struct {
+	rec      *idempotency.Record
+	claimErr error
+}
 
 func (f *webIdem) Claim(_ context.Context, _ int64, _, _, _, _ string) (*idempotency.Record, bool, error) {
+	if f.claimErr != nil {
+		return nil, false, f.claimErr
+	}
 	return f.rec, true, nil
 }
 func (f *webIdem) Checkpoint(_ context.Context, _ int64, subjectID *int64) error {
@@ -724,5 +746,85 @@ func TestConfirmAnswers503WhenDatastoreUnavailable(t *testing.T) {
 	}
 	if got := rec.Header().Get("Retry-After"); got != "2" {
 		t.Errorf("Retry-After = %q, want %q", got, "2")
+	}
+}
+
+// errUnavailableForTest is the exact shape the repository produces.
+func errUnavailableForTest() error {
+	return fmt.Errorf("%w: %w", domain.ErrUnavailable, context.DeadlineExceeded)
+}
+
+// The review finding these pin down: three confirm-flow sites mapped ANY error
+// from a repository call onto ErrConfirmInFlight, so a failover striking after
+// the initial session load answered 409 "A confirm is already in flight" — a
+// 4xx, which does not even burn error budget, while telling the shopper a
+// confirm exists that does not. Each subtest injects unavailability at a
+// different depth of the flow; all must surface as 503.
+func TestConfirmMidFlowUnavailabilityIs503Not409(t *testing.T) {
+	tests := []struct {
+		name string
+		repo *fakeRepo
+		idem *webIdem
+	}{
+		{
+			// Site 1: the entry-gate CAS (ready -> confirming).
+			name: "BeginConfirm",
+			repo: &fakeRepo{byID: readyWebSession("7"), beginErr: errUnavailableForTest()},
+			idem: &webIdem{rec: &idempotency.Record{ID: 11}},
+		},
+		{
+			// Site 2: the post-gate TOCTOU re-read (second FindByID).
+			name: "post-gate re-read",
+			repo: &fakeRepo{byID: readyWebSession("7"), findErrOnCall: 2},
+			idem: &webIdem{rec: &idempotency.Record{ID: 11}},
+		},
+		{
+			// Site 3: the stale-CAS recovery re-read inside completeConfirm.
+			name: "completeConfirm re-read",
+			repo: &fakeRepo{byID: readyWebSession("7"), completeErr: domain.ErrStaleTransition, findErrOnCall: 3},
+			idem: &webIdem{rec: &idempotency.Record{ID: 11}},
+		},
+		{
+			// Site 4: the idempotency store runs on the SAME pool but sits
+			// outside the repository package, so its errors must cross the
+			// classifier via the wiring adapter. Claim is one of the first DB
+			// writes of a confirm — during a real switchover this is the arm
+			// that fires most often.
+			name: "idempotency Claim",
+			repo: &fakeRepo{byID: readyWebSession("7")},
+			idem: &webIdem{claimErr: errUnavailableForTest()},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := confirmRouter(tc.repo, tc.idem, &webOrders{}, "7")
+			rec := doConfirm(r, "key-1")
+
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want 503: %s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Retry-After"); got != "2" {
+				t.Errorf("Retry-After = %q, want %q", got, "2")
+			}
+		})
+	}
+}
+
+// The 409 mapping must survive for what it is FOR: a genuinely concurrent
+// confirm. Without this control, the fix above could be "widened" to
+// propagate every error and nobody would notice the 409 contract breaking.
+func TestConcurrentConfirmStays409(t *testing.T) {
+	// A session already confirming under a DIFFERENT key.
+	s := readyWebSession("7")
+	s.Status = domain.StatusConfirming
+	other := int64(99)
+	s.ConfirmKeyID = &other
+	repo := &fakeRepo{byID: s}
+	r := confirmRouter(repo, &webIdem{rec: &idempotency.Record{ID: 11}}, &webOrders{}, "7")
+
+	rec := doConfirm(r, "key-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
 	}
 }

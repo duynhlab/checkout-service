@@ -158,10 +158,9 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 	// Re-read after winning the gate: a concurrent PUT (ready→ready token
 	// re-attach) between our read and the CAS must not send a stale token or
 	// items to order (security-review TOCTOU finding).
-	session, err = s.repo.FindByID(ctx, session.ID)
-	if err != nil || session.Status != domain.StatusConfirming ||
-		session.ConfirmKeyID == nil || *session.ConfirmKeyID != key.ID {
-		return nil, ErrConfirmInFlight
+	session, err = s.rereadConfirming(ctx, session.ID, key.ID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Re-validate and redeem ONLY while no order attempt was ever authorized
@@ -218,6 +217,27 @@ func (s *CheckoutService) claimConfirm(ctx context.Context, uid int64, idemKey, 
 	return key, nil, nil
 }
 
+// rereadConfirming reloads the session after winning the entry gate and checks
+// the claim binding still holds. A mismatch is a concurrent confirm (409); an
+// unavailable datastore keeps its own name — a failover here leaves the
+// session parked in confirming under our key, the same state a process crash
+// mid-confirm leaves, and it recovers the same way: a retry re-enters via the
+// matching-key arm after the lock takeover, or ExpireDue reaps it.
+func (s *CheckoutService) rereadConfirming(ctx context.Context, sessionID string, keyID int64) (*domain.Session, error) {
+	session, err := s.repo.FindByID(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, domain.ErrUnavailable) {
+			return nil, err
+		}
+		return nil, ErrConfirmInFlight
+	}
+	if session.Status != domain.StatusConfirming ||
+		session.ConfirmKeyID == nil || *session.ConfirmKeyID != keyID {
+		return nil, ErrConfirmInFlight
+	}
+	return session, nil
+}
+
 // enterConfirm applies the entry gate and the session↔key mutual exclusion.
 // done=true means the completed-recovery path already produced the answer
 // (rebuild + Finish); a non-nil error rejects the confirm.
@@ -225,6 +245,14 @@ func (s *CheckoutService) enterConfirm(ctx context.Context, session *domain.Sess
 	switch session.Status { //nolint:exhaustive // every other status has no confirm entry
 	case domain.StatusReady:
 		if err := s.repo.BeginConfirm(ctx, session.ID, keyID); err != nil {
+			// Only a lost CAS means "someone else is confirming". An
+			// unavailable datastore must keep its own name: mapping it onto
+			// ErrConfirmInFlight would answer a 4xx during a failover — worse
+			// than the old 500, because 4xx does not even burn error budget
+			// (review finding on the original fix).
+			if errors.Is(err, domain.ErrUnavailable) {
+				return false, err
+			}
 			return false, ErrConfirmInFlight
 		}
 		return false, nil
@@ -348,7 +376,17 @@ func (s *CheckoutService) completeConfirm(ctx context.Context, session *domain.S
 		return nil, err
 	}
 	fresh, ferr := s.repo.FindByID(ctx, session.ID)
-	if ferr != nil || fresh.Status != domain.StatusCompleted ||
+	if ferr != nil {
+		// The order was already created; only the session CAS answer is
+		// unknown. 503 with the SAME key is exactly right: the retry re-enters
+		// the completed-recovery arm and returns the existing order — never a
+		// second one.
+		if errors.Is(ferr, domain.ErrUnavailable) {
+			return nil, ferr
+		}
+		return nil, ErrConfirmInFlight
+	}
+	if fresh.Status != domain.StatusCompleted ||
 		fresh.ConfirmKeyID == nil || *fresh.ConfirmKeyID != keyID {
 		return nil, ErrConfirmInFlight
 	}
