@@ -45,7 +45,8 @@ func NewSessionRepository(db *pgxpool.Pool) *SessionRepository {
 // Create inserts the session and its item snapshot in one transaction. A
 // second active session for the user maps to domain.ErrActiveSessionExists
 // (partial unique index).
-func (r *SessionRepository) Create(ctx context.Context, s *domain.Session) error {
+func (r *SessionRepository) Create(ctx context.Context, s *domain.Session) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -92,7 +93,8 @@ func (r *SessionRepository) Create(ctx context.Context, s *domain.Session) error
 
 // FindByID loads a session with its items. Ownership is NOT checked here —
 // the logic layer owns that rule.
-func (r *SessionRepository) FindByID(ctx context.Context, id string) (*domain.Session, error) {
+func (r *SessionRepository) FindByID(ctx context.Context, id string) (_ *domain.Session, err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -105,7 +107,8 @@ func (r *SessionRepository) FindByID(ctx context.Context, id string) (*domain.Se
 }
 
 // FindActiveByUserID loads the user's single active session, if any.
-func (r *SessionRepository) FindActiveByUserID(ctx context.Context, userID string) (*domain.Session, error) {
+func (r *SessionRepository) FindActiveByUserID(ctx context.Context, userID string) (_ *domain.Session, err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -120,7 +123,8 @@ func (r *SessionRepository) FindActiveByUserID(ctx context.Context, userID strin
 }
 
 // UpdateStatus conditionally moves status (optimistic concurrency on `from`).
-func (r *SessionRepository) UpdateStatus(ctx context.Context, id string, from, to domain.SessionStatus) error {
+func (r *SessionRepository) UpdateStatus(ctx context.Context, id string, from, to domain.SessionStatus) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -140,7 +144,8 @@ func (r *SessionRepository) UpdateStatus(ctx context.Context, id string, from, t
 // An address change INVALIDATES the shipping quote (RFC-0015: rates and tax
 // are destination-dependent): method, fee, and tax reset and the total drops
 // back to subtotal − discount, forcing the funnel through PUT shipping again.
-func (r *SessionRepository) SetAddress(ctx context.Context, id string, from domain.SessionStatus, addr *domain.Address, discountMinor int64) error {
+func (r *SessionRepository) SetAddress(ctx context.Context, id string, from domain.SessionStatus, addr *domain.Address, discountMinor int64) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -168,7 +173,8 @@ func (r *SessionRepository) SetAddress(ctx context.Context, id string, from doma
 // idempotency claim in one CAS — the session-level mutual exclusion for the
 // confirm flow (RFC-0015 P2). Idempotent for the same claim; a different
 // claim (or any other status) is ErrStaleTransition.
-func (r *SessionRepository) BeginConfirm(ctx context.Context, id string, keyID int64) error {
+func (r *SessionRepository) BeginConfirm(ctx context.Context, id string, keyID int64) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -191,7 +197,8 @@ func (r *SessionRepository) BeginConfirm(ctx context.Context, id string, keyID i
 // PRICE_CHANGED / STOCK_UNAVAILABLE path. Every write is conditional on the
 // session still being confirming under THIS claim, so it can never race a
 // concurrent completion.
-func (r *SessionRepository) RequoteItems(ctx context.Context, id string, keyID int64, items []domain.SessionItem, subtotalMinor, taxMinor, discountMinor int64) error {
+func (r *SessionRepository) RequoteItems(ctx context.Context, id string, keyID int64, items []domain.SessionItem, subtotalMinor, taxMinor, discountMinor int64) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -234,7 +241,8 @@ func (r *SessionRepository) RequoteItems(ctx context.Context, id string, keyID i
 // on the claim binding. The binding is deliberately KEPT on the completed row:
 // it is the recovery proof that lets the same claim rebuild and cache the
 // response after a crash between completion and Finish.
-func (r *SessionRepository) CompleteSession(ctx context.Context, id string, keyID int64, orderID string) error {
+func (r *SessionRepository) CompleteSession(ctx context.Context, id string, keyID int64, orderID string) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -254,7 +262,8 @@ func (r *SessionRepository) CompleteSession(ctx context.Context, id string, keyI
 // SetShipping persists the shipping choice and shipping_set in one
 // conditional write. total_minor is recomputed in SQL from the persisted
 // components so the stored total can never drift from its parts.
-func (r *SessionRepository) SetShipping(ctx context.Context, id string, from domain.SessionStatus, asOf time.Time, method string, feeMinor, taxMinor, discountMinor int64) error {
+func (r *SessionRepository) SetShipping(ctx context.Context, id string, from domain.SessionStatus, asOf time.Time, method string, feeMinor, taxMinor, discountMinor int64) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -282,7 +291,8 @@ func (r *SessionRepository) SetShipping(ctx context.Context, id string, from dom
 // SetPaymentToken persists the tok_ reference and ready in one conditional
 // write. The logic layer has already validated the token shape — PAN-shaped
 // input never reaches this statement.
-func (r *SessionRepository) SetPaymentToken(ctx context.Context, id string, from domain.SessionStatus, token string) error {
+func (r *SessionRepository) SetPaymentToken(ctx context.Context, id string, from domain.SessionStatus, token string) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -303,7 +313,8 @@ func (r *SessionRepository) SetPaymentToken(ctx context.Context, id string, from
 // the session ONLY if its DB deadline has actually elapsed — the timer firing
 // is a wake-up, never a verdict. Returns the outcome plus, for OutcomeNotDue,
 // how long until the real deadline so the workflow can re-arm.
-func (r *SessionRepository) ExpireDue(ctx context.Context, id string, lockTakeover time.Duration) (domain.ExpireOutcome, time.Duration, error) {
+func (r *SessionRepository) ExpireDue(ctx context.Context, id string, lockTakeover time.Duration) (_ domain.ExpireOutcome, _ time.Duration, err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -383,14 +394,15 @@ func (r *SessionRepository) ExpireDue(ctx context.Context, id string, lockTakeov
 
 // GetTaxRateBps looks up the flat tax rate (basis points) for a region,
 // falling back to the seeded DEFAULT row (RFC-0015 P3).
-func (r *SessionRepository) GetTaxRateBps(ctx context.Context, region string) (int32, error) {
+func (r *SessionRepository) GetTaxRateBps(ctx context.Context, region string) (_ int32, err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
 	var bps int32
 	// ORDER BY makes the exact-region row win deterministically — UNION ALL
 	// + LIMIT without it rides on unguaranteed planner row order (review).
-	err := r.db.QueryRow(ctx, `
+	err = r.db.QueryRow(ctx, `
 		SELECT rate_bps FROM tax_rules
 		WHERE region IN ($1, 'DEFAULT')
 		ORDER BY (region = 'DEFAULT')
@@ -408,7 +420,8 @@ func (r *SessionRepository) GetTaxRateBps(ctx context.Context, region string) (i
 // not rot (doubt-cycle b/c). A finished row reaped after ttl only downgrades
 // a very late same-key replay from a cached 201 to a 409; the session row
 // itself still shows the order.
-func (r *SessionRepository) ReapFinishedIdempotencyKeys(ctx context.Context, ttl time.Duration) (int64, error) {
+func (r *SessionRepository) ReapFinishedIdempotencyKeys(ctx context.Context, ttl time.Duration) (_ int64, err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -427,11 +440,12 @@ func (r *SessionRepository) ReapFinishedIdempotencyKeys(ctx context.Context, ttl
 // workflow (timer reset) and bumps the DB expiry here, so the lazy backstop
 // never expires a session the timer considers alive. Terminal sessions are
 // left untouched — a late Touch is a harmless no-op, like a late timer.
-func (r *SessionRepository) Touch(ctx context.Context, id string, expiresAt time.Time) error {
+func (r *SessionRepository) Touch(ctx context.Context, id string, expiresAt time.Time) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
-	_, err := r.db.Exec(ctx, `
+	_, err = r.db.Exec(ctx, `
 		UPDATE checkout_sessions SET expires_at = $2, updated_at = now()
 		WHERE id = $1 AND status NOT IN ('completed','cancelled','expired')`, id, expiresAt)
 	if err != nil {
@@ -443,7 +457,8 @@ func (r *SessionRepository) Touch(ctx context.Context, id string, expiresAt time
 // MarkExpired conditionally expires a non-terminal session. A late call
 // against a terminal session is a no-op — never an error (RFC-0015: a
 // late-firing timer must be harmless).
-func (r *SessionRepository) MarkExpired(ctx context.Context, id string, reason domain.ExpiredReason) error {
+func (r *SessionRepository) MarkExpired(ctx context.Context, id string, reason domain.ExpiredReason) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -451,7 +466,7 @@ func (r *SessionRepository) MarkExpired(ctx context.Context, id string, reason d
 	// handoff in flight (P2) and must finish or drop back to shipping_set —
 	// never be yanked to expired mid-flight. Mirrors the FSM table, which has
 	// no confirming→expired edge.
-	_, err := r.db.Exec(ctx, `
+	_, err = r.db.Exec(ctx, `
 		UPDATE checkout_sessions
 		SET status = 'expired', expired_reason = $2, updated_at = now()
 		WHERE id = $1 AND status NOT IN ('completed','cancelled','expired','confirming')`, id, reason)

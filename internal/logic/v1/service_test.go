@@ -18,10 +18,18 @@ type fakeRepo struct {
 	// activeSecond, when set, is returned from the SECOND FindActiveByUserID
 	// call onward (simulating a concurrent winner appearing between the
 	// pre-create lookup and the post-conflict re-fetch).
-	activeSecond    *domain.Session
-	activeCalls     int
-	byID            *domain.Session
-	byIDErr         error
+	activeSecond *domain.Session
+	activeCalls  int
+	byID         *domain.Session
+	byIDErr      error
+	// byIDErrOnCall fails only the Nth FindByID call (1-based); the confirm
+	// flow's post-gate re-read is call #2, completeConfirm's recovery read #3.
+	byIDErrOnCall int
+	byIDErrValue  error
+	// byIDSecond, when set, is returned from the SECOND FindByID call onward
+	// (a concurrent mutation appearing between the gate and the re-read).
+	byIDSecond      *domain.Session
+	byIDCalls       int
 	createErr       error
 	created         *domain.Session
 	updated         []string // "from→to"
@@ -77,6 +85,13 @@ func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
 }
 
 func (f *fakeRepo) FindByID(_ context.Context, _ string) (*domain.Session, error) {
+	f.byIDCalls++
+	if f.byIDErrOnCall != 0 && f.byIDCalls == f.byIDErrOnCall {
+		return nil, f.byIDErrValue
+	}
+	if f.byIDCalls > 1 && f.byIDSecond != nil {
+		return f.byIDSecond, nil
+	}
 	return f.byID, f.byIDErr
 }
 

@@ -135,7 +135,10 @@ func main() {
 		clients.NewInventoryClient(inventoryConn),
 		cfg.Checkout.SessionTTL,
 	).WithConfirm(
-		idempotency.New(pool, cfg.Checkout.IdempotencyLockTakeover),
+		// WrapIdem routes the store's errors through the same unavailability
+		// classifier as the session repository — the idempotency table lives
+		// on the same pool, and its Claim is the first write of every confirm.
+		postgres.WrapIdem(idempotency.New(pool, cfg.Checkout.IdempotencyLockTakeover)),
 		clients.NewOrderClient(orderConn),
 	).WithQuoter(clients.NewShippingClient(shippingConn))
 
