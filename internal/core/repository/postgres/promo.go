@@ -113,6 +113,17 @@ func (r *SessionRepository) RedeemPromo(ctx context.Context, code, userID, sessi
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// FOR UPDATE below serializes every redemption of a code, so a slow
+	// holder queues everyone else. Without a lock_timeout the waiters die at
+	// the 3s query deadline, which the classifier reads as datastore
+	// unavailability — a hot promo code would manufacture fake-failover 503s.
+	// 2s (< queryTimeout) surfaces the queue as SQLSTATE 55P03 instead:
+	// contention, visibly a 500. SET LOCAL is transaction-scoped, which is
+	// the only form that is safe through PgDog's transaction pooling.
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
+		return fmt.Errorf("redeem lock_timeout: %w", err)
+	}
+
 	// Lock the code row: from here every check below is serialized per code.
 	var expiresAt *time.Time
 	var maxRedemptions, perUserLimit *int

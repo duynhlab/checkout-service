@@ -374,15 +374,11 @@ func (r *SessionRepository) ExpireDue(ctx context.Context, id string, lockTakeov
 		return domain.OutcomeGone, 0, nil
 	case domain.StatusConfirming:
 		var attempted bool
-		if err := r.db.QueryRow(ctx, `
+		bindErr := r.db.QueryRow(ctx, `
 			SELECT ik.subject_id IS NOT NULL OR ik.response_code IS NOT NULL
 			FROM checkout_sessions cs JOIN idempotency_keys ik ON ik.id = cs.confirm_key_id
-			WHERE cs.id = $1`, id).Scan(&attempted); err != nil || attempted {
-			// Order attempted (or binding unreadable): ops-only recovery.
-			return domain.OutcomeGone, 0, nil
-		}
-		// Provably-dead check not passed yet: look again after the window.
-		return domain.OutcomeNotDue, lockTakeover, nil
+			WHERE cs.id = $1`, id).Scan(&attempted)
+		return confirmingBindingOutcome(attempted, bindErr, lockTakeover)
 	}
 	remaining := time.Until(expiresAt)
 	if remaining <= 0 {
@@ -390,6 +386,28 @@ func (r *SessionRepository) ExpireDue(ctx context.Context, id string, lockTakeov
 		remaining = time.Second
 	}
 	return domain.OutcomeNotDue, remaining, nil
+}
+
+// confirmingBindingOutcome decides what a confirming session's claim binding
+// means for the expiry loop. Only two answers may stop the loop for good
+// (OutcomeGone): the binding provably shows an order attempt, or the binding
+// row is genuinely absent (the claim was reaped — ops-only recovery either
+// way). An infrastructure failure reading the binding must PROPAGATE so the
+// Temporal activity retries: before this split, `err != nil || attempted`
+// folded a failover blip into OutcomeGone and the workflow abandoned the
+// session's expiry forever (review finding on #47).
+func confirmingBindingOutcome(attempted bool, err error, lockTakeover time.Duration) (domain.ExpireOutcome, time.Duration, error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OutcomeGone, 0, nil
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("expire confirm binding read: %w", err)
+	}
+	if attempted {
+		return domain.OutcomeGone, 0, nil
+	}
+	// Provably-dead check not passed yet: look again after the window.
+	return domain.OutcomeNotDue, lockTakeover, nil
 }
 
 // GetTaxRateBps looks up the flat tax rate (basis points) for a region,

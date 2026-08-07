@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -51,6 +52,11 @@ func TestClassifyPostgresErrorCodes(t *testing.T) {
 		// deadlock is a lock-ordering bug and must stay visible as one.
 		{"serialization_failure", "40001", false},
 		{"deadlock_detected", "40P01", false},
+		// lock_not_available is what RedeemPromo's SET LOCAL lock_timeout
+		// surfaces when a promo lock convoy exceeds 2s. It must stay a 500:
+		// classifying it as unavailable would let a hot promo code manufacture
+		// fake-failover 503s and on-call breadcrumbs during a flash sale.
+		{"lock_not_available", "55P03", false},
 		// Class 53 is resource exhaustion. too_many_connections is arguably
 		// unavailability, but it is the pooler's job to bound connections, so a
 		// service that trips it has a pool misconfiguration to fix, not a
@@ -181,5 +187,40 @@ func TestRepositoryReportsUnavailableWhenPostgresIsUnreachable(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("an unreachable Postgres must classify as unavailable, got %#v (%v)", err, err)
+	}
+}
+
+// The four verdicts of the confirming-binding read, pinned as a table. Only
+// two may stop the abandonment loop for good; an infrastructure failure must
+// propagate so the Temporal activity retries (before the split, any error was
+// folded into OutcomeGone and the workflow abandoned the session forever).
+func TestConfirmingBindingOutcome(t *testing.T) {
+	takeover := 90 * time.Second
+	tests := []struct {
+		name      string
+		attempted bool
+		err       error
+		outcome   domain.ExpireOutcome
+		remaining time.Duration
+		wantErr   bool
+	}{
+		{"order attempted -> gone (ops-only recovery)", true, nil, domain.OutcomeGone, 0, false},
+		{"binding reaped (no rows) -> gone", false, pgx.ErrNoRows, domain.OutcomeGone, 0, false},
+		{"not provably dead yet -> re-check after the takeover window", false, nil, domain.OutcomeNotDue, takeover, false},
+		{"infrastructure failure -> propagate, NEVER gone", false, context.DeadlineExceeded, "", 0, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			outcome, remaining, err := confirmingBindingOutcome(tc.attempted, tc.err, takeover)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if outcome != tc.outcome || remaining != tc.remaining {
+				t.Fatalf("outcome = %q/%v, want %q/%v", outcome, remaining, tc.outcome, tc.remaining)
+			}
+			if tc.wantErr && outcome == domain.OutcomeGone {
+				t.Fatal("an error verdict must never carry OutcomeGone")
+			}
+		})
 	}
 }
