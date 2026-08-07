@@ -113,6 +113,14 @@ func (h *Handler) CreateSession(c *gin.Context) {
 			c.Header("Retry-After", "2")
 			logger.Error("Session create upstream failure", zap.Error(err))
 			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
+		case errors.Is(err, domain.ErrUnavailable):
+			// Separate arm from ErrUpstream on purpose: the response is the same,
+			// but "my own database is failing over" and "a dependency is down"
+			// are different incidents with different runbooks, and the log line
+			// is the only place that difference survives.
+			c.Header("Retry-After", "2")
+			logger.Error("Session create hit an unavailable datastore", zap.Error(err))
+			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
 		default:
 			logger.Error("Session create failed", zap.Error(err))
 			httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
@@ -336,6 +344,19 @@ func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error
 		httpx.RespondError(c, http.StatusConflict, httpx.CodeInvalidTransition, "Session state does not allow this operation")
 	case errors.Is(err, domain.ErrStaleTransition):
 		httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "Session was modified concurrently; reload and retry")
+	case errors.Is(err, domain.ErrUnavailable):
+		// Checkout's OWN database being unreachable — a CNPG failover, a demoted
+		// primary, a saturated pool. 503, for the same reason a missing
+		// dependency is 503 on the create and confirm paths: 500 tells the SPA
+		// "do not retry" and tells on-call "checkout is broken" during what is a
+		// routine switchover. Retry-After turns a dead screen into a wait.
+		//
+		// Safe to advertise as retryable because every write reachable here is
+		// either idempotency-keyed or a conditional update, so a retry lands at
+		// most once and otherwise reports the lost CAS.
+		c.Header("Retry-After", "2")
+		middleware.GetLoggerFromGinContext(c).Error("Session operation hit an unavailable datastore", zap.Error(err))
+		httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
 	default:
 		middleware.GetLoggerFromGinContext(c).Error("Session operation failed", zap.Error(err))
 		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")

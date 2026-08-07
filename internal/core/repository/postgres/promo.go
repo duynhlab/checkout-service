@@ -13,12 +13,13 @@ import (
 
 // GetPromo loads a code for the apply-time advisory checks. Missing codes
 // answer domain.ErrPromoNotFound.
-func (r *SessionRepository) GetPromo(ctx context.Context, code string) (*domain.Promo, error) {
+func (r *SessionRepository) GetPromo(ctx context.Context, code string) (_ *domain.Promo, err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
 	var p domain.Promo
-	err := r.db.QueryRow(ctx, `
+	err = r.db.QueryRow(ctx, `
 		SELECT code, kind, value, expires_at, max_redemptions, redeemed_count, per_user_limit
 		FROM promo_codes WHERE code = $1`, code).
 		Scan(&p.Code, &p.Kind, &p.Value, &p.ExpiresAt, &p.MaxRedemptions, &p.RedeemedCount, &p.PerUserLimit)
@@ -32,7 +33,8 @@ func (r *SessionRepository) GetPromo(ctx context.Context, code string) (*domain.
 }
 
 // CountUserRedemptions returns how many times a user has redeemed a code.
-func (r *SessionRepository) CountUserRedemptions(ctx context.Context, code, userID string) (int, error) {
+func (r *SessionRepository) CountUserRedemptions(ctx context.Context, code, userID string) (_ int, err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -49,7 +51,8 @@ func (r *SessionRepository) CountUserRedemptions(ctx context.Context, code, user
 // session, recomposing the total in SQL — the same conditional-write style as
 // every other money mutation. from guards the status; the caller has already
 // validated the code.
-func (r *SessionRepository) SetPromo(ctx context.Context, id string, from domain.SessionStatus, code string, discountMinor int64) error {
+func (r *SessionRepository) SetPromo(ctx context.Context, id string, from domain.SessionStatus, code string, discountMinor int64) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -71,7 +74,8 @@ func (r *SessionRepository) SetPromo(ctx context.Context, id string, from domain
 // StripPromo removes an applied code from a CONFIRMING session under its
 // claim binding (the PROMO_EXHAUSTED/EXPIRED-at-confirm path — the sibling of
 // the requote write) and recomposes the total.
-func (r *SessionRepository) StripPromo(ctx context.Context, id string, keyID int64) error {
+func (r *SessionRepository) StripPromo(ctx context.Context, id string, keyID int64) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -98,7 +102,8 @@ func (r *SessionRepository) StripPromo(ctx context.Context, id string, keyID int
 // (ADR-022). The FOR UPDATE on the code row serializes every redemption of a
 // code, which makes the per-user count phantom-free; UNIQUE(code, session_id)
 // + ON CONFLICT makes crash-re-driven confirms idempotent.
-func (r *SessionRepository) RedeemPromo(ctx context.Context, code, userID, sessionID string) error {
+func (r *SessionRepository) RedeemPromo(ctx context.Context, code, userID, sessionID string) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
@@ -167,11 +172,12 @@ func (r *SessionRepository) RedeemPromo(ctx context.Context, code, userID, sessi
 
 // BackfillRedemptionOrder records the order an existing redemption produced —
 // best-effort provenance so ops can tell a used redemption from a burned one.
-func (r *SessionRepository) BackfillRedemptionOrder(ctx context.Context, code, sessionID, orderID string) error {
+func (r *SessionRepository) BackfillRedemptionOrder(ctx context.Context, code, sessionID, orderID string) (err error) {
+	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
-	_, err := r.db.Exec(ctx, `
+	_, err = r.db.Exec(ctx, `
 		UPDATE promo_redemptions SET order_id = $3
 		WHERE code = $1 AND session_id = $2 AND order_id IS NULL`, code, sessionID, orderID)
 	if err != nil {
