@@ -295,7 +295,7 @@ func TestIdempotencyKeysMigrationWorksWithPkg(t *testing.T) {
 	ctx := context.Background()
 	repo := idempotency.New(pool, time.Minute)
 
-	rec, fresh, err := repo.Claim(ctx, 7, "checkout:sess-1:key-1", "POST", "/confirm", "h1")
+	rec, fresh, err := repo.Claim(ctx, "7", "checkout:sess-1:key-1", "POST", "/confirm", "h1")
 	if err != nil || !fresh {
 		t.Fatalf("Claim fresh = (%v, %v), want fresh claim", fresh, err)
 	}
@@ -307,7 +307,7 @@ func TestIdempotencyKeysMigrationWorksWithPkg(t *testing.T) {
 		t.Fatalf("Finish (jsonb under simple protocol): %v", err)
 	}
 
-	replay, fresh, err := repo.Claim(ctx, 7, "checkout:sess-1:key-1", "POST", "/confirm", "h1")
+	replay, fresh, err := repo.Claim(ctx, "7", "checkout:sess-1:key-1", "POST", "/confirm", "h1")
 	if err != nil || fresh {
 		t.Fatalf("Claim replay = (%v, %v), want existing record", fresh, err)
 	}
@@ -451,13 +451,13 @@ func TestSessionRepository_ReapKeepsUnfinishedKeys(t *testing.T) {
 	// One finished old row, one unfinished old row (a parked confirm's claim).
 	_, err := pool.Exec(ctx, `
 		INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, created_at, response_code, response_body)
-		VALUES (7, 'old-finished', 'POST', '/confirm', 'h', now() - interval '48 hours', 201, '{}'::jsonb)`)
+		VALUES ('7', 'old-finished', 'POST', '/confirm', 'h', now() - interval '48 hours', 201, '{}'::jsonb)`)
 	if err != nil {
 		t.Fatalf("seed finished: %v", err)
 	}
 	_, err = pool.Exec(ctx, `
 		INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, created_at)
-		VALUES (7, 'old-parked', 'POST', '/confirm', 'h', now() - interval '48 hours')`)
+		VALUES ('7', 'old-parked', 'POST', '/confirm', 'h', now() - interval '48 hours')`)
 	if err != nil {
 		t.Fatalf("seed parked: %v", err)
 	}
@@ -516,7 +516,7 @@ func TestSessionRepository_ExpireDueParkedConfirmRecovery(t *testing.T) {
 		var keyID int64
 		if err := pool.QueryRow(ctx, `
 			INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, locked_at, subject_id)
-			VALUES ($1::bigint, 'parked-'||$2, 'POST', '/confirm', 'h', now() - interval '10 minutes', $3)
+			VALUES ($1, 'parked-'||$2, 'POST', '/confirm', 'h', now() - interval '10 minutes', $3)
 			RETURNING id`, userID, s.ID, subject).Scan(&keyID); err != nil {
 			t.Fatalf("seed claim: %v", err)
 		}

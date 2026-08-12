@@ -23,6 +23,7 @@ type fakeIdem struct {
 	proceed     bool
 	claimErr    error
 	claimCalls  int
+	claimedUser string
 	checkpoints []int64
 	chkErr      error
 	released    int
@@ -31,8 +32,9 @@ type fakeIdem struct {
 	finishBody  []byte
 }
 
-func (f *fakeIdem) Claim(_ context.Context, _ int64, _, _, _, _ string) (*idempotency.Record, bool, error) {
+func (f *fakeIdem) Claim(_ context.Context, userID, _, _, _, _ string) (*idempotency.Record, bool, error) {
 	f.claimCalls++
+	f.claimedUser = userID
 	return f.record, f.proceed, f.claimErr
 }
 
@@ -146,6 +148,66 @@ func TestConfirm_ReplayReturnsCacheWithoutSideEffects(t *testing.T) {
 	}
 	if s.OrderID != "42" || orders.calls != 0 || repo.completedOrder != "" {
 		t.Errorf("replay must be pure cache: order=%s calls=%d", s.OrderID, orders.calls)
+	}
+}
+
+// --- OIDC string subjects (ADR-042) ---
+
+// The user id is the OIDC token subject — an opaque string with no numeric
+// shape. The idempotency claim must receive it verbatim, and a finished record
+// keyed by it must replay verbatim.
+func TestConfirm_UUIDSubjectClaimsAndReplaysVerbatim(t *testing.T) {
+	const sub = "a11ce000-0000-4000-8000-000000000001"
+	fresh := readySession()
+	fresh.UserID = sub
+	repo := &fakeRepo{byID: fresh}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	orders := &fakeOrders{orderID: "42", status: "pending"}
+
+	s, err := confirmSvc(repo, inStock(), idem, orders).Confirm(context.Background(), sub, "sess-1", "key-1")
+	if err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	if s.Status != domain.StatusCompleted || s.OrderID != "42" {
+		t.Errorf("session = %s/%s, want completed/42", s.Status, s.OrderID)
+	}
+	if idem.claimedUser != sub {
+		t.Errorf("Claim userID = %q, want the OIDC subject verbatim", idem.claimedUser)
+	}
+
+	// Same-key retry: the finished record keyed by the same subject must
+	// answer from the cache without a second order attempt.
+	code := 201
+	replayIdem := &fakeIdem{proceed: false, record: &idempotency.Record{
+		ID: 11, ResponseCode: &code, ResponseBody: idem.finishBody,
+	}}
+	replayOrders := &fakeOrders{}
+	s, err = confirmSvc(repo, inStock(), replayIdem, replayOrders).Confirm(context.Background(), sub, "sess-1", "key-1")
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if s.OrderID != "42" || replayOrders.calls != 0 {
+		t.Errorf("replay must be pure cache: order=%s calls=%d", s.OrderID, replayOrders.calls)
+	}
+	if replayIdem.claimedUser != sub {
+		t.Errorf("replay Claim userID = %q, want the OIDC subject verbatim", replayIdem.claimedUser)
+	}
+}
+
+// authmw rejects tokens without a sub, so an empty subject reaching the logic
+// layer is a bug — refused before any side effect (replaces the old numeric
+// ParseInt guard).
+func TestConfirm_EmptySubjectRejectedBeforeAnySideEffect(t *testing.T) {
+	repo := &fakeRepo{byID: readySession()}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+	orders := &fakeOrders{}
+
+	_, err := confirmSvc(repo, inStock(), idem, orders).Confirm(context.Background(), "", "sess-1", "key-1")
+	if err == nil {
+		t.Fatal("Confirm with an empty subject must fail")
+	}
+	if idem.claimCalls != 0 || orders.calls != 0 || repo.confirmedKey != 0 {
+		t.Error("empty subject must have zero side effects (no claim, no binding, no order)")
 	}
 }
 
