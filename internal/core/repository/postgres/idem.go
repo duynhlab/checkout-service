@@ -11,7 +11,7 @@ import (
 // concrete *idempotency.Repository without this package importing the logic
 // layer.
 type idemStore interface {
-	Claim(ctx context.Context, userID int64, key, method, path, hash string) (*idempotency.Record, bool, error)
+	Claim(ctx context.Context, userID, key, method, path, hash string) (*idempotency.Record, bool, error)
 	Checkpoint(ctx context.Context, id int64, subjectID *int64) error
 	Release(ctx context.Context, id int64) error
 	Finish(ctx context.Context, id int64, code int, body []byte) error
@@ -36,7 +36,7 @@ func WrapIdem(inner *idempotency.Repository) IdemStore {
 	return IdemStore{inner: inner}
 }
 
-func (s IdemStore) Claim(ctx context.Context, userID int64, key, method, path, hash string) (_ *idempotency.Record, _ bool, err error) {
+func (s IdemStore) Claim(ctx context.Context, userID, key, method, path, hash string) (_ *idempotency.Record, _ bool, err error) {
 	defer func() { err = classify(err) }()
 	return s.inner.Claim(ctx, userID, key, method, path, hash)
 }

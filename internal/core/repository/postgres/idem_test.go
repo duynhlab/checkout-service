@@ -17,7 +17,7 @@ import (
 // the whole point: the adapter, not the handler, must do the classifying.
 type fakeIdem struct{ err error }
 
-func (f fakeIdem) Claim(context.Context, int64, string, string, string, string) (*idempotency.Record, bool, error) {
+func (f fakeIdem) Claim(context.Context, string, string, string, string, string) (*idempotency.Record, bool, error) {
 	return nil, false, f.err
 }
 func (f fakeIdem) Checkpoint(context.Context, int64, *int64) error  { return f.err }
@@ -28,7 +28,7 @@ func TestIdemStoreClassifiesInfrastructureFailures(t *testing.T) {
 	raw := fmt.Errorf("claim: %w", &pgconn.PgError{Code: "57P01"}) // CNPG switchover
 	s := IdemStore{inner: fakeIdem{err: raw}}
 
-	_, _, err := s.Claim(context.Background(), 1, "k", "POST", "/p", "h")
+	_, _, err := s.Claim(context.Background(), "a11ce000-0000-4000-8000-000000000001", "k", "POST", "/p", "h")
 	if !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("Claim: a switchover error must classify as unavailable, got %v", err)
 	}
@@ -49,7 +49,7 @@ func TestIdemStoreClassifiesInfrastructureFailures(t *testing.T) {
 func TestIdemStoreLeavesBusinessSentinelsAlone(t *testing.T) {
 	for _, sentinel := range []error{idempotency.ErrConflict, idempotency.ErrLocked} {
 		s := IdemStore{inner: fakeIdem{err: sentinel}}
-		_, _, err := s.Claim(context.Background(), 1, "k", "POST", "/p", "h")
+		_, _, err := s.Claim(context.Background(), "a11ce000-0000-4000-8000-000000000001", "k", "POST", "/p", "h")
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("sentinel %v did not survive the adapter: %v", sentinel, err)
 		}

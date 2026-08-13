@@ -59,6 +59,39 @@ func TestLoad_Overrides(t *testing.T) {
 	}
 }
 
+// TestLoadOIDCDefaults pins the Keycloak OIDC defaults (ADR-041) so a
+// regression back to the legacy auth-service JWT config fails fast. The JWKS
+// override defaults to empty — authmw derives the Keycloak realm certs URL
+// from the issuer.
+func TestLoadOIDCDefaults(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "")
+	t.Setenv("OIDC_AUDIENCE", "")
+	t.Setenv("OIDC_JWKS_URL", "")
+	cfg := Load()
+	if want := "https://id.duynh.me/realms/duynhlab"; cfg.OIDCIssuer != want {
+		t.Errorf("default OIDCIssuer = %q, want %q", cfg.OIDCIssuer, want)
+	}
+	if want := "duynhlab-platform"; cfg.OIDCAudience != want {
+		t.Errorf("default OIDCAudience = %q, want %q", cfg.OIDCAudience, want)
+	}
+	if cfg.OIDCJWKSURL != "" {
+		t.Errorf("default OIDCJWKSURL = %q, want empty (derived from issuer)", cfg.OIDCJWKSURL)
+	}
+}
+
+func TestLoadOIDCOverrides(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc.local/realms/test")
+	t.Setenv("OIDC_AUDIENCE", "test-aud")
+	t.Setenv("OIDC_JWKS_URL", "http://kc.local/certs")
+	cfg := Load()
+	if cfg.OIDCIssuer != "https://kc.local/realms/test" ||
+		cfg.OIDCAudience != "test-aud" ||
+		cfg.OIDCJWKSURL != "http://kc.local/certs" {
+		t.Errorf("OIDC overrides not applied: issuer=%q aud=%q jwks=%q",
+			cfg.OIDCIssuer, cfg.OIDCAudience, cfg.OIDCJWKSURL)
+	}
+}
+
 // validConfig returns a Config that passes Validate().
 func validConfig() *Config {
 	c := &Config{}

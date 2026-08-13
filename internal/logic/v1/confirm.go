@@ -87,7 +87,7 @@ type OrderCreator interface {
 
 // IdemStore is the slice of pkg/idempotency this flow uses.
 type IdemStore interface {
-	Claim(ctx context.Context, userID int64, key, method, path, hash string) (*idempotency.Record, bool, error)
+	Claim(ctx context.Context, userID, key, method, path, hash string) (*idempotency.Record, bool, error)
 	Checkpoint(ctx context.Context, id int64, subjectID *int64) error
 	Release(ctx context.Context, id int64) error
 	Finish(ctx context.Context, id int64, code int, body []byte) error
@@ -117,10 +117,10 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 	if s.idem == nil || s.orders == nil {
 		return nil, ErrUpstream
 	}
-	uid, err := strconv.ParseInt(userID, 10, 64)
-	if err != nil || uid <= 0 || uid > math.MaxInt32 {
-		// Platform user ids are numeric (JWT sub); anything else is a bug.
-		return nil, fmt.Errorf("non-numeric user id in confirm: %w", err)
+	if userID == "" {
+		// The user id is the OIDC token subject (ADR-042) — an opaque string.
+		// authmw rejects tokens without a sub, so an empty one here is a bug.
+		return nil, errors.New("empty user id in confirm")
 	}
 
 	session, err := s.ownedSession(ctx, userID, id)
@@ -135,7 +135,7 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 		return nil, err
 	}
 
-	key, replay, err := s.claimConfirm(ctx, uid, idemKey, id)
+	key, replay, err := s.claimConfirm(ctx, userID, idemKey, id)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -198,8 +198,8 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 
 // claimConfirm claims the idempotency key, translating the pkg sentinels and
 // decoding a finished record into its cached replay session.
-func (s *CheckoutService) claimConfirm(ctx context.Context, uid int64, idemKey, sessionID string) (*idempotency.Record, *domain.Session, error) {
-	key, proceed, err := s.idem.Claim(ctx, uid, idemKey, "POST", confirmPath, sessionID)
+func (s *CheckoutService) claimConfirm(ctx context.Context, userID, idemKey, sessionID string) (*idempotency.Record, *domain.Session, error) {
+	key, proceed, err := s.idem.Claim(ctx, userID, idemKey, "POST", confirmPath, sessionID)
 	if err != nil {
 		switch {
 		case errors.Is(err, idempotency.ErrConflict):

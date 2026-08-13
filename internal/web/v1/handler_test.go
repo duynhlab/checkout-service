@@ -490,7 +490,7 @@ type webIdem struct {
 	claimErr error
 }
 
-func (f *webIdem) Claim(_ context.Context, _ int64, _, _, _, _ string) (*idempotency.Record, bool, error) {
+func (f *webIdem) Claim(_ context.Context, _, _, _, _, _ string) (*idempotency.Record, bool, error) {
 	if f.claimErr != nil {
 		return nil, false, f.claimErr
 	}

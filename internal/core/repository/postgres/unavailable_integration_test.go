@@ -89,7 +89,7 @@ func TestWrapIdemIsTransparentOnARealStore(t *testing.T) {
 	s := WrapIdem(idempotency.New(pool, time.Minute))
 	ctx := context.Background()
 
-	rec, proceed, err := s.Claim(ctx, 7, "wrap-key", "POST", "/confirm", "h1")
+	rec, proceed, err := s.Claim(ctx, "7", "wrap-key", "POST", "/confirm", "h1")
 	if err != nil || !proceed || rec == nil {
 		t.Fatalf("claim: rec=%v proceed=%v err=%v", rec, proceed, err)
 	}
@@ -101,7 +101,7 @@ func TestWrapIdemIsTransparentOnARealStore(t *testing.T) {
 		t.Fatalf("finish: %v", err)
 	}
 	// A finished key replays instead of proceeding.
-	rec2, proceed2, err := s.Claim(ctx, 7, "wrap-key", "POST", "/confirm", "h1")
+	rec2, proceed2, err := s.Claim(ctx, "7", "wrap-key", "POST", "/confirm", "h1")
 	if err != nil || proceed2 {
 		t.Fatalf("replay claim: proceed=%v err=%v — want cached replay", proceed2, err)
 	}
@@ -109,14 +109,14 @@ func TestWrapIdemIsTransparentOnARealStore(t *testing.T) {
 		t.Fatalf("replayed code = %v, want 201", rec2.ResponseCode)
 	}
 	// Release on a fresh claim leaves the key reclaimable.
-	rec3, _, err := s.Claim(ctx, 7, "wrap-key-2", "POST", "/confirm", "h2")
+	rec3, _, err := s.Claim(ctx, "7", "wrap-key-2", "POST", "/confirm", "h2")
 	if err != nil {
 		t.Fatalf("claim 2: %v", err)
 	}
 	if err := s.Release(ctx, rec3.ID); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if _, proceed, err := s.Claim(ctx, 7, "wrap-key-2", "POST", "/confirm", "h2"); err != nil || !proceed {
+	if _, proceed, err := s.Claim(ctx, "7", "wrap-key-2", "POST", "/confirm", "h2"); err != nil || !proceed {
 		t.Fatalf("reclaim after release: proceed=%v err=%v", proceed, err)
 	}
 }

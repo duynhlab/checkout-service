@@ -157,8 +157,15 @@ func main() {
 	// reaped — a parked confirm's claim binding must not rot).
 	go runIdempotencyReaper(repo, logger)
 
-	// Local JWT verification via JWKS — fail-closed, the only credential path.
-	verifier, err := authmw.NewVerifier(cfg.JWKSURL, cfg.JWTIssuer, cfg.JWTAudience)
+	// Local OIDC JWT verification (ADR-041): Keycloak is the issuer; the JWKS
+	// URL is derived from the issuer (realm certs endpoint) unless
+	// OIDC_JWKS_URL overrides it. NewVerifier does not block on an unreachable
+	// JWKS — it refreshes in the background, so it is safe to build at startup.
+	verifier, err := authmw.NewVerifier(authmw.Config{
+		Issuer:   cfg.OIDCIssuer,
+		Audience: cfg.OIDCAudience,
+		JWKSURL:  cfg.OIDCJWKSURL,
+	})
 	if err != nil {
 		logger.Error("JWT verifier init failed", zap.Error(err))
 		return

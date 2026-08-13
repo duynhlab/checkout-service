@@ -169,6 +169,10 @@ shopper is charged the right amount, or can escape a stuck session at all.
 - The availability metric has **four** outcomes, not three: the unknown-SKU case
   is its own value precisely because it is neither a clean result nor a transport
   error.
+- `user_id` is the OIDC token subject: an opaque string, never an integer
+  (ADR-042). It scopes sessions and the idempotency claim. `subject_id` beside it
+  in `idempotency_keys` stays numeric because it holds an order id, not an
+  identity — do not parse a subject anywhere.
 - Product is asked for prices through the batch price RPC. It is not a catalog
   listing call, and it is not cached on product's side — that is deliberate.
 
