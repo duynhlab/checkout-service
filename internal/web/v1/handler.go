@@ -330,6 +330,14 @@ func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error
 		httpx.RespondError(c, http.StatusNotFound, httpx.CodePromoInvalid, "Promo code not found")
 	case errors.Is(err, logicv1.ErrPromoExpired):
 		httpx.RespondError(c, http.StatusConflict, httpx.CodePromoExpired, "Promo code has expired")
+	case errors.Is(err, logicv1.ErrPromoExhausted):
+		// A cap that is already spent is a refusal, not a fault. Without this arm
+		// it fell to the default and answered 500, so a shopper who typed a
+		// used-up code was told the service was broken — while the SAME condition
+		// at the confirm gate has always answered 409. The apply path carries no
+		// session (nothing was attached), which is why this uses the flat
+		// envelope rather than confirm's requoted one.
+		httpx.RespondError(c, http.StatusConflict, httpx.CodePromoExhausted, "Promo code is no longer available")
 	case errors.Is(err, logicv1.ErrInvalidQuote):
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Unknown shipping method for this destination")
 	case errors.Is(err, logicv1.ErrInvalidPaymentToken):
