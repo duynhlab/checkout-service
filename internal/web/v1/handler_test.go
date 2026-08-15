@@ -37,6 +37,13 @@ type fakeRepo struct {
 	findErrOnCall  int
 	findCalls      int
 	persistedToken string
+	// promo overrides the default WELCOME10 when a test needs a code with caps
+	// on it; userRedemptions is what CountUserRedemptions reports. Both exist so
+	// the exhausted branches are reachable from the HTTP layer at all — the
+	// hardcoded promo below has neither cap, so before this the apply path's
+	// 409 could only be exercised in the logic package.
+	promo           *domain.Promo
+	userRedemptions int
 }
 
 func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
@@ -117,13 +124,21 @@ func (f *fakeRepo) CompleteSession(_ context.Context, _ string, _ int64, _ strin
 }
 
 func (f *fakeRepo) GetPromo(_ context.Context, code string) (*domain.Promo, error) {
+	if f.promo != nil {
+		if code != f.promo.Code {
+			return nil, domain.ErrPromoNotFound
+		}
+		return f.promo, nil
+	}
 	if code != "WELCOME10" {
 		return nil, domain.ErrPromoNotFound
 	}
 	return &domain.Promo{Code: code, Kind: "percent", Value: 10}, nil
 }
 
-func (f *fakeRepo) CountUserRedemptions(_ context.Context, _, _ string) (int, error) { return 0, nil }
+func (f *fakeRepo) CountUserRedemptions(_ context.Context, _, _ string) (int, error) {
+	return f.userRedemptions, nil
+}
 
 func (f *fakeRepo) SetPromo(_ context.Context, _ string, _ domain.SessionStatus, code string, discountMinor int64) error {
 	if f.byID != nil {
@@ -356,6 +371,68 @@ func TestRemovePromo_200Detaches(t *testing.T) {
 	rec := doJSON(r, http.MethodDelete, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/promo", "")
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+// applyPromo drives POST …/promo against a session that is ready for one.
+func applyPromo(repo *fakeRepo, code string) *httptest.ResponseRecorder {
+	repo.byID = liveSession("7", domain.StatusShippingSet)
+	r := newRouter(repo, &fakeCart{}, &fakeProducts{}, "7")
+	return doJSON(r,
+		http.MethodPost, "/checkout/v1/private/checkout/sessions/11111111-1111-1111-1111-111111111111/promo",
+		`{"code":"`+code+`"}`)
+}
+
+// A spent cap is a refusal the shopper can act on, so it must reach them as
+// 409 PROMO_EXHAUSTED — the same answer the confirm gate has always given for
+// the same condition. It used to fall through respondSessionError's default and
+// answer 500, which told the shopper the service was broken and told the SPA
+// not to bother explaining. Both cap branches are covered because they are
+// separate checks over different sources: the global count comes back on the
+// promo row, the per-user one costs an extra query.
+func TestApplyPromo_ExhaustedIs409(t *testing.T) {
+	maxOne, limitOne := 1, 1
+
+	for _, tc := range []struct {
+		name string
+		repo *fakeRepo
+	}{
+		{
+			name: "global cap spent",
+			repo: &fakeRepo{promo: &domain.Promo{
+				Code: "SCARCE", Kind: "fixed", Value: 200,
+				MaxRedemptions: &maxOne, RedeemedCount: 1,
+			}},
+		},
+		{
+			name: "per-user limit reached",
+			repo: &fakeRepo{
+				promo: &domain.Promo{
+					Code: "ONETIME", Kind: "fixed", Value: 300,
+					PerUserLimit: &limitOne,
+				},
+				userRedemptions: 1,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := applyPromo(tc.repo, tc.repo.promo.Code)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body %s)", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "PROMO_EXHAUSTED") {
+				t.Errorf("body = %s, want code PROMO_EXHAUSTED", rec.Body.String())
+			}
+		})
+	}
+}
+
+// The 409 above must not have been bought by widening the promo arms: an
+// unknown code is still a 404, not a conflict.
+func TestApplyPromo_UnknownStays404(t *testing.T) {
+	rec := applyPromo(&fakeRepo{}, "NO-SUCH-CODE")
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "PROMO_INVALID") {
+		t.Errorf("got (%d, %s), want 404 PROMO_INVALID", rec.Code, rec.Body.String())
 	}
 }
 
