@@ -259,25 +259,17 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 		span.RecordError(err)
 		switch {
 		case errors.Is(err, logicv1.ErrPriceChanged):
-			c.JSON(http.StatusConflict, gin.H{
-				"error":   gin.H{"code": httpx.CodePriceChanged, "message": "Prices changed; session requoted — review and confirm again"},
-				"session": toSessionResponse(session),
-			})
+			respondRequote(c, http.StatusConflict, httpx.CodePriceChanged,
+				"Prices changed; session requoted — review and confirm again", session)
 		case errors.Is(err, logicv1.ErrStockUnavailable):
-			c.JSON(http.StatusConflict, gin.H{
-				"error":   gin.H{"code": httpx.CodeStockUnavailable, "message": "Some items are no longer available"},
-				"session": toSessionResponse(session),
-			})
+			respondRequote(c, http.StatusConflict, httpx.CodeStockUnavailable,
+				"Some items are no longer available", session)
 		case errors.Is(err, logicv1.ErrPromoExhausted):
-			c.JSON(http.StatusConflict, gin.H{
-				"error":   gin.H{"code": httpx.CodePromoExhausted, "message": "Promo code is no longer available — totals updated"},
-				"session": toSessionResponse(session),
-			})
+			respondRequote(c, http.StatusConflict, httpx.CodePromoExhausted,
+				"Promo code is no longer available — totals updated", session)
 		case errors.Is(err, logicv1.ErrPromoExpired):
-			c.JSON(http.StatusConflict, gin.H{
-				"error":   gin.H{"code": httpx.CodePromoExpired, "message": "Promo code expired — totals updated"},
-				"session": toSessionResponse(session),
-			})
+			respondRequote(c, http.StatusConflict, httpx.CodePromoExpired,
+				"Promo code expired — totals updated", session)
 		case errors.Is(err, logicv1.ErrConfirmInFlight):
 			httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "A confirm is already in flight for this session")
 		case errors.Is(err, logicv1.ErrKeyConflict):
@@ -290,10 +282,8 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 			// cannot answer for it yet.
 			c.Header("Retry-After", "2")
 			logger.Error("Confirm blocked: inventory does not track a SKU", zap.Error(err))
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error":   gin.H{"code": httpx.CodeInternal, "message": "Availability is temporarily unknown for one or more items — try again shortly"},
-				"session": toSessionResponse(session),
-			})
+			respondRequote(c, http.StatusServiceUnavailable, httpx.CodeInternal,
+				"Availability is temporarily unknown for one or more items — try again shortly", session)
 		case errors.Is(err, logicv1.ErrUpstream):
 			c.Header("Retry-After", "2")
 			logger.Error("Confirm upstream failure", zap.Error(err))
@@ -318,6 +308,19 @@ func (h *Handler) CancelSession(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Session cancelled"})
+}
+
+// respondRequote answers a confirm that failed but left the session requoted
+// and still usable. The refreshed session travels WITH the error on purpose:
+// the SPA shows the shopper what changed instead of stranding them on a dead
+// confirm screen, so this envelope is a contract, not a convenience. Every
+// requote outcome must go through here — writing the shape by hand at each
+// call site is how the arms drifted apart in the first place.
+func respondRequote(c *gin.Context, status int, code, message string, session *domain.Session) {
+	c.JSON(status, gin.H{
+		"error":   gin.H{"code": code, "message": message},
+		"session": toSessionResponse(session),
+	})
 }
 
 // respondSessionError maps logic errors to the shared envelope. Unknown and

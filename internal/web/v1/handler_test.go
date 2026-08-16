@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/duynhlab/pkg/authmw"
+	"github.com/duynhlab/pkg/httpx"
 	"github.com/duynhlab/pkg/idempotency"
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
@@ -655,6 +656,44 @@ func TestConfirm_UpstreamDownIs503WithRetryAfter(t *testing.T) {
 	rec := doConfirm(r, "key-1")
 	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
 		t.Fatalf("resp = %d retry-after=%q, want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+}
+
+// The confirm gate's requote answers carry the refreshed session ALONGSIDE the
+// error, so the SPA can show what changed instead of stranding the shopper on a
+// dead confirm screen. Only the 503 data-gap arm below was pinned; the four 409
+// arms each built that envelope by hand, so nothing would have caught one of
+// them losing the session. This covers the 409 shape.
+func TestConfirm_PriceChangedIs409WithRequotedSession(t *testing.T) {
+	repo := &fakeRepo{byID: readyWebSession("7")}
+	r := gin.New()
+	// The catalog now says 3999 while the session snapshot holds 2999, so the
+	// confirm gate requotes instead of charging the stale price.
+	prods := &fakeProducts{infos: []logicv1.ProductInfo{
+		{ProductID: "1", Name: "Mouse", UnitPriceMinor: 3999, AvailableQty: 5},
+	}}
+	svc := logicv1.NewCheckoutService(repo, &fakeCart{}, prods, prods, time.Minute).
+		WithConfirm(&webIdem{rec: &idempotency.Record{ID: 12}}, &webOrders{})
+	RegisterRoutes(r, NewHandler(svc), func(c *gin.Context) {
+		c.Set(authmw.CtxUserID, "7")
+		c.Next()
+	})
+
+	rec := doConfirm(r, "key-price")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("resp = %d, want 409 — body %s", rec.Code, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v — body %s", err, rec.Body.String())
+	}
+	errObj, ok := body["error"].(map[string]any)
+	if !ok || errObj["code"] != httpx.CodePriceChanged {
+		t.Errorf("error = %v, want code %q", body["error"], httpx.CodePriceChanged)
+	}
+	if _, ok := body["session"]; !ok {
+		t.Fatalf("no session in the requote envelope: %s", rec.Body.String())
 	}
 }
 
