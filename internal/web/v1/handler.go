@@ -24,7 +24,7 @@ import (
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
-	"github.com/duynhlab/checkout-service/middleware"
+	"github.com/duynhlab/pkg/httpmw"
 )
 
 // msgInvalidRequestBody is the shared 400 message for malformed JSON.
@@ -83,7 +83,7 @@ func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
 // active session already exists; POST is idempotent).
 func (h *Handler) CreateSession(c *gin.Context) {
 	ctx, span := webSpan(c)
-	logger := middleware.GetLoggerFromGinContext(c)
+	logger := httpmw.LoggerFrom(c)
 
 	session, created, err := h.svc.CreateSession(ctx, c.GetString(authmw.CtxUserID))
 	if err != nil {
@@ -242,7 +242,7 @@ const maxIdempotencyKeyLen = 120
 // checkout attempt and persists it so a retry always converges.
 func (h *Handler) ConfirmSession(c *gin.Context) {
 	ctx, span := webSpan(c)
-	logger := middleware.GetLoggerFromGinContext(c)
+	logger := httpmw.LoggerFrom(c)
 
 	key := c.GetHeader("Idempotency-Key")
 	if key == "" {
@@ -363,10 +363,10 @@ func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error
 		// either idempotency-keyed or a conditional update, so a retry lands at
 		// most once and otherwise reports the lost CAS.
 		c.Header("Retry-After", "2")
-		middleware.GetLoggerFromGinContext(c).Error("Session operation hit an unavailable datastore", zap.Error(err))
+		httpmw.LoggerFrom(c).Error("Session operation hit an unavailable datastore", zap.Error(err))
 		httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
 	default:
-		middleware.GetLoggerFromGinContext(c).Error("Session operation failed", zap.Error(err))
+		httpmw.LoggerFrom(c).Error("Session operation failed", zap.Error(err))
 		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
 	}
 }
