@@ -149,7 +149,10 @@ func TestClassifyNonPostgresErrors(t *testing.T) {
 // it has no verdict to add.
 func TestClassifyLeavesUnrelatedErrorsIdentical(t *testing.T) {
 	in := errors.New("boom")
-	if got := classify(in); got != in {
+	// "Identical" spelled out without an == on errors: the result must still be
+	// the same error, and it must not be unwrappable — a wrapper is exactly the
+	// allocation this test exists to forbid.
+	if got := classify(in); !errors.Is(got, in) || errors.Unwrap(got) != nil {
 		t.Fatalf("classify wrapped an unrelated error: %v", got)
 	}
 }
@@ -159,7 +162,10 @@ func TestClassifyLeavesUnrelatedErrorsIdentical(t *testing.T) {
 func TestClassifyIsIdempotent(t *testing.T) {
 	once := classify(fmt.Errorf("q: %w", &pgconn.PgError{Code: "57P01"}))
 	twice := classify(once)
-	if once != twice {
+	// A second sentinel would both nest `once` one level deeper and change the
+	// message, so "still the same chain, still the same text" is the identity
+	// check without an == on errors.
+	if !errors.Is(twice, once) || twice.Error() != once.Error() {
 		t.Fatalf("classify is not idempotent:\n once  = %v\n twice = %v", once, twice)
 	}
 }

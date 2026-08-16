@@ -202,8 +202,7 @@ func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) 
 // Inventory is in the list, not dialled separately as it was during the RFC-0021
 // migration: it is the availability authority now, so a checkout that cannot reach
 // it has no second answer to fall back to.
-func dialEastWest(cfg *config.Config, logger *zap.Logger) ([5]*grpc.ClientConn, func(), bool) {
-	var conns [5]*grpc.ClientConn
+func dialEastWest(cfg *config.Config, logger *zap.Logger) ([]*grpc.ClientConn, func(), bool) {
 	targets := []struct {
 		name string
 		addr string
@@ -218,6 +217,7 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([5]*grpc.ClientConn, 
 		// answer from somewhere else.
 		{"inventory", cfg.Checkout.InventoryGRPCAddr},
 	}
+	conns := make([]*grpc.ClientConn, len(targets))
 	for i, tgt := range targets {
 		conn, err := grpcx.Dial(tgt.addr)
 		if err != nil {

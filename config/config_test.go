@@ -172,9 +172,9 @@ func TestValidate(t *testing.T) {
 
 func TestIsDevelopmentProduction(t *testing.T) {
 	tests := []struct {
-		env       string
-		isDev     bool
-		isProd    bool
+		env    string
+		isDev  bool
+		isProd bool
 	}{
 		{"development", true, false},
 		{"dev", true, false},

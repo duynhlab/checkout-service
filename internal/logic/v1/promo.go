@@ -31,7 +31,7 @@ func discountFor(p *domain.Promo, subtotal, fee, tax int64) (int64, error) {
 			return 0, ErrPromoInvalid
 		}
 		var err error
-		if d, err = flatTax(subtotal, int32(p.Value)*100); err != nil { //nolint:gosec // bounded 1..100 above
+		if d, err = flatTax(subtotal, int32(p.Value)*100); err != nil {
 			return 0, err
 		}
 	default: // "fixed" by schema CHECK
