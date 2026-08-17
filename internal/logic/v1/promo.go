@@ -4,11 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
-
 	"github.com/duynhlab/checkout-service/internal/core/domain"
-	"github.com/duynhlab/checkout-service/middleware"
 )
 
 // Promo errors surfaced to the web layer (404/409 PROMO_*).
@@ -31,7 +27,7 @@ func discountFor(p *domain.Promo, subtotal, fee, tax int64) (int64, error) {
 			return 0, ErrPromoInvalid
 		}
 		var err error
-		if d, err = flatTax(subtotal, int32(p.Value)*100); err != nil { //nolint:gosec // bounded 1..100 above
+		if d, err = flatTax(subtotal, int32(p.Value)*100); err != nil {
 			return 0, err
 		}
 	default: // "fixed" by schema CHECK
@@ -66,9 +62,7 @@ func (s *CheckoutService) sessionDiscount(ctx context.Context, session *domain.S
 // authoritative gate stays the atomic redemption at confirm. Applying NEVER
 // counts a use.
 func (s *CheckoutService) ApplyPromo(ctx context.Context, userID, id, code string) (*domain.Session, error) {
-	ctx, span := middleware.StartSpan(ctx, "checkout.session.apply_promo", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.apply_promo")
 	defer span.End()
 
 	session, err := s.ownedSession(ctx, userID, id)
@@ -130,9 +124,7 @@ func (s *CheckoutService) ApplyPromo(ctx context.Context, userID, id, code strin
 // user whose code no longer fits the totals an exit that is not "wait for
 // the TTL" (review finding).
 func (s *CheckoutService) RemovePromo(ctx context.Context, userID, id string) (*domain.Session, error) {
-	ctx, span := middleware.StartSpan(ctx, "checkout.session.remove_promo", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.remove_promo")
 	defer span.End()
 
 	session, err := s.ownedSession(ctx, userID, id)

@@ -27,6 +27,7 @@ import (
 
 	"github.com/duynhlab/pkg/authmw"
 	"github.com/duynhlab/pkg/grpcx"
+	"github.com/duynhlab/pkg/httpmw"
 	"github.com/duynhlab/pkg/idempotency"
 	"github.com/duynhlab/pkg/logger/zapx"
 	"github.com/duynhlab/pkg/migratex"
@@ -41,7 +42,6 @@ import (
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
 	webv1 "github.com/duynhlab/checkout-service/internal/web/v1"
 	checkoutwf "github.com/duynhlab/checkout-service/internal/workflow"
-	"github.com/duynhlab/checkout-service/middleware"
 )
 
 func main() {
@@ -172,7 +172,7 @@ func main() {
 	}
 
 	var isShuttingDown atomic.Bool
-	srv := setupServer(cfg, logger, handler, verifier, pool, &isShuttingDown)
+	srv := setupServer(cfg, obsx.ConfigFromEnv().ServiceName, logger, handler, verifier, pool, &isShuttingDown)
 	runGracefulShutdown(cfg, logger, srv, tp, pool, &isShuttingDown)
 }
 
@@ -202,8 +202,7 @@ func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) 
 // Inventory is in the list, not dialled separately as it was during the RFC-0021
 // migration: it is the availability authority now, so a checkout that cannot reach
 // it has no second answer to fall back to.
-func dialEastWest(cfg *config.Config, logger *zap.Logger) ([5]*grpc.ClientConn, func(), bool) {
-	var conns [5]*grpc.ClientConn
+func dialEastWest(cfg *config.Config, logger *zap.Logger) ([]*grpc.ClientConn, func(), bool) {
 	targets := []struct {
 		name string
 		addr string
@@ -218,6 +217,7 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([5]*grpc.ClientConn, 
 		// answer from somewhere else.
 		{"inventory", cfg.Checkout.InventoryGRPCAddr},
 	}
+	conns := make([]*grpc.ClientConn, len(targets))
 	for i, tgt := range targets {
 		conn, err := grpcx.Dial(tgt.addr)
 		if err != nil {
@@ -242,7 +242,6 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([5]*grpc.ClientConn, 
 // when setup failed — the service still runs) and the possibly-teed logger.
 func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context) error }, *zap.Logger) {
 	otelCfg := obsx.ConfigFromEnv()
-	middleware.SetServiceName(otelCfg.ServiceName)
 	obs, err := obsx.SetupObservability(context.Background(), otelCfg)
 	if err != nil {
 		logger.Warn("Failed to initialize OpenTelemetry", zap.Error(err))
@@ -406,6 +405,7 @@ func runSubcommand(cmd string, cfg *config.Config, logger *zap.Logger) bool {
 // endpoints, then the session routes behind the JWT middleware.
 func setupServer(
 	cfg *config.Config,
+	otelServiceName string,
 	logger *zap.Logger,
 	handler *webv1.Handler,
 	verifier *authmw.Verifier,
@@ -415,8 +415,8 @@ func setupServer(
 	isShuttingDown *atomic.Bool,
 ) *http.Server {
 	r := gin.Default()
-	r.Use(middleware.TracingMiddleware())
-	r.Use(middleware.LoggingMiddleware(logger))
+	r.Use(httpmw.Tracing(otelServiceName))
+	r.Use(httpmw.Logging(logger))
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})

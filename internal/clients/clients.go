@@ -87,7 +87,7 @@ func (c *OrderClient) CreateOrder(ctx context.Context, userID string, items []do
 		reqItems = append(reqItems, &orderv1.OrderItem{
 			ProductId:      it.ProductID,
 			ProductName:    it.ProductName,
-			Quantity:       int32(qty), //nolint:gosec // clamped above
+			Quantity:       int32(qty),
 			UnitPriceMinor: it.UnitPriceMinor,
 		})
 	}

@@ -10,15 +10,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/duynhlab/pkg/idempotency"
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
-	"github.com/duynhlab/checkout-service/middleware"
 )
 
 // Confirm-flow errors (see errors.go for the P1 set).
@@ -109,9 +106,7 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 	defer cancel()
 	start := s.now()
 	defer func() { confirmDuration.Record(ctx, s.now().Sub(start).Seconds()) }()
-	ctx, span := middleware.StartSpan(ctx, "checkout.session.confirm", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.confirm")
 	defer span.End()
 
 	if s.idem == nil || s.orders == nil {
