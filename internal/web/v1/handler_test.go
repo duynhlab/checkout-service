@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/duynhlab/pkg/authmw"
+	"github.com/duynhlab/pkg/httpx"
 	"github.com/duynhlab/pkg/idempotency"
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
@@ -44,6 +45,10 @@ type fakeRepo struct {
 	// 409 could only be exercised in the logic package.
 	promo           *domain.Promo
 	userRedemptions int
+	// redeemErr is what RedeemPromo returns. The confirm gate maps the domain
+	// promo errors onto the 409 requote envelope, and that mapping is only
+	// reachable from the HTTP layer through this hook.
+	redeemErr error
 }
 
 func (f *fakeRepo) Create(_ context.Context, s *domain.Session) error {
@@ -151,7 +156,7 @@ func (f *fakeRepo) SetPromo(_ context.Context, _ string, _ domain.SessionStatus,
 
 func (f *fakeRepo) StripPromo(_ context.Context, _ string, _ int64) error { return nil }
 
-func (f *fakeRepo) RedeemPromo(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeRepo) RedeemPromo(_ context.Context, _, _, _ string) error { return f.redeemErr }
 
 func (f *fakeRepo) BackfillRedemptionOrder(_ context.Context, _, _, _ string) error { return nil }
 
@@ -658,6 +663,44 @@ func TestConfirm_UpstreamDownIs503WithRetryAfter(t *testing.T) {
 	}
 }
 
+// The confirm gate's requote answers carry the refreshed session ALONGSIDE the
+// error, so the SPA can show what changed instead of stranding the shopper on a
+// dead confirm screen. Only the 503 data-gap arm below was pinned; the four 409
+// arms each built that envelope by hand, so nothing would have caught one of
+// them losing the session. This covers the 409 shape.
+func TestConfirm_PriceChangedIs409WithRequotedSession(t *testing.T) {
+	repo := &fakeRepo{byID: readyWebSession("7")}
+	r := gin.New()
+	// The catalog now says 3999 while the session snapshot holds 2999, so the
+	// confirm gate requotes instead of charging the stale price.
+	prods := &fakeProducts{infos: []logicv1.ProductInfo{
+		{ProductID: "1", Name: "Mouse", UnitPriceMinor: 3999, AvailableQty: 5},
+	}}
+	svc := logicv1.NewCheckoutService(repo, &fakeCart{}, prods, prods, time.Minute).
+		WithConfirm(&webIdem{rec: &idempotency.Record{ID: 12}}, &webOrders{})
+	RegisterRoutes(r, NewHandler(svc), func(c *gin.Context) {
+		c.Set(authmw.CtxUserID, "7")
+		c.Next()
+	})
+
+	rec := doConfirm(r, "key-price")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("resp = %d, want 409 — body %s", rec.Code, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v — body %s", err, rec.Body.String())
+	}
+	errObj, ok := body["error"].(map[string]any)
+	if !ok || errObj["code"] != httpx.CodePriceChanged {
+		t.Errorf("error = %v, want code %q", body["error"], httpx.CodePriceChanged)
+	}
+	if _, ok := body["session"]; !ok {
+		t.Fatalf("no session in the requote envelope: %s", rec.Body.String())
+	}
+}
+
 // An untracked SKU is 503, not 409 STOCK_UNAVAILABLE: nothing about the basket is
 // wrong, inventory simply cannot answer for it. The response carries the REQUOTED
 // session, because the alternative is a shopper stranded on a dead confirm screen
@@ -903,5 +946,83 @@ func TestConcurrentConfirmStays409(t *testing.T) {
 	rec := doConfirm(r, "key-1")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Every arm of the confirm requote answers 409 with the SAME envelope shape —
+// an `error` object carrying the arm's code, and the requoted `session` beside
+// it. The SPA reads both on every arm, so a fifth arm added without the session
+// would strand a shopper on a dead confirm screen. The price-changed arm has
+// its own test above; this covers the other three, which respondRequote made
+// share one call site.
+func TestConfirm_RequoteArmsShareOneEnvelope(t *testing.T) {
+	cases := []struct {
+		name     string
+		wantCode string
+		arrange  func(*fakeRepo) *fakeProducts
+	}{
+		{
+			// Same price, no stock: revalidation requotes and reports the
+			// shortage rather than charging for something undeliverable.
+			name:     "stock ran out",
+			wantCode: httpx.CodeStockUnavailable,
+			arrange: func(_ *fakeRepo) *fakeProducts {
+				return &fakeProducts{infos: []logicv1.ProductInfo{
+					{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 0},
+				}}
+			},
+		},
+		{
+			name:     "promo spent between apply and confirm",
+			wantCode: httpx.CodePromoExhausted,
+			arrange: func(r *fakeRepo) *fakeProducts {
+				r.byID.PromoCode = "WELCOME10"
+				r.redeemErr = domain.ErrPromoExhausted
+				return &fakeProducts{infos: []logicv1.ProductInfo{
+					{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5},
+				}}
+			},
+		},
+		{
+			name:     "promo expired between apply and confirm",
+			wantCode: httpx.CodePromoExpired,
+			arrange: func(r *fakeRepo) *fakeProducts {
+				r.byID.PromoCode = "WELCOME10"
+				r.redeemErr = domain.ErrPromoExpired
+				return &fakeProducts{infos: []logicv1.ProductInfo{
+					{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5},
+				}}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &fakeRepo{byID: readyWebSession("7")}
+			prods := tc.arrange(repo)
+			r := gin.New()
+			svc := logicv1.NewCheckoutService(repo, &fakeCart{}, prods, prods, time.Minute).
+				WithConfirm(&webIdem{rec: &idempotency.Record{ID: 12}}, &webOrders{})
+			RegisterRoutes(r, NewHandler(svc), func(c *gin.Context) {
+				c.Set(authmw.CtxUserID, "7")
+				c.Next()
+			})
+
+			rec := doConfirm(r, "key-"+tc.wantCode)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("resp = %d, want 409 — body %s", rec.Code, rec.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v — body %s", err, rec.Body.String())
+			}
+			errObj, ok := body["error"].(map[string]any)
+			if !ok || errObj["code"] != tc.wantCode {
+				t.Errorf("error = %v, want code %q", body["error"], tc.wantCode)
+			}
+			if _, ok := body["session"]; !ok {
+				t.Errorf("no session in the requote envelope: %s", rec.Body.String())
+			}
+		})
 	}
 }

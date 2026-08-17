@@ -113,6 +113,9 @@ func main() {
 		return
 	}
 	defer cleanup()
+	// Positional, matching dialEastWest's target order. The slice is sized from
+	// that target list, so adding a sixth target grows conns too: this read stays
+	// in bounds, and the new connection is simply unused until wired up here.
 	cartConn, productConn, orderConn, shippingConn, inventoryConn := conns[0], conns[1], conns[2], conns[3], conns[4]
 
 	// Deadline-fencing invariant (RFC-0015 P2 confirm): a lock takeover must
@@ -202,6 +205,11 @@ func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) 
 // Inventory is in the list, not dialled separately as it was during the RFC-0021
 // migration: it is the availability authority now, so a checkout that cannot reach
 // it has no second answer to fall back to.
+// The connection slice is sized from `targets`, never from a literal. This used
+// to be a [5] array while `targets` held five entries with nothing enforcing the
+// match — and the list has already grown once (inventory, RFC-0021 phase 4). A
+// sixth entry would have compiled and then panicked on conns[5] at startup, and
+// no test would have caught it, because `targets` is a literal.
 func dialEastWest(cfg *config.Config, logger *zap.Logger) ([]*grpc.ClientConn, func(), bool) {
 	targets := []struct {
 		name string
@@ -359,6 +367,11 @@ func maybeRunWorker(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) 
 	return true
 }
 
+// healthPayload is the probe response body, written once. The API server's
+// probes are the only place this shape appears more than twice; the worker
+// process below serves the same field from a raw mux, so the two must not drift.
+func healthPayload(state string) gin.H { return gin.H{"status": state} }
+
 // startWorkerHealthServer serves /health and /ready for the worker process.
 func startWorkerHealthServer(port string, logger *zap.Logger, ready *atomic.Bool) *http.Server {
 	mux := http.NewServeMux()
@@ -419,20 +432,20 @@ func setupServer(
 	r.Use(httpmw.Logging(logger))
 
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, healthPayload("ok"))
 	})
 	r.GET("/ready", func(c *gin.Context) {
 		if isShuttingDown.Load() {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "shutting_down"})
+			c.JSON(http.StatusServiceUnavailable, healthPayload("shutting_down"))
 			return
 		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), time.Second)
 		defer cancel()
 		if err := pool.Ping(ctx); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "db_unavailable"})
+			c.JSON(http.StatusServiceUnavailable, healthPayload("db_unavailable"))
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, healthPayload("ok"))
 	})
 
 	// Checkout v1 routes — Variant A collection-noun paths (`sessions`,

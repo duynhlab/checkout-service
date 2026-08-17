@@ -53,6 +53,19 @@ func TestDialEastWest_SizesConnsFromTargetList(t *testing.T) {
 	}
 }
 
+// healthPayload is the probe body for the API server. The worker process serves
+// the same `status` field from a raw mux, so the shape is pinned here to keep
+// the two from drifting.
+func TestHealthPayload_ShapeIsStatusOnly(t *testing.T) {
+	got := healthPayload("shutting_down")
+	if len(got) != 1 {
+		t.Fatalf("payload = %v, want exactly one field", got)
+	}
+	if got["status"] != "shutting_down" {
+		t.Errorf(`payload["status"] = %v, want "shutting_down"`, got["status"])
+	}
+}
+
 type stubPool struct{ err error }
 
 func (p stubPool) Ping(context.Context) error { return p.err }
