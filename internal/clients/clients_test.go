@@ -8,8 +8,10 @@ import (
 	"google.golang.org/grpc"
 
 	inventoryv1 "github.com/duynhlab/pkg/proto/inventory/v1"
+	orderv1 "github.com/duynhlab/pkg/proto/order/v1"
 	productv1 "github.com/duynhlab/pkg/proto/product/v1"
 
+	"github.com/duynhlab/checkout-service/internal/core/domain"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
 )
 
@@ -106,5 +108,69 @@ func TestProductClient_BatchGetCurrentPrices_PropagatesError(t *testing.T) {
 
 	if _, err := c.BatchGetCurrentPrices(context.Background(), []string{"1"}); err == nil {
 		t.Fatal("BatchGetCurrentPrices() error = nil, want propagated error")
+	}
+}
+
+// fakeOrderSvc embeds the generated order client; only CreateOrder has a body,
+// and it keeps the request so the mapping can be asserted.
+type fakeOrderSvc struct {
+	orderv1.OrderServiceClient
+	got  *orderv1.CreateOrderRequest
+	resp *orderv1.CreateOrderResponse
+	err  error
+}
+
+func (f *fakeOrderSvc) CreateOrder(_ context.Context, in *orderv1.CreateOrderRequest, _ ...grpc.CallOption) (*orderv1.CreateOrderResponse, error) {
+	f.got = in
+	return f.resp, f.err
+}
+
+// The item mapping is the boundary where checkout's int64 quantity becomes
+// order's int32, and where the totals components cross so the charged total
+// equals the session total (P4). Both are asserted here because a silent
+// truncation or a dropped component only shows up as a money difference in
+// production.
+func TestOrderClient_CreateOrder_MapsItemsAndTotals(t *testing.T) {
+	f := &fakeOrderSvc{resp: &orderv1.CreateOrderResponse{OrderId: "42", Status: "pending"}}
+	c := &OrderClient{c: f}
+
+	id, status, err := c.CreateOrder(context.Background(), "alice",
+		[]domain.SessionItem{
+			{ProductID: "1", ProductName: "Wireless Mouse", Quantity: 2, UnitPriceMinor: 2999},
+			{ProductID: "2", ProductName: "USB Hub", Quantity: 1, UnitPriceMinor: 7999},
+		},
+		"tok_visa_ok", "idem-1", 300, 263, 299)
+	if err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	if id != "42" || status != "pending" {
+		t.Errorf("got (%q, %q), want (\"42\", \"pending\")", id, status)
+	}
+
+	if n := len(f.got.GetItems()); n != 2 {
+		t.Fatalf("items = %d, want 2", n)
+	}
+	first := f.got.GetItems()[0]
+	if first.GetProductId() != "1" || first.GetProductName() != "Wireless Mouse" ||
+		first.GetQuantity() != 2 || first.GetUnitPriceMinor() != 2999 {
+		t.Errorf("item[0] = %+v, want the session line verbatim", first)
+	}
+	// The three components must all cross: order charges their sum, so a
+	// dropped one is a wrong charge, not a wrong display.
+	if f.got.GetShippingFeeMinor() != 300 || f.got.GetTaxMinor() != 263 || f.got.GetDiscountMinor() != 299 {
+		t.Errorf("totals = fee %d tax %d discount %d, want 300/263/299",
+			f.got.GetShippingFeeMinor(), f.got.GetTaxMinor(), f.got.GetDiscountMinor())
+	}
+	if f.got.GetUserId() != "alice" || f.got.GetIdempotencyKey() != "idem-1" {
+		t.Errorf("identity/idempotency did not cross: %+v", f.got)
+	}
+}
+
+// A transport error must surface, not be swallowed into an empty order id —
+// checkout retries on it, and a silent "" would look like a created order.
+func TestOrderClient_CreateOrder_PropagatesError(t *testing.T) {
+	c := &OrderClient{c: &fakeOrderSvc{err: errors.New("unavailable")}}
+	if _, _, err := c.CreateOrder(context.Background(), "alice", nil, "tok", "k", 0, 0, 0); err == nil {
+		t.Fatal("want the transport error to surface")
 	}
 }
