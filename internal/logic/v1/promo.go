@@ -4,11 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
-
 	"github.com/duynhlab/checkout-service/internal/core/domain"
-	"github.com/duynhlab/pkg/obsx"
 )
 
 // Promo errors surfaced to the web layer (404/409 PROMO_*).
@@ -66,9 +62,7 @@ func (s *CheckoutService) sessionDiscount(ctx context.Context, session *domain.S
 // authoritative gate stays the atomic redemption at confirm. Applying NEVER
 // counts a use.
 func (s *CheckoutService) ApplyPromo(ctx context.Context, userID, id, code string) (*domain.Session, error) {
-	ctx, span := obsx.StartSpan(ctx, tracerScope, "checkout.session.apply_promo", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.apply_promo")
 	defer span.End()
 
 	session, err := s.ownedSession(ctx, userID, id)
@@ -130,9 +124,7 @@ func (s *CheckoutService) ApplyPromo(ctx context.Context, userID, id, code strin
 // user whose code no longer fits the totals an exit that is not "wait for
 // the TTL" (review finding).
 func (s *CheckoutService) RemovePromo(ctx context.Context, userID, id string) (*domain.Session, error) {
-	ctx, span := obsx.StartSpan(ctx, tracerScope, "checkout.session.remove_promo", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.remove_promo")
 	defer span.End()
 
 	session, err := s.ownedSession(ctx, userID, id)

@@ -24,6 +24,15 @@ import (
 // service.name on the Resource.
 const tracerScope = "github.com/duynhlab/checkout-service/internal/logic/v1"
 
+// startLogicSpan opens a span for this layer. Every span here carries
+// layer=logic, and nine call sites repeating the same three lines is what
+// tipped SonarCloud's new-code duplication gate the moment the httpmw
+// migration rewrote all nine at once.
+func startLogicSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	return obsx.StartSpan(ctx, tracerScope, name,
+		trace.WithAttributes(append([]attribute.KeyValue{attribute.String("layer", "logic")}, attrs...)...))
+}
+
 // CartLine is the item-list view checkout snapshots (from cart.v1/GetCart).
 type CartLine struct {
 	ProductID      string
@@ -420,10 +429,7 @@ func NewCheckoutService(repo domain.SessionRepository, cart CartFetcher,
 // authority); cart's denormalized price is kept per line for the
 // price-changed diff. An empty cart is ErrEmptyCart.
 func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*domain.Session, bool, error) {
-	ctx, span := obsx.StartSpan(ctx, tracerScope, "checkout.session.create", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-		attribute.String("user.id", userID),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.create", attribute.String("user.id", userID))
 	defer span.End()
 
 	// Idempotent create: an active session short-circuits (after the lazy
@@ -539,9 +545,7 @@ func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*do
 // ErrSessionNotFound (anti-IDOR); an elapsed TTL is recorded lazily and
 // surfaces as ErrSessionExpired.
 func (s *CheckoutService) GetSession(ctx context.Context, userID, id string) (*domain.Session, error) {
-	ctx, span := obsx.StartSpan(ctx, tracerScope, "checkout.session.get", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.get")
 	defer span.End()
 
 	session, err := s.ownedSession(ctx, userID, id)
@@ -557,9 +561,7 @@ func (s *CheckoutService) GetSession(ctx context.Context, userID, id string) (*d
 // SetAddress stores the shipping address and moves the session to
 // address_set (a legal re-entry from any pre-confirm state).
 func (s *CheckoutService) SetAddress(ctx context.Context, userID, id string, addr *domain.Address) (*domain.Session, error) {
-	ctx, span := obsx.StartSpan(ctx, tracerScope, "checkout.session.set_address", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.set_address")
 	defer span.End()
 
 	session, err := s.ownedSession(ctx, userID, id)
@@ -602,9 +604,7 @@ func (s *CheckoutService) SetAddress(ctx context.Context, userID, id string, add
 // (subtotal + fee) from the seeded rule table, and moves the session to
 // shipping_set with the total recomputed in SQL (RFC-0015 P3).
 func (s *CheckoutService) SetShipping(ctx context.Context, userID, id, method string) (*domain.Session, error) {
-	ctx, span := obsx.StartSpan(ctx, tracerScope, "checkout.session.set_shipping", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.set_shipping")
 	defer span.End()
 
 	session, err := s.ownedSession(ctx, userID, id)
@@ -680,9 +680,7 @@ func (s *CheckoutService) priceShipping(ctx context.Context, method, region stri
 // to ready. PAN-shaped input is rejected BEFORE any persistence — the same
 // PCI-shaped rule order and payment enforce.
 func (s *CheckoutService) SetPayment(ctx context.Context, userID, id, token string) (*domain.Session, error) {
-	ctx, span := obsx.StartSpan(ctx, tracerScope, "checkout.session.set_payment", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.set_payment")
 	defer span.End()
 
 	if !domain.ValidPaymentToken(token) {
@@ -735,9 +733,7 @@ func (s *CheckoutService) touch(ctx context.Context, session *domain.Session) {
 // already-cancelled session is idempotent (no error); terminal states other
 // than cancelled reject with ErrInvalidTransition.
 func (s *CheckoutService) Cancel(ctx context.Context, userID, id string) error {
-	ctx, span := obsx.StartSpan(ctx, tracerScope, "checkout.session.cancel", trace.WithAttributes(
-		attribute.String("layer", "logic"),
-	))
+	ctx, span := startLogicSpan(ctx, "checkout.session.cancel")
 	defer span.End()
 
 	session, err := s.ownedSession(ctx, userID, id)
