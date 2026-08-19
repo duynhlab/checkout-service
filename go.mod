@@ -7,7 +7,7 @@ require (
 	github.com/duynhlab/pkg/dbx v0.36.1
 	github.com/duynhlab/pkg/grpcx v0.36.1
 	github.com/duynhlab/pkg/httpmw v0.1.0
-	github.com/duynhlab/pkg/httpx v0.36.1
+	github.com/duynhlab/pkg/httpx v0.37.0
 	github.com/duynhlab/pkg/idempotency v0.37.0
 	github.com/duynhlab/pkg/logger/zapx v0.36.0
 	github.com/duynhlab/pkg/migratex v0.36.1

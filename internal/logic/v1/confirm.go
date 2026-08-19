@@ -36,10 +36,11 @@ var (
 	ErrOrderRejected = errors.New("order rejected the confirm handoff")
 	// ErrAvailabilityUnknown — inventory answered but does not track one of the
 	// SKUs, so nobody can say whether the basket is buyable. Distinct from
-	// ErrUpstream on purpose: both become a retryable 503, but this condition is
-	// PERSISTENT (it lasts until an operator seeds the missing balance row), and
-	// the confirm path must not treat a persistent condition as transport
-	// trouble. See revalidate for what that difference costs.
+	// ErrUpstream on purpose: ErrUpstream stays a retryable 503, while this
+	// condition is PERSISTENT (it lasts until an operator receives first stock)
+	// and answers 409 ITEM_NOT_ORDERABLE (ADR-053) — the confirm path must not
+	// treat a persistent condition as transport trouble. See revalidate for
+	// what that difference costs.
 	ErrAvailabilityUnknown = errors.New("inventory does not track one of these SKUs")
 )
 
