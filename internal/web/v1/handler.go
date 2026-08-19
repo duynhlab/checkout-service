@@ -92,14 +92,13 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		case errors.Is(err, logicv1.ErrEmptyCart):
 			httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict, "Cart is empty")
 		case errors.Is(err, logicv1.ErrAvailabilityUnknown):
-			// Same 503 as an unreachable dependency -- from the shopper's side it
-			// is the same "not now, try again". The difference is the log line:
-			// this one names the SKUs inventory has no balance row for, which is
-			// the only breadcrumb an operator gets, since the response body stays
-			// opaque.
-			c.Header("Retry-After", "2")
+			// An untracked SKU is a persistent conflict, not an outage (ADR-053):
+			// no balance row exists, so retrying cannot succeed and no Retry-After
+			// is sent -- the fix is an operator receipt. Flat 409 here because no
+			// session exists yet to requote. The log line stays the only operator
+			// breadcrumb naming the SKUs; the response body stays opaque.
 			logger.Error("Session create blocked: inventory does not track a SKU", zap.Error(err))
-			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
+			httpx.RespondError(c, http.StatusConflict, httpx.CodeItemNotOrderable, "One or more items in the cart cannot be ordered")
 		case errors.Is(err, logicv1.ErrUpstream):
 			// 503, not 500. A dependency being down is not a bug in checkout, and
 			// the difference is not cosmetic: 500 tells the client "do not retry"
@@ -277,13 +276,14 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 		case errors.Is(err, logicv1.ErrAvailabilityUnknown):
 			// The session was already requoted back to shipping_set, so it is
 			// returned alongside the error like the other requote outcomes -- the
-			// SPA must not leave the shopper on a dead confirm screen. 503 rather
-			// than 409 because nothing about the basket is wrong: inventory simply
-			// cannot answer for it yet.
-			c.Header("Retry-After", "2")
+			// SPA must not leave the shopper on a dead confirm screen. 409 with
+			// its own code (ADR-053): the condition is a conflict with catalog
+			// state -- no balance row exists -- and it is persistent, so there is
+			// no Retry-After to send. Distinct from STOCK_UNAVAILABLE because the
+			// operator action differs: receive first stock, not wait for restock.
 			logger.Error("Confirm blocked: inventory does not track a SKU", zap.Error(err))
-			respondRequote(c, http.StatusServiceUnavailable, httpx.CodeInternal,
-				"Availability is temporarily unknown for one or more items — try again shortly", session)
+			respondRequote(c, http.StatusConflict, httpx.CodeItemNotOrderable,
+				"One or more items in the cart cannot be ordered — the quote was refreshed", session)
 		case errors.Is(err, logicv1.ErrUpstream):
 			c.Header("Retry-After", "2")
 			logger.Error("Confirm upstream failure", zap.Error(err))

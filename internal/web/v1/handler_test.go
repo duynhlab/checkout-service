@@ -701,19 +701,23 @@ func TestConfirm_PriceChangedIs409WithRequotedSession(t *testing.T) {
 	}
 }
 
-// An untracked SKU is 503, not 409 STOCK_UNAVAILABLE: nothing about the basket is
-// wrong, inventory simply cannot answer for it. The response carries the REQUOTED
-// session, because the alternative is a shopper stranded on a dead confirm screen
-// -- `confirming` has no FSM exit.
-func TestConfirm_UnknownSKUIs503WithRequotedSession(t *testing.T) {
+// An untracked SKU is 409 ITEM_NOT_ORDERABLE (ADR-053), not STOCK_UNAVAILABLE:
+// the basket conflicts with catalog state — no balance row exists — and the
+// condition is persistent, so no Retry-After is sent. The response carries the
+// REQUOTED session, because the alternative is a shopper stranded on a dead
+// confirm screen -- `confirming` has no FSM exit.
+func TestConfirm_UnknownSKUIs409WithRequotedSession(t *testing.T) {
 	repo := &fakeRepo{byID: readyWebSession("7")}
 	r := confirmRouterUnknownSKU(repo, &webIdem{rec: &idempotency.Record{ID: 11}}, &webOrders{}, "7")
 
 	rec := doConfirm(r, "key-1")
-	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
-		t.Fatalf("resp = %d retry-after=%q, want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	if rec.Code != http.StatusConflict || rec.Header().Get("Retry-After") != "" {
+		t.Fatalf("resp = %d retry-after=%q, want 409 with NO Retry-After (persistent conflict)", rec.Code, rec.Header().Get("Retry-After"))
 	}
 	body := rec.Body.String()
+	if !strings.Contains(body, "ITEM_NOT_ORDERABLE") {
+		t.Errorf("body = %s, want the ITEM_NOT_ORDERABLE code", body)
+	}
 	if !strings.Contains(body, "shipping_set") {
 		t.Errorf("body = %s, want the requoted session so the SPA can recover", body)
 	}
@@ -722,7 +726,7 @@ func TestConfirm_UnknownSKUIs503WithRequotedSession(t *testing.T) {
 	}
 }
 
-func TestCreateSession_UnknownSKUIs503AndOpaque(t *testing.T) {
+func TestCreateSession_UnknownSKUIs409AndOpaque(t *testing.T) {
 	prods := &fakeProducts{
 		infos:   []logicv1.ProductInfo{{ProductID: "1", Name: "Mouse", UnitPriceMinor: 2999, AvailableQty: 5}},
 		unknown: []string{"1"},
@@ -731,8 +735,13 @@ func TestCreateSession_UnknownSKUIs503AndOpaque(t *testing.T) {
 	r := newRouter(&fakeRepo{}, cart, prods, "7")
 
 	rec := doJSON(r, http.MethodPost, "/checkout/v1/private/checkout/sessions", "")
-	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
-		t.Fatalf("resp = %d retry-after=%q, want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	// Flat 409, no Retry-After: no session exists yet to requote, and a
+	// persistent conflict must not advertise a retry (ADR-053).
+	if rec.Code != http.StatusConflict || rec.Header().Get("Retry-After") != "" {
+		t.Fatalf("resp = %d retry-after=%q, want 409 with NO Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if !strings.Contains(rec.Body.String(), "ITEM_NOT_ORDERABLE") {
+		t.Errorf("body = %s, want the ITEM_NOT_ORDERABLE code", rec.Body.String())
 	}
 	// The SKU ids belong in the log and the span, never in the body.
 	if strings.Contains(rec.Body.String(), "does not track") {

@@ -60,6 +60,8 @@ github.com/duynhlab/pkg/httpmw v0.1.0 h1:YLN9CFIHgK3tQTWx1WKIXCSkPJ6slDB/tLZ7Beu
 github.com/duynhlab/pkg/httpmw v0.1.0/go.mod h1:E5Bz4CXQJZnxvPMZR0gUC1U5jCMMt7fAGwRZ7E1Tck4=
 github.com/duynhlab/pkg/httpx v0.36.1 h1:U/Bia3HwruSzNjnYVUgDC4R23gR5s02sAeCEQyrExjw=
 github.com/duynhlab/pkg/httpx v0.36.1/go.mod h1:9JIPpqTo1HGpyZP5chvW1l7+6h0WiL6VNdng1N4TpIM=
+github.com/duynhlab/pkg/httpx v0.37.0 h1:aruBCkjo3DDOp3Q0j6NrT5ZLgglsUKUv8CeLpwn4tYE=
+github.com/duynhlab/pkg/httpx v0.37.0/go.mod h1:9JIPpqTo1HGpyZP5chvW1l7+6h0WiL6VNdng1N4TpIM=
 github.com/duynhlab/pkg/idempotency v0.37.0 h1:0/SA6lTMNmpoQ6jBdczojeqZEsh84NDGdTkE2N2jOkk=
 github.com/duynhlab/pkg/idempotency v0.37.0/go.mod h1:PDFlICU3/46NWB3V82hQpjyG7Rtpj446YGNnVbSLeKM=
 github.com/duynhlab/pkg/logger/zapx v0.36.0 h1:KYDOlgodIuNelGHjUCTKICDTMPaSrhbnqZ7wWUz4PuM=
