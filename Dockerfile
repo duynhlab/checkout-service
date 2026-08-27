@@ -1,7 +1,7 @@
 # Build stage
 # --platform pins the builder to the BUILD host so a multi-arch build
 # cross-compiles instead of running this whole stage under emulation.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.6-alpine AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.7-alpine AS builder
 ARG TARGETOS TARGETARCH
 
 WORKDIR /app
