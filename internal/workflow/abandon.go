@@ -118,83 +118,120 @@ func AbandonedCheckoutWorkflow(ctx workflow.Context, in Input) error {
 	})
 
 	for {
-		timerCtx, cancelTimer := workflow.WithCancel(ctx)
-		timer := workflow.NewTimer(timerCtx, wait)
 		armedUntil = workflow.Now(ctx).Add(wait)
 
-		fired := ""
-		sel := workflow.NewSelector(ctx)
-		// Signals FIRST: on a tie (buffered signals + fired timer after a
-		// worker outage) user activity must win over the timer — though with
-		// the DB-authoritative activity even the timer branch is harmless.
-		sel.AddReceive(finalizeCh, func(c workflow.ReceiveChannel, _ bool) {
-			c.Receive(ctx, nil)
-			fired = "finalize"
-		})
-		sel.AddReceive(activityCh, func(c workflow.ReceiveChannel, _ bool) {
-			c.Receive(ctx, nil)
-			fired = "activity"
-		})
-		sel.AddFuture(timer, func(f workflow.Future) {
-			if f.Get(ctx, nil) == nil {
-				fired = "timer"
-			}
-			// CanceledError ⇒ leave fired as set by a signal callback.
-		})
-		sel.Select(ctx)
-		cancelTimer()
-
-		// Workflow cancellation: the timer future resolves with
-		// CanceledError and no signal fired — return instead of spinning on
-		// a dead context (doubt-cycle c).
-		if ctx.Err() != nil {
+		switch awaitNext(ctx, activityCh, finalizeCh, wait) {
+		case "cancelled":
 			return temporal.NewCanceledError("workflow cancelled")
-		}
-
-		switch fired {
 		case "finalize":
 			drain(activityCh, finalizeCh)
 			return nil
 		case "activity":
 			resets++
 			if resets >= maxResets {
-				if finalized := drain(activityCh, finalizeCh); finalized {
-					return nil // a buffered finalize must never be dropped by CAN
-				}
-				return workflow.NewContinueAsNewError(ctx, AbandonedCheckoutWorkflow, in)
+				return rotateAtCap(ctx, activityCh, finalizeCh, in)
 			}
 			wait = in.TTL
 			continue
 		case "timer":
-			var res ExpireResult
-			// Typed method reference, not the string "ExpireIfDue": a rename
-			// now breaks the build instead of failing at runtime. The SDK
-			// still schedules it under the method name, so recorded histories
-			// replay unchanged (corpus in replay_test.go proves it).
-			var acts *Activities
-			if err := workflow.ExecuteActivity(actCtx, acts.ExpireIfDue, in.SessionID).Get(ctx, &res); err != nil {
+			rearm, done, err := expireOnce(ctx, actCtx, in.SessionID)
+			if err != nil {
 				return err // only on workflow-level death; retries are unlimited
 			}
-			if res.Outcome == domain.OutcomeNotDue {
-				// The DB deadline moved (signal lost/raced): re-arm to it.
-				wait = res.Remaining
-				continue
+			if done {
+				// Expired now, or out of jurisdiction (terminal/confirming/
+				// gone): this watch is done. A confirming session that later
+				// un-parks is re-watched by the next mutation's
+				// SignalWithStart.
+				drain(activityCh, finalizeCh)
+				return nil
 			}
-			// Expired now, or out of jurisdiction (terminal/confirming/gone):
-			// this watch is done. A confirming session that later un-parks is
-			// re-watched by the next mutation's SignalWithStart.
-			drain(activityCh, finalizeCh)
-			return nil
+			// The DB deadline moved (signal lost/raced): re-arm to it.
+			wait = rearm
+			continue
 		default:
 			// Selector woke without a real event (defensive): loop with the
 			// same deadline.
-			wait = armedUntil.Sub(workflow.Now(ctx))
-			if wait <= 0 {
-				wait = time.Second
-			}
+			wait = clampRearm(armedUntil.Sub(workflow.Now(ctx)))
 			continue
 		}
 	}
+}
+
+// awaitNext arms the watch timer and blocks until the next event, naming
+// which one fired ("finalize", "activity", "timer", "cancelled" when the
+// workflow context died while waiting — the timer future resolves with
+// CanceledError and no signal fired, and returning beats spinning on a dead
+// context (doubt-cycle c) — or "" when the selector woke without a real
+// event). Extracted verbatim from the loop body — the workflow commands it
+// issues (one timer per call) and their order are unchanged, so recorded
+// histories replay identically (corpus-proven).
+func awaitNext(ctx workflow.Context, activityCh, finalizeCh workflow.ReceiveChannel, wait time.Duration) string {
+	timerCtx, cancelTimer := workflow.WithCancel(ctx)
+	defer cancelTimer()
+	timer := workflow.NewTimer(timerCtx, wait)
+
+	fired := ""
+	sel := workflow.NewSelector(ctx)
+	// Signals FIRST: on a tie (buffered signals + fired timer after a
+	// worker outage) user activity must win over the timer — though with
+	// the DB-authoritative activity even the timer branch is harmless.
+	sel.AddReceive(finalizeCh, func(c workflow.ReceiveChannel, _ bool) {
+		c.Receive(ctx, nil)
+		fired = "finalize"
+	})
+	sel.AddReceive(activityCh, func(c workflow.ReceiveChannel, _ bool) {
+		c.Receive(ctx, nil)
+		fired = "activity"
+	})
+	sel.AddFuture(timer, func(f workflow.Future) {
+		if f.Get(ctx, nil) == nil {
+			fired = "timer"
+		}
+		// CanceledError ⇒ leave fired as set by a signal callback.
+	})
+	sel.Select(ctx)
+	if ctx.Err() != nil {
+		return "cancelled"
+	}
+	return fired
+}
+
+// rotateAtCap ends this run at the reset cap: Continue-As-New keeps history
+// bounded, unless a finalize is already buffered — that must never be dropped
+// by the rotation, so the run completes instead.
+func rotateAtCap(ctx workflow.Context, activityCh, finalizeCh workflow.ReceiveChannel, in Input) error {
+	if finalized := drain(activityCh, finalizeCh); finalized {
+		return nil
+	}
+	return workflow.NewContinueAsNewError(ctx, AbandonedCheckoutWorkflow, in)
+}
+
+// clampRearm keeps a defensive re-arm strictly positive.
+func clampRearm(wait time.Duration) time.Duration {
+	if wait <= 0 {
+		return time.Second
+	}
+	return wait
+}
+
+// expireOnce runs the fired timer's ExpireIfDue and translates the result:
+// done=true ends the watch, done=false re-arms it for rearm. Same extraction
+// contract as awaitNext — one activity command, unchanged order.
+func expireOnce(ctx workflow.Context, actCtx workflow.Context, sessionID string) (rearm time.Duration, done bool, err error) {
+	var res ExpireResult
+	// Typed method reference, not the string "ExpireIfDue": a rename now
+	// breaks the build instead of failing at runtime. The SDK still
+	// schedules it under the method name, so recorded histories replay
+	// unchanged (corpus in replay_test.go proves it).
+	var acts *Activities
+	if err := workflow.ExecuteActivity(actCtx, acts.ExpireIfDue, sessionID).Get(ctx, &res); err != nil {
+		return 0, false, err
+	}
+	if res.Outcome == domain.OutcomeNotDue {
+		return res.Remaining, false, nil
+	}
+	return 0, true, nil
 }
 
 // drain empties both signal channels before a return path (the documented
