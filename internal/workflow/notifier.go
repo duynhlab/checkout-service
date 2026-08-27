@@ -3,10 +3,12 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.uber.org/zap"
 )
 
@@ -79,6 +81,18 @@ func (n *Notifier) signalWithStart(ctx context.Context, sessionID string) {
 			client.StartWorkflowOptions{
 				ID:        WorkflowID(sessionID),
 				TaskQueue: n.taskQueue,
+				// Fixed one-liner in the Temporal UI/CLI execution list, so an
+				// operator reads the watch's job without opening the payload.
+				// Only the FIRST SignalWithStart creates the execution, so the
+				// TTL shown is the one the run actually armed with.
+				StaticSummary: fmt.Sprintf("abandoned-checkout watch: session %s, TTL %s", sessionID, n.ttl),
+				// Business-key lookup: `SessionId = '<sid>'` in UI/CLI list
+				// filters. Registered on the namespace by temporal-bootstrap
+				// (local-stack) / the temporal-search-attributes Job (cluster)
+				// — a start referencing an unregistered attribute is rejected,
+				// which here would surface as the Warn below on every mutation.
+				TypedSearchAttributes: temporal.NewSearchAttributes(
+					temporal.NewSearchAttributeKeyKeyword("SessionId").ValueSet(sessionID)),
 			}, AbandonedCheckoutWorkflow, Input{SessionID: sessionID, TTL: n.ttl})
 		switch {
 		case err == nil:

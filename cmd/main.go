@@ -295,7 +295,8 @@ const (
 func dialTemporalRetry(cfg *config.Config, logger *zap.Logger) (client.Client, error) {
 	var lastErr error
 	for i := 1; i <= temporalDialAttempts; i++ {
-		tc, err := temporalx.Dial(temporalx.Config{HostPort: cfg.Temporal.HostPort, Namespace: cfg.Temporal.Namespace})
+		tc, err := temporalx.Dial(temporalx.Config{HostPort: cfg.Temporal.HostPort, Namespace: cfg.Temporal.Namespace},
+			temporalx.WithLogger(logger))
 		if err == nil {
 			return tc, nil
 		}
@@ -321,7 +322,8 @@ const temporalRedialInterval = 15 * time.Second
 // starting AbandonedCheckoutWorkflow until someone restarts it.
 func configureTemporal(cfg *config.Config, logger *zap.Logger) *checkoutwf.Lazy {
 	dial := func() (client.Client, error) {
-		return temporalx.Dial(temporalx.Config{HostPort: cfg.Temporal.HostPort, Namespace: cfg.Temporal.Namespace})
+		return temporalx.Dial(temporalx.Config{HostPort: cfg.Temporal.HostPort, Namespace: cfg.Temporal.Namespace},
+			temporalx.WithLogger(logger))
 	}
 	tc, err := dialTemporalRetry(cfg, logger)
 	if err != nil {
