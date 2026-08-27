@@ -19,8 +19,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
@@ -250,7 +252,14 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([]*grpc.ClientConn, f
 // when setup failed — the service still runs) and the possibly-teed logger.
 func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context) error }, *zap.Logger) {
 	otelCfg := obsx.ConfigFromEnv()
-	obs, err := obsx.SetupObservability(context.Background(), otelCfg)
+	// ADR-063: the Temporal OTel v2 plugin requires the GLOBAL tracer provider
+	// to be the replay-safe one; obsx keeps the option set and installation,
+	// this factory only swaps the constructor. temporalx.Dial refuses to start
+	// without it.
+	obs, err := obsx.SetupObservability(context.Background(), otelCfg,
+		obsx.WithTracerProviderFactory(func(opts ...sdktrace.TracerProviderOption) obsx.ShutdownTracerProvider {
+			return temporalx.NewReplaySafeTracerProvider(opts...)
+		}))
 	if err != nil {
 		logger.Warn("Failed to initialize OpenTelemetry", zap.Error(err))
 		return nil, logger
@@ -263,7 +272,7 @@ func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context)
 		return zapcore.NewTee(c, obs.ZapCore(otelCfg.ServiceName, minLevel))
 	}))
 	logger.Info("OpenTelemetry initialized",
-		zap.Bool("traces", obs.TracerProvider != nil),
+		zap.Bool("traces", obs.GlobalTracerProvider != nil),
 		zap.Bool("otlp_metrics", obs.MeterProvider != nil),
 		zap.Bool("otlp_logs", obs.LoggerProvider != nil),
 		zap.String("endpoint", otelCfg.Endpoint),
@@ -346,8 +355,13 @@ func maybeRunWorker(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) 
 		Sessions:     postgres.NewSessionRepository(pool),
 		LockTakeover: cfg.Checkout.IdempotencyLockTakeover,
 	}
-	w := temporalx.NewWorker(tc, cfg.Temporal.TaskQueue)
-	w.RegisterWorkflow(checkoutwf.AbandonedCheckoutWorkflow)
+	// ADR-064: versioning from the controller-injected env. Inert while the
+	// manifest is still a plain Deployment (no env set → no-op); when the
+	// WorkerDeployment lands, the worker registers Pinned without a code change.
+	w := temporalx.NewWorker(tc, cfg.Temporal.TaskQueue, temporalx.MustVersioningFromEnv())
+	w.RegisterWorkflowWithOptions(checkoutwf.AbandonedCheckoutWorkflow, workflow.RegisterOptions{
+		VersioningBehavior: workflow.VersioningBehaviorPinned,
+	})
 	w.RegisterActivity(acts.ExpireIfDue)
 
 	// Probes need an endpoint even on the worker (order-worker pattern);
