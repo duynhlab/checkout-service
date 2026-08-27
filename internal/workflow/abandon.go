@@ -167,7 +167,12 @@ func AbandonedCheckoutWorkflow(ctx workflow.Context, in Input) error {
 			continue
 		case "timer":
 			var res ExpireResult
-			if err := workflow.ExecuteActivity(actCtx, "ExpireIfDue", in.SessionID).Get(ctx, &res); err != nil {
+			// Typed method reference, not the string "ExpireIfDue": a rename
+			// now breaks the build instead of failing at runtime. The SDK
+			// still schedules it under the method name, so recorded histories
+			// replay unchanged (corpus in replay_test.go proves it).
+			var acts *Activities
+			if err := workflow.ExecuteActivity(actCtx, acts.ExpireIfDue, in.SessionID).Get(ctx, &res); err != nil {
 				return err // only on workflow-level death; retries are unlimited
 			}
 			if res.Outcome == domain.OutcomeNotDue {
