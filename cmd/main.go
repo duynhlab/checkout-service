@@ -19,7 +19,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
@@ -257,8 +256,8 @@ func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context)
 	// this factory only swaps the constructor. temporalx.Dial refuses to start
 	// without it.
 	obs, err := obsx.SetupObservability(context.Background(), otelCfg,
-		obsx.WithTracerProviderFactory(func(opts ...sdktrace.TracerProviderOption) obsx.ShutdownTracerProvider {
-			return temporalx.NewReplaySafeTracerProvider(opts...)
+		obsx.WithTracerProviderFactory(func(c obsx.TracerProviderConfig) obsx.ShutdownTracerProvider {
+			return temporalx.NewReplaySafeTracerProvider(c.SDKOptions()...)
 		}))
 	if err != nil {
 		logger.Warn("Failed to initialize OpenTelemetry", zap.Error(err))
@@ -272,9 +271,9 @@ func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context)
 		return zapcore.NewTee(c, obs.ZapCore(otelCfg.ServiceName, minLevel))
 	}))
 	logger.Info("OpenTelemetry initialized",
-		zap.Bool("traces", obs.GlobalTracerProvider != nil),
-		zap.Bool("otlp_metrics", obs.MeterProvider != nil),
-		zap.Bool("otlp_logs", obs.LoggerProvider != nil),
+		zap.Bool("traces", obs.Enabled().Traces),
+		zap.Bool("otlp_metrics", obs.Enabled().Metrics),
+		zap.Bool("otlp_logs", obs.Enabled().Logs),
 		zap.String("endpoint", otelCfg.Endpoint),
 		zap.Float64("sample_rate", otelCfg.SampleRate),
 	)
