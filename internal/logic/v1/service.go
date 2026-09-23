@@ -792,7 +792,7 @@ func (s *CheckoutService) lazyExpire(ctx context.Context, session *domain.Sessio
 		return session.Status == domain.StatusExpired
 	}
 	// `confirming` never lazily expires: the confirm flow (P2) owns that
-	// state's fate — completed or back to shipping_set. Mirrors the FSM table
+	// state's fate — completed, or back to shipping_set or ready. Mirrors the FSM table
 	// and MarkExpired's SQL predicate.
 	if session.Status == domain.StatusConfirming {
 		return false

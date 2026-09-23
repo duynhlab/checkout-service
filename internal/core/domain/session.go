@@ -141,8 +141,8 @@ type SessionRepository interface {
 	// BeginConfirm CASes ready → confirming and binds the idempotency claim.
 	BeginConfirm(ctx context.Context, id string, keyID int64) error
 	// AbortConfirm drops confirming → ready and clears the binding,
-	// conditional on the claim still holding the session. Only for a confirm
-	// that never authorized an order attempt.
+	// conditional on the claim still holding the session and carrying no
+	// attempt marker or cached answer (ErrStaleTransition otherwise).
 	AbortConfirm(ctx context.Context, id string, keyID int64) error
 	// RequoteItems drops confirming → shipping_set with fresh prices and
 	// clears the binding, conditional on the claim still holding the session.

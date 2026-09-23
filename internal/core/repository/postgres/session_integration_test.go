@@ -444,6 +444,45 @@ func TestSessionRepository_AbortConfirmReturnsToReady(t *testing.T) {
 	}
 }
 
+// A claim that carries the attempt marker (an order may exist) or a cached
+// answer can never be aborted, whatever the caller believes.
+func TestSessionRepository_AbortConfirmRefusesAMarkedClaim(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	for user, tc := range map[string]struct{ name, cols string }{
+		"7": {"attempt marker", "subject_id = 0"},
+		"8": {"cached answer", "response_code = 201"},
+	} {
+		name, cols := tc.name, tc.cols
+		s := newSession(user)
+		if err := repo.Create(ctx, s); err != nil {
+			t.Fatalf("%s: Create: %v", name, err)
+		}
+		var keyID int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, locked_at)
+			VALUES ($1, 'marked-'||$2, 'POST', '/confirm', 'h', now())
+			RETURNING id`, user, s.ID).Scan(&keyID); err != nil {
+			t.Fatalf("%s: seed claim: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE idempotency_keys SET `+cols+` WHERE id = $1`, keyID); err != nil {
+			t.Fatalf("%s: mark claim: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE checkout_sessions SET status = 'confirming', confirm_key_id = $2 WHERE id = $1`, s.ID, keyID); err != nil {
+			t.Fatalf("%s: park session: %v", name, err)
+		}
+		if err := repo.AbortConfirm(ctx, s.ID, keyID); !errors.Is(err, domain.ErrStaleTransition) {
+			t.Errorf("%s: AbortConfirm = %v, want ErrStaleTransition", name, err)
+		}
+		if got, _ := repo.FindByID(ctx, s.ID); got.Status != domain.StatusConfirming {
+			t.Errorf("%s: status = %s, want still confirming", name, got.Status)
+		}
+	}
+}
+
 func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
 	repo := NewSessionRepository(newTestDB(t))
 	ctx := context.Background()

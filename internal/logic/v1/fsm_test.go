@@ -39,6 +39,7 @@ func TestCanTransition(t *testing.T) {
 		domain.StatusConfirming: {
 			domain.StatusCompleted,
 			domain.StatusShippingSet, // PRICE_CHANGED drops back for a requote
+			domain.StatusReady,       // transport failure before the attempt marker
 		},
 		domain.StatusCompleted: {},
 		domain.StatusCancelled: {},

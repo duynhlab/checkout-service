@@ -182,12 +182,14 @@ func (f *fakeRepo) AbortConfirm(_ context.Context, _ string, keyID int64) error 
 	if f.abortErr != nil {
 		return f.abortErr
 	}
-	f.abortedKey = keyID
-	// Mirror the real CAS: back to ready, binding cleared.
-	if f.byID != nil {
-		f.byID.Status = domain.StatusReady
-		f.byID.ConfirmKeyID = nil
+	// Mirror the real CAS: only the confirming session bound to this claim.
+	if f.byID == nil || f.byID.Status != domain.StatusConfirming ||
+		f.byID.ConfirmKeyID == nil || *f.byID.ConfirmKeyID != keyID {
+		return domain.ErrStaleTransition
 	}
+	f.abortedKey = keyID
+	f.byID.Status = domain.StatusReady
+	f.byID.ConfirmKeyID = nil
 	return nil
 }
 
