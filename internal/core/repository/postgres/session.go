@@ -192,6 +192,28 @@ func (r *SessionRepository) BeginConfirm(ctx context.Context, id string, keyID i
 	return nil
 }
 
+// AbortConfirm moves confirming → ready and clears the claim binding: the
+// release for a confirm that failed on transport trouble before it authorized
+// an order attempt. Conditional on THIS claim still holding the session, so it
+// can never undo a concurrent completion.
+func (r *SessionRepository) AbortConfirm(ctx context.Context, id string, keyID int64) (err error) {
+	defer func() { err = classify(err) }()
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	tag, err := r.db.Exec(ctx, `
+		UPDATE checkout_sessions
+		SET status = 'ready', confirm_key_id = NULL, updated_at = now()
+		WHERE id = $1 AND status = 'confirming' AND confirm_key_id = $2`, id, keyID)
+	if err != nil {
+		return fmt.Errorf("abort confirm: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrStaleTransition
+	}
+	return nil
+}
+
 // RequoteItems drops a confirming session back to shipping_set with fresh
 // product-authoritative prices, releasing the claim binding — the
 // PRICE_CHANGED / STOCK_UNAVAILABLE path. Every write is conditional on the

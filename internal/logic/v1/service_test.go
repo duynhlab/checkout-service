@@ -52,6 +52,8 @@ type fakeRepo struct {
 	confirmedKey    int64
 	requoteErr      error
 	requoted        *requoteCall
+	abortErr        error
+	abortedKey      int64
 	completeErr     error
 	completedOrder  string
 	afterComplete   *domain.Session // swapped into byID when CompleteSession errors (stale-race tests)
@@ -172,6 +174,19 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 		f.byID.Status = domain.StatusConfirming
 		k := keyID
 		f.byID.ConfirmKeyID = &k
+	}
+	return nil
+}
+
+func (f *fakeRepo) AbortConfirm(_ context.Context, _ string, keyID int64) error {
+	if f.abortErr != nil {
+		return f.abortErr
+	}
+	f.abortedKey = keyID
+	// Mirror the real CAS: back to ready, binding cleared.
+	if f.byID != nil {
+		f.byID.Status = domain.StatusReady
+		f.byID.ConfirmKeyID = nil
 	}
 	return nil
 }

@@ -120,6 +120,8 @@ func (f *fakeRepo) BeginConfirm(_ context.Context, _ string, keyID int64) error 
 	return nil
 }
 
+func (f *fakeRepo) AbortConfirm(_ context.Context, _ string, _ int64) error { return nil }
+
 func (f *fakeRepo) RequoteItems(_ context.Context, _ string, _ int64, _ []domain.SessionItem, _, _, _ int64) error {
 	return nil
 }

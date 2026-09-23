@@ -402,6 +402,48 @@ func TestSessionRepository_ConfirmBindingLifecycle(t *testing.T) {
 	}
 }
 
+// AbortConfirm returns a confirming session to ready and clears the binding —
+// only for the claim that holds it — so a fresh key can BeginConfirm again.
+func TestSessionRepository_AbortConfirmReturnsToReady(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}, 0); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+	cur, _ := repo.FindByID(ctx, s.ID)
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, cur.UpdatedAt, "standard", 0, 0, 0); err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"); err != nil {
+		t.Fatalf("SetPaymentToken: %v", err)
+	}
+	if err := repo.BeginConfirm(ctx, s.ID, 7); err != nil {
+		t.Fatalf("BeginConfirm: %v", err)
+	}
+
+	if err := repo.AbortConfirm(ctx, s.ID, 8); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("AbortConfirm with a foreign key = %v, want ErrStaleTransition", err)
+	}
+	if err := repo.AbortConfirm(ctx, s.ID, 7); err != nil {
+		t.Fatalf("AbortConfirm: %v", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusReady || got.ConfirmKeyID != nil {
+		t.Fatalf("after abort = %s bound=%v, want ready unbound", got.Status, got.ConfirmKeyID)
+	}
+	if err := repo.AbortConfirm(ctx, s.ID, 7); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Errorf("second AbortConfirm = %v, want ErrStaleTransition (no longer confirming)", err)
+	}
+	if err := repo.BeginConfirm(ctx, s.ID, 9); err != nil {
+		t.Errorf("a fresh key must be able to confirm after the abort: %v", err)
+	}
+}
+
 func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
 	repo := NewSessionRepository(newTestDB(t))
 	ctx := context.Background()

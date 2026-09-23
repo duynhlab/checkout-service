@@ -339,9 +339,9 @@ func (s *CheckoutService) redeemPromo(ctx context.Context, session *domain.Sessi
 	case errors.Is(err, domain.ErrPromoExhausted), errors.Is(err, domain.ErrPromoNotFound):
 		mapped = ErrPromoExhausted
 	default:
-		// Transient (DB trouble): stay confirming+bound, release for an
-		// immediate same-key re-drive — the redeem tx is idempotent.
-		_ = s.idem.Release(ctx, keyID)
+		// Transient (DB trouble): the redeem tx is idempotent per session, so
+		// even a commit whose answer was lost is safe to redo from ready.
+		s.abortPreAttempt(ctx, session, keyID)
 		return nil, ErrUpstream
 	}
 	recordPromoRejected(ctx, mapped)
@@ -423,13 +423,7 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 		// `confirming` (lazyExpire skips that state and the FSM has no
 		// confirming → cancelled edge). A definite answer must requote, not retry.
 		//
-		// Release on a context that CANNOT already be cancelled: this path is
-		// reached after a hung upstream, and releasing on the expired confirm
-		// context silently fails, leaving the key locked for the whole takeover
-		// window (409 to the shopper's retry).
-		relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
-		_ = s.idem.Release(relCtx, keyID)
-		cancel()
+		s.abortPreAttempt(ctx, session, keyID)
 		return nil, ErrUpstream
 	}
 	byID := make(map[string]ProductInfo, len(infos))
@@ -465,7 +459,7 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 
 	taxMinor, discount, err := s.requoteComponents(ctx, session, subtotal)
 	if err != nil {
-		_ = s.idem.Release(ctx, keyID)
+		s.abortPreAttempt(ctx, session, keyID)
 		return nil, ErrUpstream
 	}
 	total := subtotal + session.ShippingFeeMinor + taxMinor - discount
@@ -485,6 +479,27 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 		return session, ErrStockUnavailable
 	}
 	return session, ErrPriceChanged
+}
+
+// abortPreAttempt undoes a confirm that failed on transport trouble before the
+// attempt marker: nothing irreversible happened (no order authorized, a promo
+// redeem is idempotent per session), so the session drops back to ready and
+// the key is unlocked. Parked in confirming instead, only the same key could
+// re-enter — a shopper whose key was lost saw 409 until the session TTL, unable
+// to start a new checkout either.
+//
+// Both writes run on a context that CANNOT already be cancelled: this path is
+// reached after a hung upstream, and writing on the expired confirm context
+// silently fails. If the abort write fails anyway, the old recovery holds: the
+// released key re-drives, and ExpireDue reaps a parked pre-attempt confirm.
+func (s *CheckoutService) abortPreAttempt(ctx context.Context, session *domain.Session, keyID int64) {
+	relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	if err := s.repo.AbortConfirm(relCtx, session.ID, keyID); err == nil {
+		session.Status = domain.StatusReady
+		session.ConfirmKeyID = nil
+	}
+	_ = s.idem.Release(relCtx, keyID)
 }
 
 // escapeOnUnknownAvailability gets a session OUT of `confirming` when inventory
