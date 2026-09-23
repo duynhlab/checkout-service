@@ -388,7 +388,8 @@ func TestConfirm_WrongCurrencyLineRequotesRatherThanRetrying(t *testing.T) {
 	}
 }
 
-// --- transients: key released, session stays confirming+bound ---
+// --- transients: key released; before the attempt marker the session drops
+// back to ready, after it the session stays confirming+bound ---
 
 func TestConfirm_ProductOutageIsRetryable(t *testing.T) {
 	repo := &fakeRepo{byID: readySession()}
@@ -401,6 +402,59 @@ func TestConfirm_ProductOutageIsRetryable(t *testing.T) {
 	}
 	if repo.requoted != nil {
 		t.Error("outage must not requote (degraded product ≠ everything delisted)")
+	}
+}
+
+// A transport failure BEFORE the attempt marker changed nothing irreversible:
+// no promo counted, no order authorized. The session must drop back to ready
+// with its binding cleared, so ANY key can confirm once the upstream recovers.
+// Parked in confirming, only the same key could re-enter; a shopper whose key
+// was lost (another device, cleared storage) saw 409 "confirm in flight" until
+// the session TTL, unable to start a new checkout either.
+func TestConfirm_PreAttemptOutageReturnsSessionToReady(t *testing.T) {
+	for name, prods := range map[string]*fakeProducts{
+		"product outage":       {err: errors.New("dial refused")},
+		"empty catalog answer": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo := &fakeRepo{byID: readySession()}
+			idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+
+			_, err := confirmSvc(repo, prods, idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
+			if !errors.Is(err, ErrUpstream) {
+				t.Fatalf("err = %v, want ErrUpstream", err)
+			}
+			if repo.abortedKey != 11 || idem.released != 1 {
+				t.Fatalf("abortedKey=%d released=%d, want the session released under key 11 and the key unlocked", repo.abortedKey, idem.released)
+			}
+			if repo.byID.Status != domain.StatusReady || repo.byID.ConfirmKeyID != nil {
+				t.Fatalf("session = %s bound=%v, want ready and unbound", repo.byID.Status, repo.byID.ConfirmKeyID)
+			}
+
+			// Upstream back; a DIFFERENT key confirms.
+			idem2 := &fakeIdem{record: &idempotency.Record{ID: 12}, proceed: true}
+			orders := &fakeOrders{orderID: "501", status: "pending"}
+			got, err := confirmSvc(repo, inStock(), idem2, orders).Confirm(context.Background(), "7", "sess-1", "key-2")
+			if err != nil || got.Status != domain.StatusCompleted || orders.calls != 1 {
+				t.Fatalf("fresh-key confirm after recovery: err=%v status=%v orders=%d", err, got, orders.calls)
+			}
+		})
+	}
+}
+
+// If the release write itself fails, the old recovery still holds: the key is
+// unlocked for a same-key re-drive and the session stays parked for ExpireDue.
+func TestConfirm_PreAttemptOutageAbortFailureStillReleasesKey(t *testing.T) {
+	repo := &fakeRepo{byID: readySession(), abortErr: domain.ErrUnavailable}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true}
+
+	_, err := confirmSvc(repo, &fakeProducts{err: errors.New("dial refused")}, idem, &fakeOrders{}).
+		Confirm(context.Background(), "7", "sess-1", "key-1")
+	if !errors.Is(err, ErrUpstream) || idem.released != 1 {
+		t.Fatalf("err=%v released=%d, want ErrUpstream + key released", err, idem.released)
+	}
+	if repo.byID.Status != domain.StatusConfirming {
+		t.Errorf("status = %s, want confirming (parked) when the abort write failed", repo.byID.Status)
 	}
 }
 
@@ -425,6 +479,27 @@ func TestConfirm_OrderOutageReleasesKeyStaysConfirming(t *testing.T) {
 	}
 	if idem.released != 1 || repo.completedOrder != "" || idem.finished != 0 {
 		t.Error("transient order failure: release key, no completion, no cache")
+	}
+	// After the marker an order may exist: the session must stay parked under
+	// its key, never drop to ready where another key could order again.
+	if repo.abortedKey != 0 || repo.byID.Status != domain.StatusConfirming {
+		t.Errorf("abortedKey=%d status=%s, want no abort and still confirming", repo.abortedKey, repo.byID.Status)
+	}
+}
+
+// A failed marker write may be a lost acknowledgement of a marker that DID
+// commit, so the confirm must stay parked and locked: no abort, no release.
+func TestConfirm_CheckpointFailureStaysParked(t *testing.T) {
+	repo := &fakeRepo{byID: readySession()}
+	idem := &fakeIdem{record: &idempotency.Record{ID: 11}, proceed: true, chkErr: errors.New("commit ack lost")}
+
+	_, err := confirmSvc(repo, inStock(), idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
+	if err == nil {
+		t.Fatal("want the checkpoint error")
+	}
+	if repo.abortedKey != 0 || idem.released != 0 || repo.byID.Status != domain.StatusConfirming {
+		t.Errorf("abortedKey=%d released=%d status=%s, want parked: no abort, no release, confirming",
+			repo.abortedKey, idem.released, repo.byID.Status)
 	}
 }
 
@@ -600,6 +675,9 @@ func TestConfirm_RequoteTaxLookupFailureIsRetryable(t *testing.T) {
 	if repo.requoted != nil {
 		t.Error("requote persisted despite the failed rate lookup")
 	}
+	if repo.abortedKey != 11 || repo.byID.Status != domain.StatusReady {
+		t.Errorf("abortedKey=%d status=%s, want the pre-attempt abort back to ready", repo.abortedKey, repo.byID.Status)
+	}
 }
 
 // --- P4: promo redemption inside confirm ---
@@ -687,6 +765,10 @@ func TestConfirm_RedeemTransientIsRetryable(t *testing.T) {
 	_, err := confirmSvc(repo, inStock(), idem, &fakeOrders{}).Confirm(context.Background(), "7", "sess-1", "key-1")
 	if !errors.Is(err, ErrUpstream) || idem.released != 1 || repo.promoStripped {
 		t.Fatalf("err=%v released=%d stripped=%v, want retryable with session intact", err, idem.released, repo.promoStripped)
+	}
+	if repo.abortedKey != 11 || repo.byID.Status != domain.StatusReady || repo.byID.PromoCode == "" {
+		t.Errorf("abortedKey=%d status=%s promo=%q, want back to ready with the promo kept",
+			repo.abortedKey, repo.byID.Status, repo.byID.PromoCode)
 	}
 }
 

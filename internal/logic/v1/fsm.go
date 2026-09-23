@@ -37,6 +37,7 @@ var transitions = map[domain.SessionStatus]map[domain.SessionStatus]bool{
 	domain.StatusConfirming: {
 		domain.StatusCompleted:   true,
 		domain.StatusShippingSet: true, // PRICE_CHANGED → requote and re-confirm
+		domain.StatusReady:       true, // transport failure before the attempt marker
 	},
 	// Terminal states: no rows — CanTransition answers false for everything.
 }

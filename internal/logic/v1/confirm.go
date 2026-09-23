@@ -45,17 +45,21 @@ var (
 )
 
 // ConfirmDeadline bounds the WHOLE confirm execution. This is the fencing
-// invariant (doubt-cycle b): every write this flow performs is ctx-bound, so
-// no execution can write after confirmDeadline — and the idempotency lock
-// takeover window is startup-validated to be much larger, so a takeover
-// PROVES the previous owner is dead. Two live same-key executions cannot
-// exist.
-// Exported so cmd can validate lockTakeover > 4×ConfirmDeadline at startup.
+// invariant (doubt-cycle b): every write this flow performs is bound to the
+// confirm context or, on the fail-closed paths, to a detached releaseTimeout
+// after it, so no execution can write after MaxConfirmWrite — and the
+// idempotency lock takeover window is startup-validated to be much larger, so
+// a takeover PROVES the previous owner is dead. Two live same-key executions
+// cannot exist.
+// Exported so cmd can validate lockTakeover > 4×MaxConfirmWrite at startup.
 // releaseTimeout bounds the detached idempotency release on the fail-closed paths.
 // Short: it is a single UPDATE, and the request is already answered.
 const releaseTimeout = 3 * time.Second
 
 const ConfirmDeadline = 15 * time.Second
+
+// MaxConfirmWrite is the latest a confirm execution can still write.
+const MaxConfirmWrite = ConfirmDeadline + releaseTimeout
 
 // confirmPath is the Claim scope (same key on another endpoint = conflict).
 const confirmPath = "/checkout/v1/private/checkout/sessions/confirm"
@@ -339,9 +343,9 @@ func (s *CheckoutService) redeemPromo(ctx context.Context, session *domain.Sessi
 	case errors.Is(err, domain.ErrPromoExhausted), errors.Is(err, domain.ErrPromoNotFound):
 		mapped = ErrPromoExhausted
 	default:
-		// Transient (DB trouble): stay confirming+bound, release for an
-		// immediate same-key re-drive — the redeem tx is idempotent.
-		_ = s.idem.Release(ctx, keyID)
+		// Transient (DB trouble): the redeem tx is idempotent per session, so
+		// even a commit whose answer was lost is safe to redo from ready.
+		s.abortPreAttempt(ctx, session, keyID)
 		return nil, ErrUpstream
 	}
 	recordPromoRejected(ctx, mapped)
@@ -422,14 +426,7 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 		// the shopper could never satisfy, on a session with no way out of
 		// `confirming` (lazyExpire skips that state and the FSM has no
 		// confirming → cancelled edge). A definite answer must requote, not retry.
-		//
-		// Release on a context that CANNOT already be cancelled: this path is
-		// reached after a hung upstream, and releasing on the expired confirm
-		// context silently fails, leaving the key locked for the whole takeover
-		// window (409 to the shopper's retry).
-		relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
-		_ = s.idem.Release(relCtx, keyID)
-		cancel()
+		s.abortPreAttempt(ctx, session, keyID)
 		return nil, ErrUpstream
 	}
 	byID := make(map[string]ProductInfo, len(infos))
@@ -465,7 +462,7 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 
 	taxMinor, discount, err := s.requoteComponents(ctx, session, subtotal)
 	if err != nil {
-		_ = s.idem.Release(ctx, keyID)
+		s.abortPreAttempt(ctx, session, keyID)
 		return nil, ErrUpstream
 	}
 	total := subtotal + session.ShippingFeeMinor + taxMinor - discount
@@ -485,6 +482,35 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 		return session, ErrStockUnavailable
 	}
 	return session, ErrPriceChanged
+}
+
+// abortPreAttempt undoes a confirm that failed on transport trouble before the
+// attempt marker: nothing irreversible happened (no order authorized, a promo
+// redeem is idempotent per session), so the session drops back to ready and
+// the key is unlocked. Parked in confirming instead, only the same key could
+// re-enter — a shopper whose key was lost saw 409 until the session TTL, unable
+// to start a new checkout either.
+//
+// Every caller must sit BEFORE the attempt marker; AbortConfirm also refuses a
+// claim that carries one, so a misplaced call cannot free a session whose order
+// may exist. The session keeps its TTL (a retry past it answers 410). Callers
+// return no session, so the in-memory update is for consistency only.
+//
+// Each write gets its own context that CANNOT already be cancelled: this path
+// is reached after a hung upstream, and writing on the expired confirm context
+// silently fails. If the abort write fails anyway, the old recovery holds: the
+// released key re-drives, and ExpireDue reaps a parked pre-attempt confirm.
+func (s *CheckoutService) abortPreAttempt(ctx context.Context, session *domain.Session, keyID int64) {
+	detached := context.WithoutCancel(ctx)
+	abortCtx, cancel := context.WithTimeout(detached, releaseTimeout)
+	if err := s.repo.AbortConfirm(abortCtx, session.ID, keyID); err == nil {
+		session.Status = domain.StatusReady
+		session.ConfirmKeyID = nil
+	}
+	cancel()
+	relCtx, cancel := context.WithTimeout(detached, releaseTimeout)
+	_ = s.idem.Release(relCtx, keyID)
+	cancel()
 }
 
 // escapeOnUnknownAvailability gets a session OUT of `confirming` when inventory

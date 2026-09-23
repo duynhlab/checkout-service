@@ -122,11 +122,11 @@ func main() {
 	// Deadline-fencing invariant (RFC-0015 P2 confirm): a lock takeover must
 	// PROVE the previous owner is dead, which holds only when the takeover
 	// window dwarfs the longest possible confirm execution.
-	if cfg.Checkout.IdempotencyLockTakeover <= 4*logicv1.ConfirmDeadline {
+	if cfg.Checkout.IdempotencyLockTakeover <= 4*logicv1.MaxConfirmWrite {
 		// Fatal: a config gate must exit non-zero so orchestrators see it.
-		logger.Fatal("IDEMPOTENCY_LOCK_TAKEOVER must exceed 4× the confirm deadline",
+		logger.Fatal("IDEMPOTENCY_LOCK_TAKEOVER must exceed 4× the longest confirm write",
 			zap.Duration("takeover", cfg.Checkout.IdempotencyLockTakeover),
-			zap.Duration("confirm_deadline", logicv1.ConfirmDeadline))
+			zap.Duration("max_confirm_write", logicv1.MaxConfirmWrite))
 	}
 
 	repo := postgres.NewSessionRepository(pool)

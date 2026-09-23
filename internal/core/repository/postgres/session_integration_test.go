@@ -402,6 +402,87 @@ func TestSessionRepository_ConfirmBindingLifecycle(t *testing.T) {
 	}
 }
 
+// AbortConfirm returns a confirming session to ready and clears the binding —
+// only for the claim that holds it — so a fresh key can BeginConfirm again.
+func TestSessionRepository_AbortConfirmReturnsToReady(t *testing.T) {
+	repo := NewSessionRepository(newTestDB(t))
+	ctx := context.Background()
+
+	s := newSession("7")
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.SetAddress(ctx, s.ID, domain.StatusOpen, &domain.Address{FullName: "A", Line1: "1", City: "HN", Country: "VN"}, 0); err != nil {
+		t.Fatalf("SetAddress: %v", err)
+	}
+	cur, _ := repo.FindByID(ctx, s.ID)
+	if err := repo.SetShipping(ctx, s.ID, domain.StatusAddressSet, cur.UpdatedAt, "standard", 0, 0, 0); err != nil {
+		t.Fatalf("SetShipping: %v", err)
+	}
+	if err := repo.SetPaymentToken(ctx, s.ID, domain.StatusShippingSet, "tok_visa_ok"); err != nil {
+		t.Fatalf("SetPaymentToken: %v", err)
+	}
+	if err := repo.BeginConfirm(ctx, s.ID, 7); err != nil {
+		t.Fatalf("BeginConfirm: %v", err)
+	}
+
+	if err := repo.AbortConfirm(ctx, s.ID, 8); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Fatalf("AbortConfirm with a foreign key = %v, want ErrStaleTransition", err)
+	}
+	if err := repo.AbortConfirm(ctx, s.ID, 7); err != nil {
+		t.Fatalf("AbortConfirm: %v", err)
+	}
+	got, _ := repo.FindByID(ctx, s.ID)
+	if got.Status != domain.StatusReady || got.ConfirmKeyID != nil {
+		t.Fatalf("after abort = %s bound=%v, want ready unbound", got.Status, got.ConfirmKeyID)
+	}
+	if err := repo.AbortConfirm(ctx, s.ID, 7); !errors.Is(err, domain.ErrStaleTransition) {
+		t.Errorf("second AbortConfirm = %v, want ErrStaleTransition (no longer confirming)", err)
+	}
+	if err := repo.BeginConfirm(ctx, s.ID, 9); err != nil {
+		t.Errorf("a fresh key must be able to confirm after the abort: %v", err)
+	}
+}
+
+// A claim that carries the attempt marker (an order may exist) or a cached
+// answer can never be aborted, whatever the caller believes.
+func TestSessionRepository_AbortConfirmRefusesAMarkedClaim(t *testing.T) {
+	pool := newTestDB(t)
+	repo := NewSessionRepository(pool)
+	ctx := context.Background()
+
+	for user, tc := range map[string]struct{ name, cols string }{
+		"7": {"attempt marker", "subject_id = 0"},
+		"8": {"cached answer", "response_code = 201"},
+	} {
+		name, cols := tc.name, tc.cols
+		s := newSession(user)
+		if err := repo.Create(ctx, s); err != nil {
+			t.Fatalf("%s: Create: %v", name, err)
+		}
+		var keyID int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash, locked_at)
+			VALUES ($1, 'marked-'||$2, 'POST', '/confirm', 'h', now())
+			RETURNING id`, user, s.ID).Scan(&keyID); err != nil {
+			t.Fatalf("%s: seed claim: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE idempotency_keys SET `+cols+` WHERE id = $1`, keyID); err != nil {
+			t.Fatalf("%s: mark claim: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE checkout_sessions SET status = 'confirming', confirm_key_id = $2 WHERE id = $1`, s.ID, keyID); err != nil {
+			t.Fatalf("%s: park session: %v", name, err)
+		}
+		if err := repo.AbortConfirm(ctx, s.ID, keyID); !errors.Is(err, domain.ErrStaleTransition) {
+			t.Errorf("%s: AbortConfirm = %v, want ErrStaleTransition", name, err)
+		}
+		if got, _ := repo.FindByID(ctx, s.ID); got.Status != domain.StatusConfirming {
+			t.Errorf("%s: status = %s, want still confirming", name, got.Status)
+		}
+	}
+}
+
 func TestSessionRepository_RequoteResetsPricesAndClearsBinding(t *testing.T) {
 	repo := NewSessionRepository(newTestDB(t))
 	ctx := context.Background()

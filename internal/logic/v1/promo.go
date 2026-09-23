@@ -120,7 +120,8 @@ func (s *CheckoutService) ApplyPromo(ctx context.Context, userID, id, code strin
 	return session, nil
 }
 
-// RemovePromo detaches the applied code (no use was ever counted). Gives a
+// RemovePromo detaches the applied code (no use was counted, barring a
+// confirm redeem whose commit acknowledgement was lost). Gives a
 // user whose code no longer fits the totals an exit that is not "wait for
 // the TTL" (review finding).
 func (s *CheckoutService) RemovePromo(ctx context.Context, userID, id string) (*domain.Session, error) {
