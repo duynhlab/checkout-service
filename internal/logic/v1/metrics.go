@@ -27,11 +27,14 @@ var (
 	meter = otel.Meter("checkout")
 
 	confirmedCounter, _ = meter.Int64Counter("checkout.sessions.confirmed",
-		metric.WithDescription("Checkout sessions successfully confirmed into an order"))
+		metric.WithDescription("Checkout sessions successfully confirmed into an order"),
+		metric.WithUnit("{session}"))
 	priceChangedCounter, _ = meter.Int64Counter("checkout.price.changed",
-		metric.WithDescription("Confirms bounced with PRICE_CHANGED or STOCK_UNAVAILABLE (session requoted)"))
+		metric.WithDescription("Confirms bounced with PRICE_CHANGED or STOCK_UNAVAILABLE (session requoted)"),
+		metric.WithUnit("{quote}"))
 	expiredCounter, _ = meter.Int64Counter("checkout.sessions.expired",
-		metric.WithDescription("Sessions marked expired, by who noticed (timer = abandonment workflow, lazy = read-path backstop)"))
+		metric.WithDescription("Sessions marked expired, by who noticed (timer = abandonment workflow, lazy = read-path backstop)"),
+		metric.WithUnit("{session}"))
 	confirmDuration, _ = meter.Float64Histogram("checkout.confirm.duration",
 		metric.WithDescription("End-to-end confirm handler duration"), metric.WithUnit("s"),
 		// obsx installs SLO-tuned Views only for its named HTTP instruments;
@@ -40,9 +43,11 @@ var (
 		// confirm into bucket 0.
 		metric.WithExplicitBucketBoundaries(obsx.DurationBuckets...))
 	promoRedeemedCounter, _ = meter.Int64Counter("checkout.promo.redeemed",
-		metric.WithDescription("Promo redemptions counted at confirm (P4)"))
+		metric.WithDescription("Promo redemptions counted at confirm (P4)"),
+		metric.WithUnit("{redemption}"))
 	promoRejectedCounter, _ = meter.Int64Counter("checkout.promo.rejected",
-		metric.WithDescription("Promo rejections at the authoritative confirm gate, by reason"))
+		metric.WithDescription("Promo rejections at the authoritative confirm gate, by reason"),
+		metric.WithUnit("{rejection}"))
 	// The availability authority's own signal. It replaces two migration-era
 	// counters (checkout_availability_path_total, inventory_shadow_compare_total)
 	// that phase 4 made meaningless — but it is NOT their replacement in kind:
@@ -57,7 +62,8 @@ var (
 	// a business answer), error (transport/timeout — fail-closed to 503, NEVER
 	// read as a shortage). No sku or user labels.
 	availabilityCheckCounter, _ = meter.Int64Counter("checkout.availability.check",
-		metric.WithDescription("Inventory availability checks by outcome (RFC-0021 phase 4: inventory is the only authority)"))
+		metric.WithDescription("Inventory availability checks by outcome (RFC-0021 phase 4: inventory is the only authority)"),
+		metric.WithUnit("{check}"))
 )
 
 // Availability check outcomes — bounded metric labels.
