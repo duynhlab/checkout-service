@@ -86,6 +86,7 @@ func (a *Activities) ExpireIfDue(ctx context.Context, sessionID string) (ExpireR
 	}
 	if outcome == domain.OutcomeExpired {
 		logicv1.RecordSessionExpired(ctx, string(domain.ExpiredByTimer))
+		logicv1.EmitSessionExpired(ctx, sessionID, string(domain.ExpiredByTimer))
 	}
 	return ExpireResult{Outcome: outcome, Remaining: remaining}, nil
 }

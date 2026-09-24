@@ -3,11 +3,12 @@ package workflow
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/duynhlab/pkg/logger/slogx"
 	"go.temporal.io/sdk/client"
-	"go.uber.org/zap"
 )
 
 // ErrTemporalUnavailable reports that no Temporal connection exists yet. The
@@ -31,7 +32,7 @@ type Signaler interface {
 // it (BUGS-6). Lazy makes that startup race self-healing; a connection that
 // breaks later is still the SDK's reconnect job, as before.
 type Lazy struct {
-	logger *zap.Logger
+	logger *slogx.Logger
 
 	mu     sync.RWMutex
 	client client.Client
@@ -44,7 +45,7 @@ type Lazy struct {
 // NewLazy returns a Lazy that dials in the background, waiting interval
 // between failed attempts, until one dial succeeds. dial is injected for
 // testability (production passes a temporalx.Dial closure).
-func NewLazy(dial func() (client.Client, error), interval time.Duration, logger *zap.Logger) *Lazy {
+func NewLazy(dial func() (client.Client, error), interval time.Duration, logger *slogx.Logger) *Lazy {
 	l := &Lazy{logger: logger, stop: make(chan struct{}), done: make(chan struct{})}
 	go l.redial(dial, interval)
 	return l
@@ -52,13 +53,14 @@ func NewLazy(dial func() (client.Client, error), interval time.Duration, logger 
 
 // NewLazySeeded returns an already-connected Lazy (the startup dial
 // succeeded); no background loop runs.
-func NewLazySeeded(c client.Client, logger *zap.Logger) *Lazy {
+func NewLazySeeded(c client.Client, logger *slogx.Logger) *Lazy {
 	l := &Lazy{logger: logger, client: c, stop: make(chan struct{}), done: make(chan struct{})}
 	close(l.done)
 	return l
 }
 
 func (l *Lazy) redial(dial func() (client.Client, error), interval time.Duration) {
+	ctx := context.Background() // a background loop: no request to correlate with
 	defer close(l.done)
 	for attempt := 1; ; attempt++ {
 		// Run the dial in its own goroutine so Close never waits on an
@@ -87,14 +89,14 @@ func (l *Lazy) redial(dial func() (client.Client, error), interval time.Duration
 				l.mu.Lock()
 				l.client = r.c
 				l.mu.Unlock()
-				l.logger.Info("Temporal connected by background redial; abandonment notifier active",
-					zap.Int("attempt", attempt))
+				l.logger.Info(ctx, "Temporal connected by background redial; abandonment notifier active",
+					slog.Int("attempt", attempt))
 				return
 			}
 			// The first attempts are worth a warning; after that one line
 			// per interval forever is just pager noise.
 			if attempt <= 3 || attempt%20 == 0 {
-				l.logger.Warn("Temporal background redial failed", zap.Int("attempt", attempt), zap.Error(r.err))
+				l.logger.Warn(ctx, "Temporal background redial failed", slog.Int("attempt", attempt), slogx.Err(r.err))
 			}
 		}
 

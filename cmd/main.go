@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,15 +23,13 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 
 	"github.com/duynhlab/pkg/authmw"
 	"github.com/duynhlab/pkg/grpcx"
 	"github.com/duynhlab/pkg/httpmw"
 	"github.com/duynhlab/pkg/idempotency"
-	"github.com/duynhlab/pkg/logger/zapx"
+	"github.com/duynhlab/pkg/logger/slogx"
 	"github.com/duynhlab/pkg/migratex"
 	"github.com/duynhlab/pkg/obsx"
 	"github.com/duynhlab/pkg/temporalx"
@@ -46,13 +45,11 @@ import (
 )
 
 func main() {
+	ctx := context.Background()
 	cfg := config.Load()
 
-	logger, err := zapx.New(os.Getenv("LOG_LEVEL"))
-	if err != nil {
-		panic("Failed to initialize logger: " + err.Error())
-	}
-	defer func() { _ = logger.Sync() }()
+	logger := slogx.New(slogx.Config{Level: os.Getenv("LOG_LEVEL")})
+	slogx.SetDefault(logger)
 
 	// Subcommand `migrate` runs the embedded SQL set and exits. `worker` is
 	// handled below, after observability and the DB pool exist.
@@ -64,20 +61,19 @@ func main() {
 		panic("Configuration validation failed: " + err.Error())
 	}
 
-	logger.Info("Service starting",
-		zap.String("service", cfg.Service.Name),
-		zap.String("version", cfg.Service.Version),
-		zap.String("env", cfg.Service.Env),
-		zap.String("port", cfg.Service.Port),
+	logger.Info(ctx, "Service starting",
+		slog.String("service.version", cfg.Service.Version),
+		slog.String("deployment.environment.name", cfg.Service.Env),
+		slog.String("port", cfg.Service.Port),
 	)
 
 	pool, err := database.Connect(context.Background(), cfg)
 	if err != nil {
-		logger.Error("Failed to connect to database", zap.Error(err))
+		logger.Error(ctx, "Failed to connect to database", slogx.Err(err))
 		return
 	}
 	defer pool.Close()
-	logger.Info("Database connection pool established")
+	logger.Info(ctx, "Database connection pool established")
 
 	// RFC-0014: single OTel wiring point — traces, OTLP metrics, logs.
 	tp, logger := initObservability(logger)
@@ -85,17 +81,17 @@ func main() {
 	if cfg.Profiling.Enabled {
 		stopProfiling, err := obsx.SetupProfiling()
 		if err != nil {
-			logger.Warn("Failed to initialize profiling", zap.Error(err))
+			logger.Warn(ctx, "Failed to initialize profiling", slogx.Err(err))
 		} else {
-			logger.Info("Profiling initialized", zap.String("endpoint", cfg.Profiling.Endpoint))
+			logger.Info(ctx, "Profiling initialized", slog.String("endpoint", cfg.Profiling.Endpoint))
 			defer func() {
 				if err := stopProfiling(context.Background()); err != nil {
-					logger.Error("Profiling shutdown error", zap.Error(err))
+					logger.Error(ctx, "Profiling shutdown error", slogx.Err(err))
 				}
 			}()
 		}
 	} else {
-		logger.Info("Profiling disabled (PROFILING_ENABLED=false)")
+		logger.Info(ctx, "Profiling disabled (PROFILING_ENABLED=false)")
 	}
 
 	// `<binary> worker` runs the Temporal worker for the abandonment
@@ -124,9 +120,9 @@ func main() {
 	// window dwarfs the longest possible confirm execution.
 	if cfg.Checkout.IdempotencyLockTakeover <= 4*logicv1.MaxConfirmWrite {
 		// Fatal: a config gate must exit non-zero so orchestrators see it.
-		logger.Fatal("IDEMPOTENCY_LOCK_TAKEOVER must exceed 4× the longest confirm write",
-			zap.Duration("takeover", cfg.Checkout.IdempotencyLockTakeover),
-			zap.Duration("max_confirm_write", logicv1.MaxConfirmWrite))
+		logger.Fatal(ctx, "IDEMPOTENCY_LOCK_TAKEOVER must exceed 4× the longest confirm write",
+			slog.Duration("takeover", cfg.Checkout.IdempotencyLockTakeover),
+			slog.Duration("max_confirm_write", logicv1.MaxConfirmWrite))
 	}
 
 	repo := postgres.NewSessionRepository(pool)
@@ -171,7 +167,7 @@ func main() {
 		JWKSURL:  cfg.OIDCJWKSURL,
 	})
 	if err != nil {
-		logger.Error("JWT verifier init failed", zap.Error(err))
+		logger.Error(ctx, "JWT verifier init failed", slogx.Err(err))
 		return
 	}
 
@@ -185,17 +181,18 @@ func main() {
 const idempotencyRetention = 24 * time.Hour
 
 // runIdempotencyReaper deletes expired finished idempotency rows hourly.
-func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) {
+func runIdempotencyReaper(repo *postgres.SessionRepository, logger *slogx.Logger) {
+	ctx := context.Background()
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for range ticker.C {
 		n, err := repo.ReapFinishedIdempotencyKeys(context.Background(), idempotencyRetention)
 		if err != nil {
-			logger.Warn("idempotency reap failed", zap.Error(err))
+			logger.Warn(ctx, "idempotency reap failed", slogx.Err(err))
 			continue
 		}
 		if n > 0 {
-			logger.Info("idempotency keys reaped", zap.Int64("rows", n))
+			logger.Info(ctx, "idempotency keys reaped", slog.Int64("rows", n))
 		}
 	}
 }
@@ -211,7 +208,8 @@ func runIdempotencyReaper(repo *postgres.SessionRepository, logger *zap.Logger) 
 // match — and the list has already grown once (inventory, RFC-0021 phase 4). A
 // sixth entry would have compiled and then panicked on conns[5] at startup, and
 // no test would have caught it, because `targets` is a literal.
-func dialEastWest(cfg *config.Config, logger *zap.Logger) ([]*grpc.ClientConn, func(), bool) {
+func dialEastWest(cfg *config.Config, logger *slogx.Logger) ([]*grpc.ClientConn, func(), bool) {
+	ctx := context.Background()
 	targets := []struct {
 		name string
 		addr string
@@ -230,7 +228,7 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([]*grpc.ClientConn, f
 	for i, tgt := range targets {
 		conn, err := grpcx.Dial(tgt.addr)
 		if err != nil {
-			logger.Error("Failed to dial "+tgt.name+" gRPC", zap.String("addr", tgt.addr), zap.Error(err))
+			logger.Error(ctx, "Failed to dial "+tgt.name+" gRPC", slog.String("addr", tgt.addr), slogx.Err(err))
 			for j := range i {
 				_ = conns[j].Close()
 			}
@@ -249,7 +247,8 @@ func dialEastWest(cfg *config.Config, logger *zap.Logger) ([]*grpc.ClientConn, f
 // initObservability wires the RFC-0014 OTel pipeline (traces, OTLP metrics,
 // logs) and tees application logs into it. Returns the shutdown handle (nil
 // when setup failed — the service still runs) and the possibly-teed logger.
-func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context) error }, *zap.Logger) {
+func initObservability(logger *slogx.Logger) (interface{ Shutdown(context.Context) error }, *slogx.Logger) {
+	ctx := context.Background()
 	otelCfg := obsx.ConfigFromEnv()
 	// ADR-063: the Temporal OTel v2 plugin requires the GLOBAL tracer provider
 	// to be the replay-safe one; obsx keeps the option set and installation,
@@ -260,22 +259,20 @@ func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context)
 			return temporalx.NewReplaySafeTracerProvider(c.SDKOptions()...)
 		}))
 	if err != nil {
-		logger.Warn("Failed to initialize OpenTelemetry", zap.Error(err))
+		logger.Warn(ctx, "Failed to initialize OpenTelemetry", slogx.Err(err))
 		return nil, logger
 	}
-	minLevel, lvlErr := zapcore.ParseLevel(os.Getenv("LOG_LEVEL"))
-	if lvlErr != nil {
-		minLevel = zapcore.InfoLevel
-	}
-	logger = logger.WithOptions(zap.WrapCore(func(c zapcore.Core) zapcore.Core {
-		return zapcore.NewTee(c, obs.ZapCore(otelCfg.ServiceName, minLevel))
-	}))
-	logger.Info("OpenTelemetry initialized",
-		zap.Bool("traces", obs.Enabled().Traces),
-		zap.Bool("otlp_metrics", obs.Enabled().Metrics),
-		zap.Bool("otlp_logs", obs.Enabled().Logs),
-		zap.String("endpoint", otelCfg.Endpoint),
-		zap.Float64("sample_rate", otelCfg.SampleRate),
+	// The facade reaches OTLP through the global logger provider obsx
+	// installed; rebuilding it only wires Flush, so a Fatal record is
+	// exported before the process exits.
+	logger = slogx.New(slogx.Config{Level: os.Getenv("LOG_LEVEL"), Flush: obs.ForceFlush})
+	slogx.SetDefault(logger)
+	logger.Info(ctx, "OpenTelemetry initialized",
+		slog.Bool("traces", obs.Enabled().Traces),
+		slog.Bool("otlp_metrics", obs.Enabled().Metrics),
+		slog.Bool("otlp_logs", obs.Enabled().Logs),
+		slog.String("endpoint", otelCfg.Endpoint),
+		slog.Float64("sample_rate", otelCfg.SampleRate),
 	)
 	return obs, logger
 }
@@ -291,19 +288,20 @@ const (
 // dialTemporalRetry dials Temporal with a bounded linear-backoff budget — a
 // single eager dial loses the bring-up race when Temporal reports healthy
 // moments after this process starts (order-service lesson).
-func dialTemporalRetry(cfg *config.Config, logger *zap.Logger) (client.Client, error) {
+func dialTemporalRetry(cfg *config.Config, logger *slogx.Logger) (client.Client, error) {
+	ctx := context.Background()
 	var lastErr error
 	for i := 1; i <= temporalDialAttempts; i++ {
 		tc, err := temporalx.Dial(temporalx.Config{HostPort: cfg.Temporal.HostPort, Namespace: cfg.Temporal.Namespace},
-			temporalx.WithLogger(logger))
+			temporalx.WithLogger(logger.Slog()))
 		if err == nil {
 			return tc, nil
 		}
 		lastErr = err
 		if i < temporalDialAttempts {
-			logger.Warn("Temporal dial failed; retrying",
-				zap.Int("attempt", i), zap.Int("attempts", temporalDialAttempts),
-				zap.String("hostport", cfg.Temporal.HostPort), zap.Error(err))
+			logger.Warn(ctx, "Temporal dial failed; retrying",
+				slog.Int("attempt", i), slog.Int("attempts", temporalDialAttempts),
+				slog.String("hostport", cfg.Temporal.HostPort), slogx.Err(err))
 			time.Sleep(time.Duration(i) * temporalDialBackoff)
 		}
 	}
@@ -319,21 +317,22 @@ const temporalRedialInterval = 15 * time.Second
 // background loop keeps dialing until Temporal appears, so a checkout pod
 // that raced Temporal at bring-up heals itself instead of silently never
 // starting AbandonedCheckoutWorkflow until someone restarts it.
-func configureTemporal(cfg *config.Config, logger *zap.Logger) *checkoutwf.Lazy {
+func configureTemporal(cfg *config.Config, logger *slogx.Logger) *checkoutwf.Lazy {
+	ctx := context.Background()
 	dial := func() (client.Client, error) {
 		return temporalx.Dial(temporalx.Config{HostPort: cfg.Temporal.HostPort, Namespace: cfg.Temporal.Namespace},
-			temporalx.WithLogger(logger))
+			temporalx.WithLogger(logger.Slog()))
 	}
 	tc, err := dialTemporalRetry(cfg, logger)
 	if err != nil {
-		logger.Warn("Temporal unavailable at startup; background redial engaged — session expiry stays lazy-only until connected",
-			zap.String("hostport", cfg.Temporal.HostPort),
-			zap.Duration("redial_interval", temporalRedialInterval), zap.Error(err))
+		logger.Warn(ctx, "Temporal unavailable at startup; background redial engaged — session expiry stays lazy-only until connected",
+			slog.String("hostport", cfg.Temporal.HostPort),
+			slog.Duration("redial_interval", temporalRedialInterval), slogx.Err(err))
 		return checkoutwf.NewLazy(dial, temporalRedialInterval, logger)
 	}
-	logger.Info("Temporal client initialized",
-		zap.String("hostport", cfg.Temporal.HostPort),
-		zap.String("namespace", cfg.Temporal.Namespace))
+	logger.Info(ctx, "Temporal client initialized",
+		slog.String("hostport", cfg.Temporal.HostPort),
+		slog.String("namespace", cfg.Temporal.Namespace))
 	return checkoutwf.NewLazySeeded(tc, logger)
 }
 
@@ -341,14 +340,15 @@ func configureTemporal(cfg *config.Config, logger *zap.Logger) *checkoutwf.Lazy 
 // invoked as `<binary> worker`, and reports whether it handled the command.
 // Temporal being unreachable after the retry budget is fatal here — the
 // worker can do nothing without it (order-worker pattern).
-func maybeRunWorker(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) bool {
+func maybeRunWorker(cfg *config.Config, logger *slogx.Logger, pool *pgxpool.Pool) bool {
+	ctx := context.Background()
 	if len(os.Args) <= 1 || os.Args[1] != "worker" {
 		return false
 	}
 
 	tc, err := dialTemporalRetry(cfg, logger)
 	if err != nil {
-		logger.Fatal("Failed to connect to Temporal", zap.String("hostport", cfg.Temporal.HostPort), zap.Error(err))
+		logger.Fatal(ctx, "Failed to connect to Temporal", slog.String("hostport", cfg.Temporal.HostPort), slogx.Err(err))
 	}
 	defer tc.Close()
 
@@ -371,14 +371,18 @@ func maybeRunWorker(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) 
 	healthSrv := startWorkerHealthServer(cfg.Service.Port, logger, ready)
 	defer func() { _ = healthSrv.Close() }()
 
-	logger.Info("Starting Temporal worker",
-		zap.String("hostport", cfg.Temporal.HostPort),
-		zap.String("namespace", cfg.Temporal.Namespace),
-		zap.String("task_queue", cfg.Temporal.TaskQueue))
+	logger.Info(ctx, "Starting Temporal worker",
+		slog.String("hostport", cfg.Temporal.HostPort),
+		slog.String("namespace", cfg.Temporal.Namespace),
+		slog.String("task_queue", cfg.Temporal.TaskQueue))
 	ready.Store(true)
+	logger.ProcessStarted(ctx, slogx.ComponentWorker)
 	if err := w.Run(worker.InterruptCh()); err != nil {
-		logger.Fatal("Temporal worker stopped with error", zap.Error(err))
+		logger.ProcessStopped(ctx, slogx.ComponentWorker, slogx.OutcomeError)
+		logger.Fatal(ctx, "Temporal worker stopped with error", slogx.Err(err))
 	}
+	// Written before the caller shuts the OTel SDK down, so it is exported.
+	logger.ProcessStopped(ctx, slogx.ComponentWorker, slogx.OutcomeGraceful)
 	return true
 }
 
@@ -388,7 +392,8 @@ func maybeRunWorker(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) 
 func healthPayload(state string) gin.H { return gin.H{"status": state} }
 
 // startWorkerHealthServer serves /health and /ready for the worker process.
-func startWorkerHealthServer(port string, logger *zap.Logger, ready *atomic.Bool) *http.Server {
+func startWorkerHealthServer(port string, logger *slogx.Logger, ready *atomic.Bool) *http.Server {
+	ctx := context.Background()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -411,21 +416,22 @@ func startWorkerHealthServer(port string, logger *zap.Logger, ready *atomic.Bool
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("worker health server failed", zap.Error(err))
+			logger.Error(ctx, "worker health server failed", slogx.Err(err))
 		}
 	}()
 	return srv
 }
 
 // runSubcommand handles `migrate`; returns true when it handled the command.
-func runSubcommand(cmd string, cfg *config.Config, logger *zap.Logger) bool {
+func runSubcommand(cmd string, cfg *config.Config, logger *slogx.Logger) bool {
+	ctx := context.Background()
 	if cmd != "migrate" {
 		return false
 	}
 	if err := migratex.Run(migrations.FS, "sql", cfg.Database.BuildDSN()); err != nil {
-		logger.Fatal("Schema migration failed", zap.Error(err))
+		logger.Fatal(ctx, "Schema migration failed", slogx.Err(err))
 	}
-	logger.Info("Schema migrations applied")
+	logger.Info(ctx, "Schema migrations applied")
 	return true
 }
 
@@ -434,7 +440,7 @@ func runSubcommand(cmd string, cfg *config.Config, logger *zap.Logger) bool {
 func setupServer(
 	cfg *config.Config,
 	otelServiceName string,
-	logger *zap.Logger,
+	logger *slogx.Logger,
 	handler *webv1.Handler,
 	verifier *authmw.Verifier,
 	pool interface {
@@ -442,9 +448,12 @@ func setupServer(
 	},
 	isShuttingDown *atomic.Bool,
 ) *http.Server {
-	r := gin.Default()
+	// gin.New, not gin.Default: Default installs gin's own logger and
+	// recovery, which print the raw path and client address past the facade.
+	r := gin.New()
 	r.Use(httpmw.Tracing(otelServiceName))
-	r.Use(httpmw.Logging(logger))
+	r.Use(httpmw.Logging(logger.Slog()))
+	r.Use(httpmw.Recovery(logger.Slog()))
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, healthPayload("ok"))
@@ -478,55 +487,65 @@ func setupServer(
 // flips first, the HTTP server shuts down, the pool closes, OTel flushes.
 func runGracefulShutdown(
 	cfg *config.Config,
-	logger *zap.Logger,
+	logger *slogx.Logger,
 	srv *http.Server,
 	tp interface{ Shutdown(context.Context) error },
 	pool interface{ Close() },
 	isShuttingDown *atomic.Bool,
 ) {
+	ctx := context.Background()
 	go func() {
-		logger.Info("Starting checkout service", zap.String("port", cfg.Service.Port))
+		logger.Info(ctx, "Starting checkout service", slog.String("port", cfg.Service.Port))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("Failed to start server", zap.Error(err))
+			logger.Error(ctx, "Failed to start server", slogx.Err(err))
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	logger.ProcessStarted(ctx, slogx.ComponentAPI)
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	<-ctx.Done()
+	<-sigCtx.Done()
 
 	isShuttingDown.Store(true)
 	drain := cfg.GetReadinessDrainDelayDuration()
-	logger.Info("Draining before shutdown", zap.Duration("delay", drain))
+	logger.Info(ctx, "Draining before shutdown", slog.Duration("delay", drain))
 	time.Sleep(drain)
 
 	shutdownTimeout := cfg.GetShutdownTimeoutDuration()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
+	outcome := slogx.OutcomeGraceful
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("HTTP server shutdown error", zap.Error(err))
+		outcome = slogx.OutcomeError
+		logger.Error(ctx, "HTTP server shutdown error", slogx.Err(err))
 	} else {
-		logger.Info("HTTP server shutdown complete")
+		logger.Info(ctx, "HTTP server shutdown complete")
 	}
 
 	pool.Close()
-	logger.Info("Database pool closed")
+	logger.Info(ctx, "Database pool closed")
+
+	// process.stopped goes out BEFORE the OTel SDK shuts down: a record
+	// emitted after it is dropped rather than exported.
+	logger.ProcessStopped(ctx, slogx.ComponentAPI, outcome)
 
 	if tp != nil {
 		if err := tp.Shutdown(shutdownCtx); err != nil {
-			logger.Error("OpenTelemetry shutdown error", zap.Error(err))
+			logger.Error(ctx, "OpenTelemetry shutdown error", slogx.Err(err))
 		} else {
-			logger.Info("OpenTelemetry shutdown complete")
+			logger.Info(ctx, "OpenTelemetry shutdown complete")
 		}
 	}
 
-	logger.Info("Graceful shutdown complete")
+	logger.Info(ctx, "Graceful shutdown complete")
 }
 
 // closeConn closes a gRPC client connection at shutdown.
-func closeConn(conn *grpc.ClientConn, logger *zap.Logger, name string) {
+func closeConn(conn *grpc.ClientConn, logger *slogx.Logger, name string) {
+	ctx := context.Background()
 	if err := conn.Close(); err != nil {
-		logger.Error("gRPC connection close error", zap.String("target", name), zap.Error(err))
+		logger.Error(ctx, "gRPC connection close error", slog.String("target", name), slogx.Err(err))
 	}
 }

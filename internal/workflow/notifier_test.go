@@ -3,15 +3,16 @@ package workflow
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/duynhlab/pkg/logger/slogx"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
-	"go.uber.org/zap"
 )
 
 // fakeSignaler captures the calls the Notifier fires and unblocks the test
@@ -57,7 +58,7 @@ func (f *fakeSignaler) wait(t *testing.T) {
 // live on the client call, not in workflow code.
 func TestSignalWithStart_StartOptionsContract(t *testing.T) {
 	f := &fakeSignaler{done: make(chan struct{}, 1)}
-	n := NewNotifier(f, "checkout", 30*time.Minute, zap.NewNop())
+	n := NewNotifier(f, "checkout", 30*time.Minute, slogx.New(slogx.Config{Stdout: io.Discard}))
 
 	n.SessionStarted(context.Background(), "sid-123")
 	f.wait(t)
@@ -96,7 +97,7 @@ func TestNotifier_SwallowsFailures(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := &fakeSignaler{done: make(chan struct{}, 1), err: err}
-			n := NewNotifier(f, "checkout", time.Minute, zap.NewNop())
+			n := NewNotifier(f, "checkout", time.Minute, slogx.New(slogx.Config{Stdout: io.Discard}))
 
 			n.SessionActivity(context.Background(), "sid-a")
 			f.wait(t)

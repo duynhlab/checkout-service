@@ -3,12 +3,13 @@ package workflow
 import (
 	"context"
 	"errors"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/duynhlab/pkg/logger/slogx"
 	"go.temporal.io/sdk/client"
-	"go.uber.org/zap"
 )
 
 // dialScript returns a dial func that fails `failures` times before handing
@@ -61,7 +62,7 @@ func TestLazyNotReadyBeforeFirstSuccessfulDial(t *testing.T) {
 	var calls atomic.Int32
 	inner := &fakeTemporal{}
 	// Dial never succeeds within this test's window.
-	l := NewLazy(dialScript(1000, inner, &calls), time.Hour, zap.NewNop())
+	l := NewLazy(dialScript(1000, inner, &calls), time.Hour, slogx.New(slogx.Config{Stdout: io.Discard}))
 	defer l.Close()
 
 	if l.TemporalReady() {
@@ -82,7 +83,7 @@ func TestLazyBecomesReadyAndDelegates(t *testing.T) {
 	var calls atomic.Int32
 	inner := &fakeTemporal{}
 	// First attempt fails, second (background retry) succeeds.
-	l := NewLazy(dialScript(1, inner, &calls), 10*time.Millisecond, zap.NewNop())
+	l := NewLazy(dialScript(1, inner, &calls), 10*time.Millisecond, slogx.New(slogx.Config{Stdout: io.Discard}))
 	defer l.Close()
 
 	waitReady(t, l)
@@ -99,7 +100,7 @@ func TestLazyBecomesReadyAndDelegates(t *testing.T) {
 
 func TestLazySeededClientIsReadyImmediately(t *testing.T) {
 	inner := &fakeTemporal{}
-	l := NewLazySeeded(inner, zap.NewNop())
+	l := NewLazySeeded(inner, slogx.New(slogx.Config{Stdout: io.Discard}))
 	defer l.Close()
 
 	if !l.TemporalReady() {
@@ -113,7 +114,7 @@ func TestLazySeededClientIsReadyImmediately(t *testing.T) {
 func TestLazyCloseStopsRetriesAndClosesClient(t *testing.T) {
 	var calls atomic.Int32
 	inner := &fakeTemporal{}
-	l := NewLazy(dialScript(1, inner, &calls), 10*time.Millisecond, zap.NewNop())
+	l := NewLazy(dialScript(1, inner, &calls), 10*time.Millisecond, slogx.New(slogx.Config{Stdout: io.Discard}))
 
 	waitReady(t, l)
 	l.Close()
@@ -124,7 +125,7 @@ func TestLazyCloseStopsRetriesAndClosesClient(t *testing.T) {
 
 func TestLazyCloseBeforeReadyStopsLoop(t *testing.T) {
 	var calls atomic.Int32
-	l := NewLazy(dialScript(1000, &fakeTemporal{}, &calls), 5*time.Millisecond, zap.NewNop())
+	l := NewLazy(dialScript(1000, &fakeTemporal{}, &calls), 5*time.Millisecond, slogx.New(slogx.Config{Stdout: io.Discard}))
 	time.Sleep(20 * time.Millisecond)
 	l.Close()
 
@@ -144,7 +145,7 @@ func TestLazyCloseBeforeReadyStopsLoop(t *testing.T) {
 
 func TestLazyDoubleCloseAndNilReceiver(t *testing.T) {
 	inner := &fakeTemporal{}
-	l := NewLazySeeded(inner, zap.NewNop())
+	l := NewLazySeeded(inner, slogx.New(slogx.Config{Stdout: io.Discard}))
 	l.Close()
 	l.Close() // must not panic or double-close the client
 	if inner.closed.Load() != 1 {
@@ -171,7 +172,7 @@ func TestLazyCloseDoesNotWaitOnHungDial(t *testing.T) {
 		<-release // simulate a blackholed endpoint
 		return inner, nil
 	}
-	l := NewLazy(dial, time.Millisecond, zap.NewNop())
+	l := NewLazy(dial, time.Millisecond, slogx.New(slogx.Config{Stdout: io.Discard}))
 
 	closed := make(chan struct{})
 	go func() { l.Close(); close(closed) }()

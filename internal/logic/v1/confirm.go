@@ -190,6 +190,7 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 	}
 
 	confirmedCounter.Add(ctx, 1)
+	emitSessionConfirmed(ctx, session.ID, session.OrderID)
 	if s.notifier != nil {
 		s.notifier.SessionFinalized(ctx, session.ID)
 	}
@@ -266,6 +267,7 @@ func (s *CheckoutService) enterConfirm(ctx context.Context, session *domain.Sess
 			// Crash between completion and Finish: rebuild and cache. This IS
 			// the completion (the original attempt died before counting).
 			confirmedCounter.Add(ctx, 1)
+			emitSessionConfirmed(ctx, session.ID, session.OrderID)
 			return true, s.finishConfirm(ctx, keyID, session)
 		}
 		return false, ErrInvalidTransition
@@ -479,8 +481,10 @@ func (s *CheckoutService) revalidate(ctx context.Context, session *domain.Sessio
 	session.ConfirmKeyID = nil
 	priceChangedCounter.Add(ctx, 1)
 	if stockShort {
+		emitSessionRequoted(ctx, session.ID, "stock_unavailable")
 		return session, ErrStockUnavailable
 	}
+	emitSessionRequoted(ctx, session.ID, "price_changed")
 	return session, ErrPriceChanged
 }
 
@@ -539,6 +543,7 @@ func (s *CheckoutService) escapeOnUnknownAvailability(
 	_ = s.idem.Release(ctx, keyID)
 	session.Status = domain.StatusShippingSet
 	session.ConfirmKeyID = nil
+	emitSessionRequoted(ctx, session.ID, "availability_unknown")
 	return session, ErrAvailabilityUnknown
 }
 

@@ -803,5 +803,6 @@ func (s *CheckoutService) lazyExpire(ctx context.Context, session *domain.Sessio
 	// Best-effort record; MarkExpired is conditional and idempotent.
 	_ = s.repo.MarkExpired(ctx, session.ID, domain.ExpiredByLazy)
 	RecordSessionExpired(ctx, string(domain.ExpiredByLazy))
+	EmitSessionExpired(ctx, session.ID, string(domain.ExpiredByLazy))
 	return true
 }
