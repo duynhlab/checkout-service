@@ -429,7 +429,7 @@ func NewCheckoutService(repo domain.SessionRepository, cart CartFetcher,
 // authority); cart's denormalized price is kept per line for the
 // price-changed diff. An empty cart is ErrEmptyCart.
 func (s *CheckoutService) CreateSession(ctx context.Context, userID string) (*domain.Session, bool, error) {
-	ctx, span := startLogicSpan(ctx, "checkout.session.create", attribute.String("user.id", userID))
+	ctx, span := startLogicSpan(ctx, "checkout.session.create")
 	defer span.End()
 
 	// Idempotent create: an active session short-circuits (after the lazy
