@@ -53,6 +53,9 @@ func (n *Notifier) SessionActivity(ctx context.Context, sessionID string) {
 // NotFound just means there is nothing to stop.
 func (n *Notifier) SessionFinalized(ctx context.Context, sessionID string) {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
+	// The goroutine outlives the request: its records keep the request's trace
+	// but must not use a context the handler's return cancels.
+	logCtx := context.WithoutCancel(ctx)
 	go func() {
 		defer cancel()
 		err := n.temporal.SignalWorkflow(sctx, WorkflowID(sessionID), "", SignalFinalize, nil)
@@ -62,10 +65,10 @@ func (n *Notifier) SessionFinalized(ctx context.Context, sessionID string) {
 		case errors.Is(err, ErrTemporalUnavailable):
 			// The redial loop already warns about the outage itself — one
 			// Debug per signal instead of a Warn per mutation.
-			n.logger.Debug(ctx, "abandonment finalize skipped: Temporal not connected yet",
+			n.logger.Debug(logCtx, "abandonment finalize skipped: Temporal not connected yet",
 				slog.String("checkout.session.id", sessionID))
 		default:
-			n.logger.Warn(ctx, "abandonment finalize signal failed (lazy expiry still covers this session)",
+			n.logger.Warn(logCtx, "abandonment finalize signal failed (lazy expiry still covers this session)",
 				slog.String("checkout.session.id", sessionID), slogx.Err(err))
 		}
 	}()
@@ -76,6 +79,9 @@ func (n *Notifier) SessionFinalized(ctx context.Context, sessionID string) {
 // best-effort by contract either way.
 func (n *Notifier) signalWithStart(ctx context.Context, sessionID string) {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
+	// The goroutine outlives the request: its records keep the request's trace
+	// but must not use a context the handler's return cancels.
+	logCtx := context.WithoutCancel(ctx)
 	go func() {
 		defer cancel()
 		_, err := n.temporal.SignalWithStartWorkflow(sctx, WorkflowID(sessionID), SignalActivity, nil,
@@ -100,10 +106,10 @@ func (n *Notifier) signalWithStart(ctx context.Context, sessionID string) {
 		case errors.Is(err, ErrTemporalUnavailable):
 			// See SessionFinalized: outage noise belongs to the redial loop,
 			// not to every mutation.
-			n.logger.Debug(ctx, "abandonment signal skipped: Temporal not connected yet",
+			n.logger.Debug(logCtx, "abandonment signal skipped: Temporal not connected yet",
 				slog.String("checkout.session.id", sessionID))
 		default:
-			n.logger.Warn(ctx, "abandonment signal-with-start failed (lazy expiry still covers this session)",
+			n.logger.Warn(logCtx, "abandonment signal-with-start failed (lazy expiry still covers this session)",
 				slog.String("checkout.session.id", sessionID), slogx.Err(err))
 		}
 	}()

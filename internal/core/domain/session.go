@@ -153,7 +153,7 @@ type SessionRepository interface {
 	// MarkExpired conditionally expires a non-terminal session, recording who
 	// noticed (timer vs lazy). Expiring an already-terminal session is a
 	// no-op, not an error — late timers must be harmless.
-	MarkExpired(ctx context.Context, id string, reason ExpiredReason) error
+	MarkExpired(ctx context.Context, id string, reason ExpiredReason) (bool, error)
 	// Promo surface (RFC-0015 P4, ADR-022).
 	GetPromo(ctx context.Context, code string) (*Promo, error)
 	CountUserRedemptions(ctx context.Context, code, userID string) (int, error)

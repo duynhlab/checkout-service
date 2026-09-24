@@ -190,11 +190,16 @@ func (s *CheckoutService) Confirm(ctx context.Context, userID, id, idemKey strin
 	}
 
 	confirmedCounter.Add(ctx, 1)
-	emitSessionConfirmed(ctx, session.ID, session.OrderID)
 	if s.notifier != nil {
 		s.notifier.SessionFinalized(ctx, session.ID)
 	}
-	return session, s.finishConfirm(ctx, key.ID, session)
+	if err := s.finishConfirm(ctx, key.ID, session); err != nil {
+		return session, err
+	}
+	// Only once the answer is cached: a failed Finish sends the same-key retry
+	// through the completed-recovery arm below, which would write it again.
+	emitSessionConfirmed(ctx, session.ID, session.OrderID)
+	return session, nil
 }
 
 // claimConfirm claims the idempotency key, translating the pkg sentinels and
@@ -267,8 +272,11 @@ func (s *CheckoutService) enterConfirm(ctx context.Context, session *domain.Sess
 			// Crash between completion and Finish: rebuild and cache. This IS
 			// the completion (the original attempt died before counting).
 			confirmedCounter.Add(ctx, 1)
+			if err := s.finishConfirm(ctx, keyID, session); err != nil {
+				return true, err
+			}
 			emitSessionConfirmed(ctx, session.ID, session.OrderID)
-			return true, s.finishConfirm(ctx, keyID, session)
+			return true, nil
 		}
 		return false, ErrInvalidTransition
 	default:

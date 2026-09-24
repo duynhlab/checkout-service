@@ -38,6 +38,7 @@ type fakeRepo struct {
 	setAddrErr      error
 	expired         []domain.ExpiredReason
 	markExpErr      error
+	alreadyExpired  bool // MarkExpired finds the row already expired (flips nothing)
 	createCalls     int
 	shipMethod      string
 	shipFee         int64
@@ -124,9 +125,9 @@ func (f *fakeRepo) SetAddress(_ context.Context, _ string, _ domain.SessionStatu
 	return nil
 }
 
-func (f *fakeRepo) MarkExpired(_ context.Context, _ string, reason domain.ExpiredReason) error {
+func (f *fakeRepo) MarkExpired(_ context.Context, _ string, reason domain.ExpiredReason) (bool, error) {
 	f.expired = append(f.expired, reason)
-	return f.markExpErr
+	return f.markExpErr == nil && !f.alreadyExpired, f.markExpErr
 }
 
 func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ time.Time, method string, feeMinor, taxMinor, discountMinor int64) error {

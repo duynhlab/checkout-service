@@ -1,6 +1,9 @@
 package workflow
 
 import (
+	"bytes"
+	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +11,7 @@ import (
 	"go.temporal.io/sdk/testsuite"
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 const testTTL = 30 * time.Minute
@@ -131,4 +135,30 @@ func TestAbandon_QueryReportsArmedDeadline(t *testing.T) {
 		t.Fatal("not completed")
 	}
 	env.AssertExpectations(t)
+}
+
+type fakeExpirer struct{ outcome domain.ExpireOutcome }
+
+func (f fakeExpirer) ExpireDue(context.Context, string, time.Duration) (domain.ExpireOutcome, time.Duration, error) {
+	return f.outcome, 0, nil
+}
+
+// The timer's expiry writes checkout.session.expired with reason timer, once:
+// ExpireDue reports OutcomeExpired only for the call that flipped the row.
+func TestExpireIfDue_EmitsTimerExpiry(t *testing.T) {
+	for outcome, want := range map[domain.ExpireOutcome]int{
+		domain.OutcomeExpired: 1, domain.OutcomeNotDue: 0, domain.OutcomeGone: 0,
+	} {
+		buf := &bytes.Buffer{}
+		ctx := slogx.WithContext(context.Background(), slogx.New(slogx.Config{Stdout: buf}))
+		acts := &Activities{Sessions: fakeExpirer{outcome: outcome}}
+		if _, err := acts.ExpireIfDue(ctx, "sess-1"); err != nil {
+			t.Fatalf("%s: %v", outcome, err)
+		}
+		out := buf.String()
+		n := strings.Count(out, `"event":"checkout.session.expired"`)
+		if n != want || (want == 1 && !strings.Contains(out, `"reason":"timer"`)) {
+			t.Errorf("%s: events = %d, want %d: %s", outcome, n, want, out)
+		}
+	}
 }

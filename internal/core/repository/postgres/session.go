@@ -502,7 +502,7 @@ func (r *SessionRepository) Touch(ctx context.Context, id string, expiresAt time
 // MarkExpired conditionally expires a non-terminal session. A late call
 // against a terminal session is a no-op — never an error (RFC-0015: a
 // late-firing timer must be harmless).
-func (r *SessionRepository) MarkExpired(ctx context.Context, id string, reason domain.ExpiredReason) (err error) {
+func (r *SessionRepository) MarkExpired(ctx context.Context, id string, reason domain.ExpiredReason) (_ bool, err error) {
 	defer func() { err = classify(err) }()
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
@@ -511,14 +511,16 @@ func (r *SessionRepository) MarkExpired(ctx context.Context, id string, reason d
 	// handoff in flight (P2) and must finish or drop back to shipping_set —
 	// never be yanked to expired mid-flight. Mirrors the FSM table, which has
 	// no confirming→expired edge.
-	_, err = r.db.Exec(ctx, `
+	tag, err := r.db.Exec(ctx, `
 		UPDATE checkout_sessions
 		SET status = 'expired', expired_reason = $2, updated_at = now()
 		WHERE id = $1 AND status NOT IN ('completed','cancelled','expired','confirming')`, id, reason)
 	if err != nil {
-		return fmt.Errorf("mark expired: %w", err)
+		return false, fmt.Errorf("mark expired: %w", err)
 	}
-	return nil
+	// true only for the call that flipped the row, so a caller can report the
+	// expiry once while concurrent readers and a late timer stay silent.
+	return tag.RowsAffected() == 1, nil
 }
 
 // scanSession loads one session row plus its items.

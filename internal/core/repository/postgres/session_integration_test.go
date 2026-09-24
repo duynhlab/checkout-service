@@ -220,8 +220,9 @@ func TestSessionRepository_MarkExpired(t *testing.T) {
 	if err := repo.Create(ctx, s); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := repo.MarkExpired(ctx, s.ID, domain.ExpiredByLazy); err != nil {
-		t.Fatalf("MarkExpired: %v", err)
+	flipped, err := repo.MarkExpired(ctx, s.ID, domain.ExpiredByLazy)
+	if err != nil || !flipped {
+		t.Fatalf("MarkExpired = (%v, %v), want the first call to flip the row", flipped, err)
 	}
 	got, _ := repo.FindByID(ctx, s.ID)
 	if got.Status != domain.StatusExpired || got.ExpiredReason == nil || *got.ExpiredReason != domain.ExpiredByLazy {
@@ -229,8 +230,8 @@ func TestSessionRepository_MarkExpired(t *testing.T) {
 	}
 	// Late timer against a terminal session: a no-op, never an error, and the
 	// original reason is preserved.
-	if err := repo.MarkExpired(ctx, s.ID, domain.ExpiredByTimer); err != nil {
-		t.Fatalf("late MarkExpired: %v", err)
+	if flipped, err := repo.MarkExpired(ctx, s.ID, domain.ExpiredByTimer); err != nil || flipped {
+		t.Fatalf("late MarkExpired = (%v, %v), want a no-op that reports it flipped nothing", flipped, err)
 	}
 	got, _ = repo.FindByID(ctx, s.ID)
 	if *got.ExpiredReason != domain.ExpiredByLazy {
@@ -272,7 +273,7 @@ func TestSessionRepository_TouchBumpsExpiryOnActiveOnly(t *testing.T) {
 	}
 
 	// A terminal session is never touched back to life.
-	if err := repo.MarkExpired(ctx, s.ID, domain.ExpiredByLazy); err != nil {
+	if _, err := repo.MarkExpired(ctx, s.ID, domain.ExpiredByLazy); err != nil {
 		t.Fatalf("MarkExpired: %v", err)
 	}
 	late := time.Now().Add(2 * time.Hour)
