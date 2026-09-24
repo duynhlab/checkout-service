@@ -91,8 +91,8 @@ func (f *fakeRepo) SetAddress(_ context.Context, _ string, _ domain.SessionStatu
 	return nil
 }
 
-func (f *fakeRepo) MarkExpired(_ context.Context, _ string, _ domain.ExpiredReason) error {
-	return nil
+func (f *fakeRepo) MarkExpired(_ context.Context, _ string, _ domain.ExpiredReason) (bool, error) {
+	return true, nil
 }
 
 func (f *fakeRepo) SetShipping(_ context.Context, _ string, _ domain.SessionStatus, _ time.Time, _ string, _, _, _ int64) error {

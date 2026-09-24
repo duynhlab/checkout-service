@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
 
 	"github.com/duynhlab/checkout-service/config"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 // dialEastWest sizes its connection slice from the target list rather than from
@@ -33,7 +34,7 @@ func TestDialEastWest_SizesConnsFromTargetList(t *testing.T) {
 		InventoryGRPCAddr: "dns:///inventory:9090",
 	}}
 
-	conns, cleanup, ok := dialEastWest(cfg, zap.NewNop())
+	conns, cleanup, ok := dialEastWest(cfg, slogx.New(slogx.Config{Stdout: io.Discard}))
 	if !ok {
 		t.Fatal("dialEastWest reported failure on lazy dials")
 	}
@@ -101,7 +102,7 @@ func TestProbes_StatesAndBodies(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var draining atomic.Bool
 			draining.Store(tc.draining)
-			srv := setupServer(&config.Config{}, "checkout", zap.NewNop(), nil, nil,
+			srv := setupServer(&config.Config{}, "checkout", slogx.New(slogx.Config{Stdout: io.Discard}), nil, nil,
 				stubPool{err: tc.pingErr}, &draining)
 
 			rec := httptest.NewRecorder()
@@ -124,7 +125,7 @@ func TestProbes_StatesAndBodies(t *testing.T) {
 func TestProbeRoutesAreRegisteredUnderTheSkippedPatterns(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var draining atomic.Bool
-	srv := setupServer(&config.Config{}, "checkout", zap.NewNop(), nil, nil, stubPool{}, &draining)
+	srv := setupServer(&config.Config{}, "checkout", slogx.New(slogx.Config{Stdout: io.Discard}), nil, nil, stubPool{}, &draining)
 
 	engine, ok := srv.Handler.(*gin.Engine)
 	if !ok {

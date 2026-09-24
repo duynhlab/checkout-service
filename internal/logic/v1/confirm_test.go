@@ -30,6 +30,8 @@ type fakeIdem struct {
 	finished    int
 	finishCode  int
 	finishBody  []byte
+	// finishFailNext fails the next Finish once (a DB blip after completion).
+	finishFailNext bool
 }
 
 func (f *fakeIdem) Claim(_ context.Context, userID, _, _, _, _ string) (*idempotency.Record, bool, error) {
@@ -53,6 +55,10 @@ func (f *fakeIdem) Checkpoint(_ context.Context, _ int64, subjectID *int64) erro
 func (f *fakeIdem) Release(_ context.Context, _ int64) error { f.released++; return nil }
 
 func (f *fakeIdem) Finish(_ context.Context, _ int64, code int, body []byte) error {
+	if f.finishFailNext {
+		f.finishFailNext = false
+		return errors.New("finish: db blip")
+	}
 	f.finished++
 	f.finishCode = code
 	f.finishBody = body

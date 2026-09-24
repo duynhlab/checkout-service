@@ -12,19 +12,19 @@ package v1
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 
 	"github.com/duynhlab/pkg/authmw"
 	"github.com/duynhlab/pkg/httpx"
+	"github.com/duynhlab/pkg/logger/slogx"
 
 	"github.com/duynhlab/checkout-service/internal/core/domain"
 	logicv1 "github.com/duynhlab/checkout-service/internal/logic/v1"
-	"github.com/duynhlab/pkg/httpmw"
 )
 
 // msgInvalidRequestBody is the shared 400 message for malformed JSON.
@@ -83,8 +83,6 @@ func RegisterRoutes(r gin.IRouter, h *Handler, jwtMW gin.HandlerFunc) {
 // active session already exists; POST is idempotent).
 func (h *Handler) CreateSession(c *gin.Context) {
 	ctx, span := webSpan(c)
-	logger := httpmw.LoggerFrom(c)
-
 	session, created, err := h.svc.CreateSession(ctx, c.GetString(authmw.CtxUserID))
 	if err != nil {
 		span.RecordError(err)
@@ -97,7 +95,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 			// is sent -- the fix is an operator receipt. Flat 409 here because no
 			// session exists yet to requote. The log line stays the only operator
 			// breadcrumb naming the SKUs; the response body stays opaque.
-			logger.Error("Session create blocked: inventory does not track a SKU", zap.Error(err))
+			slogx.FromContext(ctx).Error(ctx, "Session create blocked: inventory does not track a SKU", slogx.Err(err))
 			httpx.RespondError(c, http.StatusConflict, httpx.CodeItemNotOrderable, "One or more items in the cart cannot be ordered")
 		case errors.Is(err, logicv1.ErrUpstream):
 			// 503, not 500. A dependency being down is not a bug in checkout, and
@@ -110,7 +108,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 			// inventory outage reaches this arm. Found by e2e, not by unit tests —
 			// they assert the logic-layer error, not the status code.
 			c.Header("Retry-After", "2")
-			logger.Error("Session create upstream failure", zap.Error(err))
+			slogx.FromContext(ctx).Error(ctx, "Session create upstream failure", slogx.Err(err))
 			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
 		case errors.Is(err, domain.ErrUnavailable):
 			// Separate arm from ErrUpstream on purpose: the response is the same,
@@ -118,10 +116,10 @@ func (h *Handler) CreateSession(c *gin.Context) {
 			// are different incidents with different runbooks, and the log line
 			// is the only place that difference survives.
 			c.Header("Retry-After", "2")
-			logger.Error("Session create hit an unavailable datastore", zap.Error(err))
+			slogx.FromContext(ctx).Error(ctx, "Session create hit an unavailable datastore", slogx.Err(err))
 			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
 		default:
-			logger.Error("Session create failed", zap.Error(err))
+			slogx.FromContext(ctx).Error(ctx, "Session create failed", slogx.Err(err))
 			httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
 		}
 		return
@@ -131,8 +129,8 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	if created {
 		status = http.StatusCreated
 	}
-	logger.Info("Checkout session ready",
-		zap.String("session_id", session.ID), zap.Bool("created", created))
+	slogx.FromContext(ctx).Info(ctx, "Checkout session ready",
+		slog.String("checkout.session.id", session.ID), slog.Bool("created", created))
 	c.JSON(status, toSessionResponse(session))
 }
 
@@ -241,8 +239,6 @@ const maxIdempotencyKeyLen = 120
 // checkout attempt and persists it so a retry always converges.
 func (h *Handler) ConfirmSession(c *gin.Context) {
 	ctx, span := webSpan(c)
-	logger := httpmw.LoggerFrom(c)
-
 	key := c.GetHeader("Idempotency-Key")
 	if key == "" {
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeIdempotencyKeyRequired, "Idempotency-Key header is required")
@@ -281,12 +277,12 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 			// state -- no balance row exists -- and it is persistent, so there is
 			// no Retry-After to send. Distinct from STOCK_UNAVAILABLE because the
 			// operator action differs: receive first stock, not wait for restock.
-			logger.Error("Confirm blocked: inventory does not track a SKU", zap.Error(err))
+			slogx.FromContext(ctx).Error(ctx, "Confirm blocked: inventory does not track a SKU", slogx.Err(err))
 			respondRequote(c, http.StatusConflict, httpx.CodeItemNotOrderable,
 				"One or more items in the cart cannot be ordered — the quote was refreshed", session)
 		case errors.Is(err, logicv1.ErrUpstream):
 			c.Header("Retry-After", "2")
-			logger.Error("Confirm upstream failure", zap.Error(err))
+			slogx.FromContext(ctx).Error(ctx, "Confirm upstream failure", slogx.Err(err))
 			httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Confirm temporarily unavailable, retry with the same Idempotency-Key")
 		default:
 			h.respondSessionError(c, span, err)
@@ -294,8 +290,8 @@ func (h *Handler) ConfirmSession(c *gin.Context) {
 		return
 	}
 
-	logger.Info("Checkout confirmed",
-		zap.String("session_id", session.ID), zap.String("order_id", session.OrderID))
+	slogx.FromContext(ctx).Info(ctx, "Checkout confirmed",
+		slog.String("checkout.session.id", session.ID), slog.String("order.id", session.OrderID))
 	c.JSON(http.StatusCreated, toSessionResponse(session))
 }
 
@@ -366,10 +362,10 @@ func (h *Handler) respondSessionError(c *gin.Context, span trace.Span, err error
 		// either idempotency-keyed or a conditional update, so a retry lands at
 		// most once and otherwise reports the lost CAS.
 		c.Header("Retry-After", "2")
-		httpmw.LoggerFrom(c).Error("Session operation hit an unavailable datastore", zap.Error(err))
+		slogx.FromContext(c.Request.Context()).Error(c.Request.Context(), "Session operation hit an unavailable datastore", slogx.Err(err))
 		httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "Checkout temporarily unavailable, retry")
 	default:
-		httpmw.LoggerFrom(c).Error("Session operation failed", zap.Error(err))
+		slogx.FromContext(c.Request.Context()).Error(c.Request.Context(), "Session operation failed", slogx.Err(err))
 		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, "Internal server error")
 	}
 }

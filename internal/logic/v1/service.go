@@ -800,8 +800,12 @@ func (s *CheckoutService) lazyExpire(ctx context.Context, session *domain.Sessio
 	if s.now().Before(session.ExpiresAt) {
 		return false
 	}
-	// Best-effort record; MarkExpired is conditional and idempotent.
-	_ = s.repo.MarkExpired(ctx, session.ID, domain.ExpiredByLazy)
+	// Best-effort record; MarkExpired is conditional and idempotent. The event
+	// goes out only from the call that flipped the row: a concurrent reader or
+	// the timer that got there first already reported this expiry.
+	if flipped, err := s.repo.MarkExpired(ctx, session.ID, domain.ExpiredByLazy); err == nil && flipped {
+		EmitSessionExpired(ctx, session.ID, string(domain.ExpiredByLazy))
+	}
 	RecordSessionExpired(ctx, string(domain.ExpiredByLazy))
 	return true
 }
