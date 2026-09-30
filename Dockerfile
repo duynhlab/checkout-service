@@ -13,7 +13,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" go build -o /app/checkout-service ./cmd/main.go
 
 # Final stage
-FROM alpine:latest
+FROM alpine:3.24
 
 RUN apk --no-cache upgrade && apk --no-cache add ca-certificates
 
