@@ -23,9 +23,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/duynhlab/pkg/idempotency"
 
@@ -38,20 +36,13 @@ func newTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
-	container, err := postgres.Run(ctx, "postgres:16-alpine",
+	container, err := postgres.Run(ctx, "postgres:18-alpine",
 		postgres.WithDatabase("checkout"),
 		postgres.WithUsername("checkout"),
 		postgres.WithPassword("secret"),
-		// The postgres entrypoint starts the server twice (initdb, then the
-		// real start) and the port already listens during the first — waiting
-		// on the port races the restart window and connects die with
-		// "connection reset by peer". Wait for the SECOND ready line instead
-		// (same strategy as payment-service).
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(90*time.Second),
-		),
+		// Ready twice (initdb restarts the server once), then the published
+		// port: the module's own strategy, so a test never races the restart.
+		postgres.BasicWaitStrategies(),
 	)
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
