@@ -18,7 +18,7 @@ at the last moment, and hands the result to order-service.
 
 | Area | Technology |
 |------|------------|
-| Runtime | Go 1.26 |
+| Runtime | Go 1.27 |
 | Transports | HTTP (private) · gRPC **client only** — no gRPC server |
 | Workflows | Temporal — orchestrator of the abandoned-checkout timer |
 | Data | PostgreSQL |
