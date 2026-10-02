@@ -1,7 +1,7 @@
 # Build stage
 # --platform pins the builder to the BUILD host so a multi-arch build
 # cross-compiles instead of running this whole stage under emulation.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.7-alpine AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.1-alpine AS builder
 ARG TARGETOS TARGETARCH
 
 WORKDIR /app
@@ -13,7 +13,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" go build -o /app/checkout-service ./cmd/main.go
 
 # Final stage
-FROM alpine:latest
+FROM alpine:3.24
 
 RUN apk --no-cache upgrade && apk --no-cache add ca-certificates
 

@@ -1,25 +1,24 @@
 module github.com/duynhlab/checkout-service
 
-go 1.26.7
+go 1.27.1
 
 require (
-	github.com/duynhlab/pkg/authmw v0.37.2
-	github.com/duynhlab/pkg/dbx v0.36.3
-	github.com/duynhlab/pkg/grpcx v0.37.0
-	github.com/duynhlab/pkg/httpmw v0.2.0
-	github.com/duynhlab/pkg/httpx v0.37.1
-	github.com/duynhlab/pkg/idempotency v0.37.1
-	github.com/duynhlab/pkg/logger/slogx v0.3.0
-	github.com/duynhlab/pkg/migratex v0.36.2
-	github.com/duynhlab/pkg/obsx v0.47.0
-	github.com/duynhlab/pkg/proto v0.37.1
-	github.com/duynhlab/pkg/temporalx v0.44.0
+	github.com/duynhlab/pkg/authmw v0.38.0
+	github.com/duynhlab/pkg/dbx v0.38.0
+	github.com/duynhlab/pkg/grpcx v0.38.0
+	github.com/duynhlab/pkg/httpmw v0.4.0
+	github.com/duynhlab/pkg/httpx v0.38.0
+	github.com/duynhlab/pkg/idempotency v0.38.0
+	github.com/duynhlab/pkg/logger/slogx v0.4.0
+	github.com/duynhlab/pkg/migratex v0.37.0
+	github.com/duynhlab/pkg/obsx v0.48.0
+	github.com/duynhlab/pkg/proto v0.38.0
+	github.com/duynhlab/pkg/temporalx v0.45.0
 	github.com/gin-gonic/gin v1.12.0
-	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/joho/godotenv v1.5.1
 	github.com/stretchr/testify v1.12.1
-	github.com/testcontainers/testcontainers-go v0.44.0
-	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
+	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/metric v1.46.0
 	go.opentelemetry.io/otel/sdk/metric v1.46.0
@@ -108,6 +107,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
+	github.com/testcontainers/testcontainers-go v0.44.0 // indirect
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
@@ -118,7 +118,7 @@ require (
 	go.opentelemetry.io/contrib/bridges/otelslog v0.20.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.71.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0 // indirect
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/runtime v0.71.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.22.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.46.0 // indirect
