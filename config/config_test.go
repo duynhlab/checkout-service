@@ -266,6 +266,20 @@ func TestValidateErrorMentionsField(t *testing.T) {
 	}
 }
 
+// A password from a file (DB_PASSWORD_FILE, ADR-025 pattern A) satisfies the
+// database check in place of DB_PASSWORD; with neither set it still errors.
+func TestValidateDatabase_PasswordFile(t *testing.T) {
+	c := &Config{Database: DatabaseConfig{Host: "h", Name: "n", User: "u", PasswordFile: "/etc/db/secret/password"}}
+	if errs := c.validateDatabase(); len(errs) != 0 {
+		t.Errorf("validateDatabase() with PasswordFile set = %v, want none", errs)
+	}
+
+	c.Database.PasswordFile = ""
+	if errs := c.validateDatabase(); len(errs) != 1 || errs[0] != "DB_PASSWORD or DB_PASSWORD_FILE is required when DB_HOST is set" {
+		t.Errorf("validateDatabase() with neither password = %v, want the password error", errs)
+	}
+}
+
 // The canary dial must default to 100 — "no canary". A default of 0 would mean
 // that flipping CHECKOUT_AVAILABILITY_SOURCE to `inventory` silently kept every
 // read on Product, so an operator would watch a cutover that never happened.
