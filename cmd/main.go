@@ -97,8 +97,14 @@ func main() {
 	// `<binary> worker` runs the Temporal worker for the abandonment
 	// workflow and serves no HTTP beyond health probes.
 	if maybeRunWorker(cfg, logger, pool) {
+		// Flush the worker's final metrics/spans on the same bounded budget
+		// as the API path.
 		if tp != nil {
-			_ = tp.Shutdown(context.Background()) // flush the worker's final metrics/spans
+			if err := shutdownTelemetry(tp.Shutdown, otelShutdownTimeout); err != nil {
+				logger.Error(ctx, "OpenTelemetry shutdown error", slogx.Err(err))
+			} else {
+				logger.Info(ctx, "OpenTelemetry shutdown complete")
+			}
 		}
 		return
 	}
@@ -483,6 +489,19 @@ func setupServer(
 	}
 }
 
+// otelShutdownTimeout bounds the final telemetry flush on its own clock: an
+// exhausted HTTP drain must not hand the exporter an expired context and lose
+// the last process.stopped record and spans (homelab#1359).
+const otelShutdownTimeout = 5 * time.Second
+
+// shutdownTelemetry runs the OTel SDK shutdown under a fresh context bounded
+// by timeout, independent of whatever the drain consumed.
+func shutdownTelemetry(shutdown func(context.Context) error, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return shutdown(ctx)
+}
+
 // runGracefulShutdown serves until SIGTERM/SIGINT, then drains: readiness
 // flips first, the HTTP server shuts down, the pool closes, OTel flushes.
 func runGracefulShutdown(
@@ -532,7 +551,7 @@ func runGracefulShutdown(
 	logger.ProcessStopped(ctx, slogx.ComponentAPI, outcome)
 
 	if tp != nil {
-		if err := tp.Shutdown(shutdownCtx); err != nil {
+		if err := shutdownTelemetry(tp.Shutdown, otelShutdownTimeout); err != nil {
 			logger.Error(ctx, "OpenTelemetry shutdown error", slogx.Err(err))
 		} else {
 			logger.Info(ctx, "OpenTelemetry shutdown complete")
